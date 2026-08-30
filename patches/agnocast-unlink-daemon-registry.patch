@@ -1,0 +1,592 @@
+Agnocast unlink-daemon registry patch
+
+Base: 3e3738d1cd88dde5ae5543b084e93f8ad9dbeeed
+Apply from a clean Agnocast checkout with:
+  git apply /workspace/rclpy_zerocopy_ws/patches/agnocast-unlink-daemon-registry.patch
+diff --git a/agnocast_kmod/agnocast.h b/agnocast_kmod/agnocast.h
+index 9df78a3..01040fb 100644
+--- a/agnocast_kmod/agnocast.h
++++ b/agnocast_kmod/agnocast.h
+@@ -302,6 +302,16 @@ struct ioctl_discovery_agent_exists_args
+     ret_exists;  // whether an agent is registered for this (ns, domain); read-only liveness query
+ };
+ 
++struct ioctl_add_unlink_daemon_args
++{
++  bool ret_already_exists;
++};
++
++struct ioctl_unlink_daemon_should_exit_args
++{
++  bool ret_should_exit;
++};
++
+ struct ioctl_set_ros2_subscriber_num_args
+ {
+   struct name_info topic_name;
+@@ -352,6 +362,9 @@ struct ioctl_add_domain_bridge_args
+ #define AGNOCAST_ADD_DISCOVERY_AGENT_CMD _IOWR(0xA6, 30, struct ioctl_add_discovery_agent_args)
+ #define AGNOCAST_DISCOVERY_AGENT_EXISTS_CMD \
+   _IOWR(0xA6, 31, struct ioctl_discovery_agent_exists_args)
++#define AGNOCAST_ADD_UNLINK_DAEMON_CMD _IOWR(0xA6, 32, struct ioctl_add_unlink_daemon_args)
++#define AGNOCAST_UNLINK_DAEMON_SHOULD_EXIT_CMD \
++  _IOR(0xA6, 33, struct ioctl_unlink_daemon_should_exit_args)
+ 
+ // ================================================
+ // ros2cli ioctls
+@@ -538,6 +551,14 @@ int agnocast_ioctl_add_discovery_agent(
+ int agnocast_ioctl_discovery_agent_exists(
+   const struct ipc_namespace * ipc_ns, const uint32_t domain_id, bool * ret_exists);
+ 
++int agnocast_ioctl_add_unlink_daemon(
++  const pid_t pid, struct pid * pid_ref, const struct ipc_namespace * ipc_ns,
++  struct ioctl_add_unlink_daemon_args * ioctl_ret);
++
++int agnocast_ioctl_unlink_daemon_should_exit(
++  const pid_t pid, const struct pid * pid_ref, const struct ipc_namespace * ipc_ns,
++  bool * ret_should_exit);
++
+ int agnocast_ioctl_get_exit_process(
+   const struct ipc_namespace * ipc_ns, struct ioctl_get_exit_process_args * ioctl_ret,
+   struct exit_subscription_mq_info * mq_info_buf, uint32_t mq_info_buf_size,
+@@ -561,6 +582,7 @@ int agnocast_increment_message_entry_rc(
+   const int64_t entry_id);
+ int agnocast_get_alive_proc_num(void);
+ int agnocast_get_discovery_agent_num(void);
++int agnocast_get_unlink_daemon_num(void);
+ bool agnocast_is_proc_exited(const pid_t pid);
+ int agnocast_get_topic_entries_num(const char * topic_name, const struct ipc_namespace * ipc_ns);
+ int64_t agnocast_get_latest_received_entry_id(
+diff --git a/agnocast_kmod/agnocast_exit.c b/agnocast_kmod/agnocast_exit.c
+index 90751b5..57472dd 100644
+--- a/agnocast_kmod/agnocast_exit.c
++++ b/agnocast_kmod/agnocast_exit.c
+@@ -29,6 +29,17 @@ static void remove_all_process_info(void)
+   // No explicit synchronize_rcu() needed: kfree_rcu() defers freeing until after the grace period.
+ }
+ 
++static void remove_all_unlink_daemons(void)
++{
++  struct unlink_daemon_info * daemon;
++  int bkt;
++  struct hlist_node * tmp;
++  hash_for_each_safe(unlink_daemon_htable, bkt, tmp, daemon, node)
++  {
++    agnocast_release_unlink_daemon(daemon);
++  }
++}
++
+ static void remove_all_discovery_agents(void)
+ {
+   struct discovery_agent_info * agent;
+@@ -74,6 +85,7 @@ void agnocast_exit_free_data(void)
+   down_write(&global_htables_rwsem);
+   remove_all_topics();
+   remove_all_process_info();
++  remove_all_unlink_daemons();
+   remove_all_discovery_agents();
+   remove_all_bridge_info();
+   remove_all_domain_rules();
+diff --git a/agnocast_kmod/agnocast_internal.c b/agnocast_kmod/agnocast_internal.c
+index c65d6dd..5dfd22d 100644
+--- a/agnocast_kmod/agnocast_internal.c
++++ b/agnocast_kmod/agnocast_internal.c
+@@ -8,6 +8,7 @@ struct device * agnocast_device;
+ DECLARE_RWSEM(global_htables_rwsem);
+ 
+ DEFINE_HASHTABLE(proc_info_htable, PROC_INFO_HASH_BITS);
++DEFINE_HASHTABLE(unlink_daemon_htable, UNLINK_DAEMON_HASH_BITS);
+ DEFINE_HASHTABLE(discovery_agent_htable, DISCOVERY_AGENT_HASH_BITS);
+ DEFINE_HASHTABLE(topic_hashtable, TOPIC_HASH_BITS);
+ DEFINE_HASHTABLE(bridge_htable, TOPIC_HASH_BITS);
+@@ -331,11 +332,54 @@ void agnocast_remove_discovery_agent_by_pid(const pid_t pid)
+   }
+ }
+ 
+-// RCU-protected check: returns true if pid is a registered agnocast process or discovery agent.
++bool agnocast_unlink_daemon_is_alive(const struct unlink_daemon_info * daemon)
++{
++  struct task_struct * task;
++  bool alive = false;
++
++  rcu_read_lock();
++  task = pid_task(daemon->pid_ref, PIDTYPE_TGID);
++  if (task != NULL) {
++    alive = pid_alive(task) && READ_ONCE(task->exit_state) == 0 && task->signal != NULL &&
++            atomic_read(&task->signal->live) > 0;
++  }
++  rcu_read_unlock();
++  return alive;
++}
++
++// Caller holds global_htables_rwsem (write).
++void agnocast_release_unlink_daemon(struct unlink_daemon_info * daemon)
++{
++  hash_del_rcu(&daemon->node);
++  put_pid(daemon->pid_ref);
++  kfree_rcu(daemon, rcu_head);
++}
++
++// Caller holds global_htables_rwsem (write). A matching live entry is retained: this can happen
++// after numeric PID reuse, and must not let an old queued exit remove the new daemon generation.
++bool agnocast_remove_unlink_daemon_by_pid(const pid_t pid)
++{
++  struct unlink_daemon_info * daemon;
++  struct hlist_node * tmp;
++  hash_for_each_possible_safe(
++    unlink_daemon_htable, daemon, tmp, node, hash_min(pid, UNLINK_DAEMON_HASH_BITS))
++  {
++    if (daemon->global_pid == pid) {
++      if (!agnocast_unlink_daemon_is_alive(daemon)) {
++        agnocast_release_unlink_daemon(daemon);
++      }
++      return true;
++    }
++  }
++  return false;
++}
++
++// RCU-protected check: returns true for every process whose exit requires registry cleanup.
+ bool is_agnocast_pid(const pid_t pid)
+ {
+   struct process_info * proc_info;
+   struct discovery_agent_info * agent;
++  struct unlink_daemon_info * daemon;
+   bool found = false;
+   rcu_read_lock();
+   hash_for_each_possible_rcu(proc_info_htable, proc_info, node, hash_min(pid, PROC_INFO_HASH_BITS))
+@@ -355,6 +399,16 @@ bool is_agnocast_pid(const pid_t pid)
+       }
+     }
+   }
++  if (!found) {
++    hash_for_each_possible_rcu(
++      unlink_daemon_htable, daemon, node, hash_min(pid, UNLINK_DAEMON_HASH_BITS))
++    {
++      if (daemon->global_pid == pid) {
++        found = true;
++        break;
++      }
++    }
++  }
+   rcu_read_unlock();
+   return found;
+ }
+@@ -365,6 +419,13 @@ void agnocast_process_exit_cleanup(const pid_t pid)
+ {
+   down_write(&global_htables_rwsem);
+ 
++  // Unlink daemons are not application processes. Returning after their registry cleanup also
++  // prevents an old daemon exit event from touching a live app that reused the numeric PID.
++  if (agnocast_remove_unlink_daemon_by_pid(pid)) {
++    up_write(&global_htables_rwsem);
++    return;
++  }
++
+   // The discovery agent is tracked outside proc_info and has no proc_info entry, so drain it
+   // here before the proc_info lookup (which would otherwise return early for the agent's pid).
+   agnocast_remove_discovery_agent_by_pid(pid);
+diff --git a/agnocast_kmod/agnocast_internal.h b/agnocast_kmod/agnocast_internal.h
+index 53525bb..fed438e 100644
+--- a/agnocast_kmod/agnocast_internal.h
++++ b/agnocast_kmod/agnocast_internal.h
+@@ -11,7 +11,9 @@
+ #include <linux/kthread.h>
+ #include <linux/mm.h>  // kvzalloc, kvfree
+ #include <linux/module.h>
++#include <linux/pid.h>
+ #include <linux/rwsem.h>
++#include <linux/sched/signal.h>
+ #include <linux/slab.h>  // kmalloc, kfree
+ #include <linux/tracepoint.h>
+ #include <linux/version.h>
+@@ -46,6 +48,7 @@ extern struct rw_semaphore global_htables_rwsem;
+ #define PROC_INFO_HASH_BITS 10
+ // At most one agent per (IPC namespace, domain), so the table is tiny.
+ #define DISCOVERY_AGENT_HASH_BITS 4
++#define UNLINK_DAEMON_HASH_BITS 4
+ 
+ // Allocated in pre_handler_subscriber_exit(), freed in agnocast_commit_exit_process() after
+ // the daemon successfully copies the data to user-space.
+@@ -79,6 +82,17 @@ struct process_info
+ 
+ extern DECLARE_HASHTABLE(proc_info_htable, PROC_INFO_HASH_BITS);
+ 
++struct unlink_daemon_info
++{
++  pid_t global_pid;
++  struct pid * pid_ref;
++  const struct ipc_namespace * ipc_ns;
++  struct hlist_node node;
++  struct rcu_head rcu_head;
++};
++
++extern DECLARE_HASHTABLE(unlink_daemon_htable, UNLINK_DAEMON_HASH_BITS);
++
+ struct publisher_info
+ {
+   topic_local_id_t id;
+@@ -223,6 +237,13 @@ struct discovery_agent_info * agnocast_find_discovery_agent(
+   const struct ipc_namespace * ipc_ns, const uint32_t domain_id);
+ void agnocast_remove_discovery_agent_by_pid(const pid_t pid);
+ 
++// All registry operations require global_htables_rwsem. The liveness check also pins the
++// daemon's struct pid identity, so a recycled numeric PID cannot validate a stale owner.
++struct unlink_daemon_info * agnocast_find_unlink_daemon(const struct ipc_namespace * ipc_ns);
++bool agnocast_unlink_daemon_is_alive(const struct unlink_daemon_info * daemon);
++void agnocast_release_unlink_daemon(struct unlink_daemon_info * daemon);
++bool agnocast_remove_unlink_daemon_by_pid(const pid_t pid);
++
+ int agnocast_get_size_sub_info_htable(struct topic_wrapper * wrapper);
+ 
+ int agnocast_get_size_pub_info_htable(struct topic_wrapper * wrapper);
+diff --git a/agnocast_kmod/agnocast_ioctl.c b/agnocast_kmod/agnocast_ioctl.c
+index 4d31b9e..09e45bb 100644
+--- a/agnocast_kmod/agnocast_ioctl.c
++++ b/agnocast_kmod/agnocast_ioctl.c
+@@ -658,7 +658,12 @@ int agnocast_ioctl_add_process(
+     ret = -EINVAL;
+     goto unlock;
+   }
+-  ioctl_ret->ret_unlink_daemon_exist = (get_process_num(ipc_ns) > 0);
++  struct unlink_daemon_info * unlink_daemon = agnocast_find_unlink_daemon(ipc_ns);
++  if (unlink_daemon && !agnocast_unlink_daemon_is_alive(unlink_daemon)) {
++    agnocast_release_unlink_daemon(unlink_daemon);
++    unlink_daemon = NULL;
++  }
++  ioctl_ret->ret_unlink_daemon_exist = (unlink_daemon != NULL);
+   ioctl_ret->ret_performance_bridge_daemon_exist =
+     has_alive_performance_bridge_manager(ipc_ns, domain_id);
+   ioctl_ret->ret_discovery_agent_exist = (agnocast_find_discovery_agent(ipc_ns, domain_id) != NULL);
+@@ -2398,6 +2403,18 @@ struct discovery_agent_info * agnocast_find_discovery_agent(
+   return NULL;
+ }
+ 
++// Caller holds global_htables_rwsem (read or write).
++struct unlink_daemon_info * agnocast_find_unlink_daemon(const struct ipc_namespace * ipc_ns)
++{
++  struct unlink_daemon_info * daemon;
++  int bkt;
++  hash_for_each(unlink_daemon_htable, bkt, daemon, node)
++  {
++    if (ipc_eq(daemon->ipc_ns, ipc_ns)) return daemon;
++  }
++  return NULL;
++}
++
+ // The agent is not a registered Agnocast process, so it passes its own pid + ROS_DOMAIN_ID.
+ //
+ // commit == false: read-only idle poll; userspace counts consecutive idle polls before exiting.
+@@ -2470,6 +2487,62 @@ int agnocast_ioctl_discovery_agent_exists(
+   return 0;
+ }
+ 
++int agnocast_ioctl_add_unlink_daemon(
++  const pid_t pid, struct pid * pid_ref, const struct ipc_namespace * ipc_ns,
++  struct ioctl_add_unlink_daemon_args * ioctl_ret)
++{
++  int ret = 0;
++  ioctl_ret->ret_already_exists = false;
++  if (pid_ref == NULL) return -EINVAL;
++
++  down_write(&global_htables_rwsem);
++  struct unlink_daemon_info * existing = agnocast_find_unlink_daemon(ipc_ns);
++  if (existing && agnocast_unlink_daemon_is_alive(existing)) {
++    ioctl_ret->ret_already_exists = true;
++    goto unlock;
++  }
++  if (existing) agnocast_release_unlink_daemon(existing);
++
++  struct unlink_daemon_info * daemon = kmalloc(sizeof(*daemon), GFP_KERNEL);
++  if (!daemon) {
++    ret = -ENOMEM;
++    goto unlock;
++  }
++  daemon->global_pid = pid;
++  daemon->pid_ref = get_pid(pid_ref);
++  daemon->ipc_ns = ipc_ns;
++  INIT_HLIST_NODE(&daemon->node);
++  hash_add_rcu(unlink_daemon_htable, &daemon->node, hash_min(pid, UNLINK_DAEMON_HASH_BITS));
++
++unlock:
++  up_write(&global_htables_rwsem);
++  return ret;
++}
++
++int agnocast_ioctl_unlink_daemon_should_exit(
++  const pid_t pid, const struct pid * pid_ref, const struct ipc_namespace * ipc_ns,
++  bool * ret_should_exit)
++{
++  int ret = 0;
++  *ret_should_exit = false;
++
++  down_write(&global_htables_rwsem);
++  struct unlink_daemon_info * daemon = agnocast_find_unlink_daemon(ipc_ns);
++  if (!daemon || daemon->global_pid != pid || daemon->pid_ref != pid_ref) {
++    ret = -EPERM;
++    goto unlock;
++  }
++
++  if (get_process_num(ipc_ns) == 0) {
++    agnocast_release_unlink_daemon(daemon);
++    *ret_should_exit = true;
++  }
++
++unlock:
++  up_write(&global_htables_rwsem);
++  return ret;
++}
++
+ int agnocast_ioctl_check_and_request_bridge_shutdown(
+   const pid_t pid, const struct ipc_namespace * ipc_ns,
+   struct ioctl_check_and_request_bridge_shutdown_args * ioctl_ret)
+@@ -3152,6 +3225,30 @@ static long discovery_agent_exists_cmd(struct ioctl_discovery_agent_exists_args
+   return ret;
+ }
+ 
++static long add_unlink_daemon_cmd(struct ioctl_add_unlink_daemon_args __user * arg)
++{
++  const pid_t pid = current->tgid;
++  const struct ipc_namespace * ipc_ns = current->nsproxy->ipc_ns;
++  struct ioctl_add_unlink_daemon_args args;
++  if (copy_from_user(&args, arg, sizeof(args))) return -EFAULT;
++
++  int ret = agnocast_ioctl_add_unlink_daemon(pid, task_tgid(current), ipc_ns, &args);
++  if (copy_to_user(arg, &args, sizeof(args))) return -EFAULT;
++  return ret;
++}
++
++static long unlink_daemon_should_exit_cmd(
++  struct ioctl_unlink_daemon_should_exit_args __user * arg)
++{
++  const pid_t pid = current->tgid;
++  const struct ipc_namespace * ipc_ns = current->nsproxy->ipc_ns;
++  struct ioctl_unlink_daemon_should_exit_args args = {};
++  int ret = agnocast_ioctl_unlink_daemon_should_exit(
++    pid, task_tgid(current), ipc_ns, &args.ret_should_exit);
++  if (copy_to_user(arg, &args, sizeof(args))) return -EFAULT;
++  return ret;
++}
++
+ long agnocast_ioctl(struct file * file, unsigned int cmd, unsigned long arg)
+ {
+   switch (cmd) {
+@@ -3217,6 +3314,11 @@ long agnocast_ioctl(struct file * file, unsigned int cmd, unsigned long arg)
+       return add_discovery_agent_cmd((struct ioctl_add_discovery_agent_args __user *)arg);
+     case AGNOCAST_DISCOVERY_AGENT_EXISTS_CMD:
+       return discovery_agent_exists_cmd((struct ioctl_discovery_agent_exists_args __user *)arg);
++    case AGNOCAST_ADD_UNLINK_DAEMON_CMD:
++      return add_unlink_daemon_cmd((struct ioctl_add_unlink_daemon_args __user *)arg);
++    case AGNOCAST_UNLINK_DAEMON_SHOULD_EXIT_CMD:
++      return unlink_daemon_should_exit_cmd(
++        (struct ioctl_unlink_daemon_should_exit_args __user *)arg);
+     default:
+       return -EINVAL;
+   }
+@@ -3313,6 +3415,20 @@ int agnocast_get_discovery_agent_num(void)
+   return count;
+ }
+ 
++int agnocast_get_unlink_daemon_num(void)
++{
++  int count = 0;
++  struct unlink_daemon_info * daemon;
++  int bkt;
++  down_read(&global_htables_rwsem);
++  hash_for_each(unlink_daemon_htable, bkt, daemon, node)
++  {
++    count++;
++  }
++  up_read(&global_htables_rwsem);
++  return count;
++}
++
+ bool agnocast_is_proc_exited(const pid_t pid)
+ {
+   struct process_info * proc_info;
+diff --git a/agnocast_kmod/agnocast_kunit/agnocast_kunit_add_process.c b/agnocast_kmod/agnocast_kunit/agnocast_kunit_add_process.c
+index 729d8dc..8750fc2 100644
+--- a/agnocast_kmod/agnocast_kunit/agnocast_kunit_add_process.c
++++ b/agnocast_kmod/agnocast_kunit/agnocast_kunit_add_process.c
+@@ -6,6 +6,7 @@
+ 
+ #include <kunit/test.h>
+ #include <linux/delay.h>
++#include <linux/sched/signal.h>
+ 
+ static pid_t pid = 1000;
+ void test_case_add_process_normal(struct kunit * test)
+@@ -17,6 +18,7 @@ void test_case_add_process_normal(struct kunit * test)
+   int ret = agnocast_ioctl_add_process(local_pid, current->nsproxy->ipc_ns, false, 0, &args);
+ 
+   KUNIT_EXPECT_EQ(test, ret, 0);
++  KUNIT_EXPECT_FALSE(test, args.ret_unlink_daemon_exist);
+   KUNIT_EXPECT_EQ(test, agnocast_get_alive_proc_num(), 1);
+   KUNIT_EXPECT_FALSE(test, agnocast_is_proc_exited(local_pid));
+ }
+@@ -64,6 +66,77 @@ void test_case_add_process_twice(struct kunit * test)
+   KUNIT_EXPECT_FALSE(test, agnocast_is_proc_exited(local_pid));
+ }
+ 
++// The first daemon claim wins, and only an actual registered daemon suppresses a spawn.
++void test_case_unlink_daemon_registry_gates_spawn(struct kunit * test)
++{
++  KUNIT_ASSERT_EQ(test, agnocast_get_alive_proc_num(), 0);
++  KUNIT_ASSERT_EQ(test, agnocast_get_unlink_daemon_num(), 0);
++
++  struct ioctl_add_unlink_daemon_args first = {};
++  KUNIT_ASSERT_EQ(
++    test,
++    agnocast_ioctl_add_unlink_daemon(
++      current->tgid, task_tgid(current), current->nsproxy->ipc_ns, &first),
++    0);
++  KUNIT_EXPECT_FALSE(test, first.ret_already_exists);
++  KUNIT_EXPECT_EQ(test, agnocast_get_unlink_daemon_num(), 1);
++
++  struct ioctl_add_unlink_daemon_args duplicate = {};
++  KUNIT_ASSERT_EQ(
++    test,
++    agnocast_ioctl_add_unlink_daemon(
++      current->tgid, task_tgid(current), current->nsproxy->ipc_ns, &duplicate),
++    0);
++  KUNIT_EXPECT_TRUE(test, duplicate.ret_already_exists);
++  KUNIT_EXPECT_EQ(test, agnocast_get_unlink_daemon_num(), 1);
++
++  union ioctl_add_process_args app = {};
++  KUNIT_ASSERT_EQ(
++    test, agnocast_ioctl_add_process(pid++, current->nsproxy->ipc_ns, false, 0, &app), 0);
++  KUNIT_EXPECT_TRUE(test, app.ret_unlink_daemon_exist);
++}
++
++// add_process and the daemon's final deregistration share one write lock: an app added first
++// vetoes exit, while an exit committed first makes the app request a replacement.
++void test_case_unlink_daemon_exit_add_ordering(struct kunit * test)
++{
++  struct ioctl_add_unlink_daemon_args daemon = {};
++  KUNIT_ASSERT_EQ(
++    test,
++    agnocast_ioctl_add_unlink_daemon(
++      current->tgid, task_tgid(current), current->nsproxy->ipc_ns, &daemon),
++    0);
++
++  bool should_exit = false;
++  KUNIT_ASSERT_EQ(
++    test,
++    agnocast_ioctl_unlink_daemon_should_exit(
++      current->tgid, task_tgid(current), current->nsproxy->ipc_ns, &should_exit),
++    0);
++  KUNIT_EXPECT_TRUE(test, should_exit);
++  KUNIT_EXPECT_EQ(test, agnocast_get_unlink_daemon_num(), 0);
++
++  union ioctl_add_process_args app = {};
++  KUNIT_ASSERT_EQ(
++    test, agnocast_ioctl_add_process(pid++, current->nsproxy->ipc_ns, false, 0, &app), 0);
++  KUNIT_EXPECT_FALSE(test, app.ret_unlink_daemon_exist);
++
++  struct ioctl_add_unlink_daemon_args replacement = {};
++  KUNIT_ASSERT_EQ(
++    test,
++    agnocast_ioctl_add_unlink_daemon(
++      current->tgid, task_tgid(current), current->nsproxy->ipc_ns, &replacement),
++    0);
++  should_exit = true;
++  KUNIT_ASSERT_EQ(
++    test,
++    agnocast_ioctl_unlink_daemon_should_exit(
++      current->tgid, task_tgid(current), current->nsproxy->ipc_ns, &should_exit),
++    0);
++  KUNIT_EXPECT_FALSE(test, should_exit);
++  KUNIT_EXPECT_EQ(test, agnocast_get_unlink_daemon_num(), 1);
++}
++
+ // A performance bridge manager is gated per-(ipc_ns, domain): a manager in one
+ // domain must not suppress spawning a manager in another domain, while a second
+ // manager in the same domain is suppressed.
+diff --git a/agnocast_kmod/agnocast_kunit/agnocast_kunit_add_process.h b/agnocast_kmod/agnocast_kunit/agnocast_kunit_add_process.h
+index 8b5ceb0..58843a5 100644
+--- a/agnocast_kmod/agnocast_kunit/agnocast_kunit_add_process.h
++++ b/agnocast_kmod/agnocast_kunit/agnocast_kunit_add_process.h
+@@ -5,6 +5,8 @@
+ #define TEST_CASES_ADD_PROCESS                                                      \
+   KUNIT_CASE(test_case_add_process_normal), KUNIT_CASE(test_case_add_process_many), \
+     KUNIT_CASE(test_case_add_process_twice),                                        \
++    KUNIT_CASE(test_case_unlink_daemon_registry_gates_spawn),                       \
++    KUNIT_CASE(test_case_unlink_daemon_exit_add_ordering),                          \
+     KUNIT_CASE(test_case_add_process_perf_manager_per_domain),                      \
+     KUNIT_CASE(test_case_discovery_agent_register_first_wins),                      \
+     KUNIT_CASE(test_case_discovery_agent_register_duplicate_loses),                 \
+@@ -20,6 +22,8 @@
+ void test_case_add_process_normal(struct kunit * test);
+ void test_case_add_process_many(struct kunit * test);
+ void test_case_add_process_twice(struct kunit * test);
++void test_case_unlink_daemon_registry_gates_spawn(struct kunit * test);
++void test_case_unlink_daemon_exit_add_ordering(struct kunit * test);
+ void test_case_add_process_perf_manager_per_domain(struct kunit * test);
+ void test_case_discovery_agent_register_first_wins(struct kunit * test);
+ void test_case_discovery_agent_register_duplicate_loses(struct kunit * test);
+diff --git a/src/agnocastlib/include/agnocast/agnocast_ioctl.hpp b/src/agnocastlib/include/agnocast/agnocast_ioctl.hpp
+index 00cebc5..67f8643 100644
+--- a/src/agnocastlib/include/agnocast/agnocast_ioctl.hpp
++++ b/src/agnocastlib/include/agnocast/agnocast_ioctl.hpp
+@@ -341,6 +341,16 @@ struct ioctl_check_and_request_bridge_shutdown_args
+   bool ret_should_shutdown;
+ };
+ 
++struct ioctl_add_unlink_daemon_args
++{
++  bool ret_already_exists;
++};
++
++struct ioctl_unlink_daemon_should_exit_args
++{
++  bool ret_should_exit;
++};
++
+ struct ioctl_set_ros2_subscriber_num_args
+ {
+   struct name_info topic_name;
+@@ -377,5 +387,8 @@ struct ioctl_set_ros2_publisher_num_args
+   _IOW(0xA6, 25, struct ioctl_set_ros2_subscriber_num_args)
+ #define AGNOCAST_SET_ROS2_PUBLISHER_NUM_CMD _IOW(0xA6, 26, struct ioctl_set_ros2_publisher_num_args)
+ #define AGNOCAST_NOTIFY_BRIDGE_SHUTDOWN_CMD _IO(0xA6, 27)
++#define AGNOCAST_ADD_UNLINK_DAEMON_CMD _IOWR(0xA6, 32, struct ioctl_add_unlink_daemon_args)
++#define AGNOCAST_UNLINK_DAEMON_SHOULD_EXIT_CMD \
++  _IOR(0xA6, 33, struct ioctl_unlink_daemon_should_exit_args)
+ 
+ }  // namespace agnocast
+diff --git a/src/agnocastlib/src/agnocast.cpp b/src/agnocastlib/src/agnocast.cpp
+index e2c394f..71cfc0b 100644
+--- a/src/agnocastlib/src/agnocast.cpp
++++ b/src/agnocastlib/src/agnocast.cpp
+@@ -184,6 +184,14 @@ initialize_agnocast_result acquire_agnocast_resources_for_bridge()
+ 
+ void poll_for_unlink()
+ {
++  struct ioctl_add_unlink_daemon_args add_daemon_args = {};
++  if (ioctl(agnocast_fd, AGNOCAST_ADD_UNLINK_DAEMON_CMD, &add_daemon_args) < 0) {
++    RCLCPP_ERROR(logger, "AGNOCAST_ADD_UNLINK_DAEMON_CMD failed: %s", strerror(errno));
++    close(agnocast_fd);
++    exit(EXIT_FAILURE);
++  }
++  if (add_daemon_args.ret_already_exists) return;
++
+   std::vector<exit_subscription_mq_info> mq_info_buf(MAX_SUBSCRIPTION_NUM_PER_PROCESS);
+ 
+   while (true) {
+@@ -218,7 +226,14 @@ void poll_for_unlink()
+     } while (get_exit_process_args.ret_pid > 0);
+ 
+     if (get_exit_process_args.ret_daemon_should_exit) {
+-      break;
++      struct ioctl_unlink_daemon_should_exit_args should_exit_args = {};
++      if (ioctl(agnocast_fd, AGNOCAST_UNLINK_DAEMON_SHOULD_EXIT_CMD, &should_exit_args) < 0) {
++        RCLCPP_ERROR(
++          logger, "AGNOCAST_UNLINK_DAEMON_SHOULD_EXIT_CMD failed: %s", strerror(errno));
++        close(agnocast_fd);
++        exit(EXIT_FAILURE);
++      }
++      if (should_exit_args.ret_should_exit) break;
+     }
+   }
+ 
+
