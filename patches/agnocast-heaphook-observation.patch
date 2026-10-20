@@ -1,0 +1,614 @@
+diff --git a/agnocast_heaphook/Cargo.toml b/agnocast_heaphook/Cargo.toml
+index 14c6098..13b5a70 100644
+--- a/agnocast_heaphook/Cargo.toml
++++ b/agnocast_heaphook/Cargo.toml
+@@ -14,6 +14,9 @@ description = "A heap runtime replacement for Agnocast"
+ [lib]
+ crate-type = ["cdylib"]
+ 
++[features]
++test-observation = []
++
+ [dependencies]
+ libc = "0.2"
+ # `unstable` exposes `allocation_usable_size`, used to find a freed block's extent for
+diff --git a/agnocast_heaphook/src/lib.rs b/agnocast_heaphook/src/lib.rs
+index 92744c5..23e297d 100644
+--- a/agnocast_heaphook/src/lib.rs
++++ b/agnocast_heaphook/src/lib.rs
+@@ -40,8 +40,24 @@ static RESOLVE_START_MAIN: extern "C" fn() = {
+ };
+ 
+ mod reclaim;
++#[cfg(feature = "test-observation")]
++mod test_observation;
+ mod tlsf;
+ 
++// Compile the wrapper out entirely unless test instrumentation was requested.
++macro_rules! observed_allocation {
++    ($ptr:expr, $size:expr, $shared:expr, $allocate:expr) => {{
++        #[cfg(feature = "test-observation")]
++        {
++            test_observation::allocate($ptr, $size, $shared, || $allocate)
++        }
++        #[cfg(not(feature = "test-observation"))]
++        {
++            $allocate
++        }
++    }};
++}
++
+ /// Version string exported as a C-compatible symbol for external querying.
+ /// Can be read via `dlsym` or `nm -D` on the shared library.
+ #[no_mangle]
+@@ -531,7 +547,9 @@ pub unsafe extern "C" fn __libc_start_main(
+ #[no_mangle]
+ pub extern "C" fn malloc(size: usize) -> *mut c_void {
+     if should_use_heap() {
+-        return unsafe { (*ORIGINAL_MALLOC.get_or_init(init_original_malloc))(size) };
++        return observed_allocation!(ptr::null_mut(), size, false, unsafe {
++            (*ORIGINAL_MALLOC.get_or_init(init_original_malloc))(size)
++        });
+     }
+ 
+     let layout = match Layout::from_size_align(size, MIN_ALIGN) {
+@@ -539,15 +557,20 @@ pub extern "C" fn malloc(size: usize) -> *mut c_void {
+         Err(_) => return ptr::null_mut(),
+     };
+ 
+-    match AGNOCAST_SHARED_MEMORY_ALLOCATOR
+-        .get()
+-        .unwrap()
+-        .inner
+-        .allocate(layout)
+-    {
+-        Some(non_null_ptr) => non_null_ptr.as_ptr().cast(),
+-        None => ptr::null_mut(),
+-    }
++    observed_allocation!(
++        ptr::null_mut(),
++        size,
++        true,
++        match AGNOCAST_SHARED_MEMORY_ALLOCATOR
++            .get()
++            .unwrap()
++            .inner
++            .allocate(layout)
++        {
++            Some(non_null_ptr) => non_null_ptr.as_ptr().cast(),
++            None => ptr::null_mut(),
++        }
++    )
+ }
+ 
+ /// # Safety
+@@ -559,6 +582,8 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
+     }
+ 
+     if !is_shared(ptr.cast()) {
++        #[cfg(feature = "test-observation")]
++        test_observation::notify(2, ptr, 0, false);
+         return (*ORIGINAL_FREE.get_or_init(init_original_free))(ptr);
+     }
+ 
+@@ -569,6 +594,8 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
+ 
+     let non_null_ptr = unsafe { NonNull::new_unchecked(ptr.cast()) };
+ 
++    #[cfg(feature = "test-observation")]
++    test_observation::notify(2, ptr, 0, true);
+     AGNOCAST_SHARED_MEMORY_ALLOCATOR
+         .get()
+         .unwrap()
+@@ -579,6 +606,12 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
+ #[no_mangle]
+ pub extern "C" fn calloc(num: usize, size: usize) -> *mut c_void {
+     if should_use_heap() {
++        #[cfg(feature = "test-observation")]
++        if let Some(total) = num.checked_mul(size) {
++            return observed_allocation!(ptr::null_mut(), total, false, unsafe {
++                (*ORIGINAL_CALLOC.get_or_init(init_original_calloc))(num, size)
++            });
++        }
+         return unsafe { (*ORIGINAL_CALLOC.get_or_init(init_original_calloc))(num, size) };
+     }
+ 
+@@ -591,21 +624,26 @@ pub extern "C" fn calloc(num: usize, size: usize) -> *mut c_void {
+         Err(_) => return ptr::null_mut(),
+     };
+ 
+-    match AGNOCAST_SHARED_MEMORY_ALLOCATOR
+-        .get()
+-        .unwrap()
+-        .inner
+-        .allocate(layout)
+-    {
+-        Some(non_null_ptr) => {
+-            let ptr = non_null_ptr.as_ptr();
+-            unsafe {
+-                ptr::write_bytes(ptr, 0, size);
++    observed_allocation!(
++        ptr::null_mut(),
++        size,
++        true,
++        match AGNOCAST_SHARED_MEMORY_ALLOCATOR
++            .get()
++            .unwrap()
++            .inner
++            .allocate(layout)
++        {
++            Some(non_null_ptr) => {
++                let ptr = non_null_ptr.as_ptr();
++                unsafe {
++                    ptr::write_bytes(ptr, 0, size);
++                }
++                ptr.cast()
+             }
+-            ptr.cast()
++            None => ptr::null_mut(),
+         }
+-        None => ptr::null_mut(),
+-    }
++    )
+ }
+ 
+ /// # Safety
+@@ -618,7 +656,12 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, new_size: usize) -> *mut c_vo
+     }
+ 
+     if !is_shared(ptr.cast()) {
+-        return (*ORIGINAL_REALLOC.get_or_init(init_original_realloc))(ptr, new_size);
++        return observed_allocation!(
++            ptr,
++            new_size,
++            false,
++            (*ORIGINAL_REALLOC.get_or_init(init_original_realloc))(ptr, new_size)
++        );
+     }
+ 
+     if should_use_heap() {
+@@ -633,25 +676,42 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, new_size: usize) -> *mut c_vo
+         Err(_) => return ptr::null_mut(),
+     };
+ 
+-    match AGNOCAST_SHARED_MEMORY_ALLOCATOR
+-        .get()
+-        .unwrap()
+-        .inner
+-        .reallocate(non_null_ptr, new_layout)
+-    {
+-        Some(non_null_ptr) => non_null_ptr.as_ptr().cast(),
+-        None => ptr::null_mut(),
+-    }
++    observed_allocation!(
++        ptr,
++        new_size,
++        true,
++        match AGNOCAST_SHARED_MEMORY_ALLOCATOR
++            .get()
++            .unwrap()
++            .inner
++            .reallocate(non_null_ptr, new_layout)
++        {
++            Some(non_null_ptr) => non_null_ptr.as_ptr().cast(),
++            None => ptr::null_mut(),
++        }
++    )
+ }
+ 
+ #[no_mangle]
+ pub extern "C" fn posix_memalign(memptr: &mut *mut c_void, alignment: usize, size: usize) -> i32 {
+     if should_use_heap() {
+-        return unsafe {
++        #[cfg(feature = "test-observation")]
++        if alignment.is_power_of_two()
++            && alignment % size_of::<*mut c_void>() == 0
++            && test_observation::notify(0, ptr::null_mut(), size, false)
++        {
++            return libc::ENOMEM;
++        }
++        let result = unsafe {
+             (*ORIGINAL_POSIX_MEMALIGN.get_or_init(init_original_posix_memalign))(
+                 memptr, alignment, size,
+             )
+         };
++        #[cfg(feature = "test-observation")]
++        if result == 0 && !memptr.is_null() {
++            test_observation::notify(1, *memptr, size, false);
++        }
++        return result;
+     }
+ 
+     // `alignment` must be a power of two and a multiple of `sizeof(void *)`.
+@@ -664,6 +724,10 @@ pub extern "C" fn posix_memalign(memptr: &mut *mut c_void, alignment: usize, siz
+         Err(_) => return libc::ENOMEM,
+     };
+ 
++    #[cfg(feature = "test-observation")]
++    if test_observation::notify(0, ptr::null_mut(), size, true) {
++        return libc::ENOMEM;
++    }
+     match AGNOCAST_SHARED_MEMORY_ALLOCATOR
+         .get()
+         .unwrap()
+@@ -672,6 +736,8 @@ pub extern "C" fn posix_memalign(memptr: &mut *mut c_void, alignment: usize, siz
+     {
+         Some(non_null_ptr) => {
+             *memptr = non_null_ptr.as_ptr().cast();
++            #[cfg(feature = "test-observation")]
++            test_observation::notify(1, *memptr, size, true);
+             0
+         }
+         None => libc::ENOMEM,
+@@ -681,9 +747,15 @@ pub extern "C" fn posix_memalign(memptr: &mut *mut c_void, alignment: usize, siz
+ #[no_mangle]
+ pub extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_void {
+     if should_use_heap() {
+-        return unsafe {
++        #[cfg(feature = "test-observation")]
++        if !alignment.is_power_of_two() || size & (alignment - 1) != 0 {
++            return unsafe {
++                (*ORIGINAL_ALIGNED_ALLOC.get_or_init(init_original_aligned_alloc))(alignment, size)
++            };
++        }
++        return observed_allocation!(ptr::null_mut(), size, false, unsafe {
+             (*ORIGINAL_ALIGNED_ALLOC.get_or_init(init_original_aligned_alloc))(alignment, size)
+-        };
++        });
+     }
+ 
+     // `alignment` should be a power of two and `size` should be a multiple of `alignment`.
+@@ -696,23 +768,34 @@ pub extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_void {
+         Err(_) => return ptr::null_mut(),
+     };
+ 
+-    match AGNOCAST_SHARED_MEMORY_ALLOCATOR
+-        .get()
+-        .unwrap()
+-        .inner
+-        .allocate(layout)
+-    {
+-        Some(non_null_ptr) => non_null_ptr.as_ptr().cast(),
+-        None => std::ptr::null_mut(),
+-    }
++    observed_allocation!(
++        ptr::null_mut(),
++        size,
++        true,
++        match AGNOCAST_SHARED_MEMORY_ALLOCATOR
++            .get()
++            .unwrap()
++            .inner
++            .allocate(layout)
++        {
++            Some(non_null_ptr) => non_null_ptr.as_ptr().cast(),
++            None => std::ptr::null_mut(),
++        }
++    )
+ }
+ 
+ #[no_mangle]
+ pub extern "C" fn memalign(alignment: usize, size: usize) -> *mut c_void {
+     if should_use_heap() {
+-        return unsafe {
++        #[cfg(feature = "test-observation")]
++        if !alignment.is_power_of_two() {
++            return unsafe {
++                (*ORIGINAL_MEMALIGN.get_or_init(init_original_memalign))(alignment, size)
++            };
++        }
++        return observed_allocation!(ptr::null_mut(), size, false, unsafe {
+             (*ORIGINAL_MEMALIGN.get_or_init(init_original_memalign))(alignment, size)
+-        };
++        });
+     }
+ 
+     // `alignment` must be a power of two.
+@@ -721,15 +804,20 @@ pub extern "C" fn memalign(alignment: usize, size: usize) -> *mut c_void {
+         Err(_) => return ptr::null_mut(),
+     };
+ 
+-    match AGNOCAST_SHARED_MEMORY_ALLOCATOR
+-        .get()
+-        .unwrap()
+-        .inner
+-        .allocate(layout)
+-    {
+-        Some(non_null_ptr) => non_null_ptr.as_ptr().cast(),
+-        None => std::ptr::null_mut(),
+-    }
++    observed_allocation!(
++        ptr::null_mut(),
++        size,
++        true,
++        match AGNOCAST_SHARED_MEMORY_ALLOCATOR
++            .get()
++            .unwrap()
++            .inner
++            .allocate(layout)
++        {
++            Some(non_null_ptr) => non_null_ptr.as_ptr().cast(),
++            None => std::ptr::null_mut(),
++        }
++    )
+ }
+ 
+ #[no_mangle]
+diff --git a/agnocast_heaphook/src/test_observation.rs b/agnocast_heaphook/src/test_observation.rs
+new file mode 100644
+--- /dev/null
++++ b/agnocast_heaphook/src/test_observation.rs
+@@ -0,0 +1,273 @@
++//! Allocation-free instrumentation enabled only for system contract tests.
++
++use std::{
++    os::raw::c_void,
++    ptr,
++    sync::atomic::{AtomicPtr, Ordering},
++};
++
++/// Observer ABI: event, pointer, requested bytes, shared-pool routing.
++pub type Observer = unsafe extern "C" fn(u32, *mut c_void, usize, bool) -> bool;
++
++static OBSERVER: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
++
++/// Installs a process-wide test observer, or disables observation with NULL.
++///
++/// Event 0 precedes allocation; returning true injects ENOMEM without allocating
++/// or releasing a realloc input. Its pointer is NULL except for realloc.
++/// Event 1 reports a successful allocation and its requested size. Event 2
++/// precedes an actual free and has size zero. Return values for events 1 and 2
++/// are ignored. Realloc's internal relocation does not emit a separate event 2.
++/// Requests rejected by argument validation bypass the observer.
++///
++/// # Safety
++///
++/// The callback must not allocate, log, unwind, change errno, or call allocator
++/// hooks recursively. It may run concurrently on any allocating thread. Its code
++/// must remain loaded until all in-flight calls have finished, including after
++/// replacement or disabling. The caller owns that synchronization.
++#[no_mangle]
++pub unsafe extern "C" fn agnocast_heaphook_test_set_observer(observer: Option<Observer>) {
++    OBSERVER.store(
++        observer.map_or(ptr::null_mut(), |callback| callback as *mut c_void),
++        Ordering::Release,
++    );
++}
++
++/// Returns whether an address is inside the initialized shared pool.
++///
++/// Does not dereference the address or initialize the allocator. NULL and any
++/// address outside the exact half-open pool range return false.
++#[no_mangle]
++pub extern "C" fn agnocast_heaphook_test_is_shared(ptr: *const c_void) -> bool {
++    super::is_shared(ptr.cast())
++}
++
++#[inline]
++pub(super) fn notify(event: u32, ptr: *mut c_void, size: usize, shared: bool) -> bool {
++    let observer = OBSERVER.load(Ordering::Acquire);
++    if observer.is_null() {
++        return false;
++    }
++    let observer: Observer = unsafe { std::mem::transmute(observer) };
++    unsafe { observer(event, ptr, size, shared) }
++}
++
++#[inline]
++pub(super) fn allocate(
++    ptr: *mut c_void,
++    size: usize,
++    shared: bool,
++    allocate: impl FnOnce() -> *mut c_void,
++) -> *mut c_void {
++    if notify(0, ptr, size, shared) {
++        unsafe { *libc::__errno_location() = libc::ENOMEM };
++        return ptr::null_mut();
++    }
++    let result = allocate();
++    if !result.is_null() {
++        notify(1, result, size, shared);
++    }
++    result
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::{
++        atomic::{AtomicBool, AtomicI64, AtomicUsize},
++        Mutex, MutexGuard,
++    };
++
++    static LOCK: Mutex<()> = Mutex::new(());
++    static THREAD: AtomicI64 = AtomicI64::new(0);
++    static FAIL_NEXT: AtomicBool = AtomicBool::new(false);
++    static COUNTS: [AtomicUsize; 3] = [
++        AtomicUsize::new(0),
++        AtomicUsize::new(0),
++        AtomicUsize::new(0),
++    ];
++    static POINTERS: [AtomicUsize; 3] = [
++        AtomicUsize::new(0),
++        AtomicUsize::new(0),
++        AtomicUsize::new(0),
++    ];
++    static SIZE: AtomicUsize = AtomicUsize::new(0);
++    static SHARED: AtomicBool = AtomicBool::new(false);
++
++    unsafe extern "C" fn observer(event: u32, ptr: *mut c_void, size: usize, shared: bool) -> bool {
++        if THREAD.load(Ordering::Relaxed) != libc::syscall(libc::SYS_gettid) {
++            return false;
++        }
++        COUNTS[event as usize].fetch_add(1, Ordering::Relaxed);
++        POINTERS[event as usize].store(ptr as usize, Ordering::Relaxed);
++        SIZE.store(size, Ordering::Relaxed);
++        SHARED.store(shared, Ordering::Relaxed);
++        event != 0 || FAIL_NEXT.swap(false, Ordering::Relaxed)
++    }
++
++    struct Observation(MutexGuard<'static, ()>);
++
++    impl Observation {
++        fn new() -> Self {
++            let observation = Self(LOCK.lock().unwrap());
++            for value in COUNTS.iter().chain(POINTERS.iter()) {
++                value.store(0, Ordering::Relaxed);
++            }
++            FAIL_NEXT.store(false, Ordering::Relaxed);
++            unsafe {
++                agnocast_heaphook_test_set_observer(Some(observer));
++                THREAD.store(libc::syscall(libc::SYS_gettid), Ordering::Relaxed);
++            }
++            observation
++        }
++    }
++
++    impl Drop for Observation {
++        fn drop(&mut self) {
++            THREAD.store(0, Ordering::Relaxed);
++            unsafe { agnocast_heaphook_test_set_observer(None) };
++        }
++    }
++
++    const ALLOCATORS: [fn() -> *mut c_void; 6] = [
++        || crate::malloc(64),
++        || crate::calloc(4, 16),
++        || unsafe { crate::realloc(ptr::null_mut(), 64) },
++        || crate::aligned_alloc(32, 64),
++        || crate::memalign(32, 64),
++        || {
++            let mut ptr = ptr::null_mut();
++            crate::posix_memalign(&mut ptr, 32, 64);
++            ptr
++        },
++    ];
++
++    #[test]
++    fn every_allocator_reports_one_attempt_result_and_free() {
++        for allocator in ALLOCATORS {
++            let _observation = Observation::new();
++            let ptr = allocator();
++            assert!(!ptr.is_null());
++            assert_eq!(COUNTS[0].load(Ordering::Relaxed), 1);
++            assert_eq!(COUNTS[1].load(Ordering::Relaxed), 1);
++            assert_eq!(POINTERS[0].load(Ordering::Relaxed), 0);
++            assert_eq!(POINTERS[1].load(Ordering::Relaxed), ptr as usize);
++            assert_eq!(SIZE.load(Ordering::Relaxed), 64);
++            assert!(SHARED.load(Ordering::Relaxed));
++            unsafe { crate::free(ptr) };
++            assert_eq!(COUNTS[2].load(Ordering::Relaxed), 1);
++            assert_eq!(POINTERS[2].load(Ordering::Relaxed), ptr as usize);
++            assert_eq!(SIZE.load(Ordering::Relaxed), 0);
++            assert!(SHARED.load(Ordering::Relaxed));
++        }
++    }
++
++    #[test]
++    fn injected_failure_is_one_shot_and_next_allocation_succeeds() {
++        for (index, allocator) in ALLOCATORS.into_iter().enumerate() {
++            let _observation = Observation::new();
++            unsafe { *libc::__errno_location() = 0 };
++            FAIL_NEXT.store(true, Ordering::Relaxed);
++            let failed = allocator();
++            assert!(failed.is_null());
++            let expected_errno = if index == 5 { 0 } else { libc::ENOMEM };
++            assert_eq!(unsafe { *libc::__errno_location() }, expected_errno);
++            assert_eq!(COUNTS[0].load(Ordering::Relaxed), 1);
++            assert_eq!(COUNTS[1].load(Ordering::Relaxed), 0);
++            assert_eq!(COUNTS[2].load(Ordering::Relaxed), 0);
++            let ptr = allocator();
++            assert!(!ptr.is_null());
++            assert_eq!(COUNTS[0].load(Ordering::Relaxed), 2);
++            assert_eq!(COUNTS[1].load(Ordering::Relaxed), 1);
++            unsafe { crate::free(ptr) };
++        }
++    }
++
++    #[test]
++    fn realloc_injection_preserves_shared_and_heap_inputs() {
++        for shared in [true, false] {
++            let ptr = if shared {
++                crate::malloc(64)
++            } else {
++                unsafe { (*crate::ORIGINAL_MALLOC.get_or_init(crate::init_original_malloc))(64) }
++            };
++            assert!(!ptr.is_null());
++            unsafe { ptr::write_bytes(ptr.cast::<u8>(), 0xa5, 64) };
++            let _observation = Observation::new();
++            FAIL_NEXT.store(true, Ordering::Relaxed);
++            let result = unsafe { crate::realloc(ptr, 128) };
++            assert!(result.is_null());
++            assert_eq!(unsafe { *libc::__errno_location() }, libc::ENOMEM);
++            assert_eq!(POINTERS[0].load(Ordering::Relaxed), ptr as usize);
++            assert_eq!(COUNTS[1].load(Ordering::Relaxed), 0);
++            assert_eq!(COUNTS[2].load(Ordering::Relaxed), 0);
++            assert_eq!(SHARED.load(Ordering::Relaxed), shared);
++            for offset in 0..64 {
++                assert_eq!(unsafe { *ptr.cast::<u8>().add(offset) }, 0xa5);
++            }
++            let resized = unsafe { crate::realloc(ptr, 128) };
++            assert!(!resized.is_null());
++            assert_eq!(SHARED.load(Ordering::Relaxed), shared);
++            unsafe { crate::free(resized) };
++            assert_eq!(COUNTS[2].load(Ordering::Relaxed), 1);
++            assert_eq!(SHARED.load(Ordering::Relaxed), shared);
++        }
++    }
++
++    #[test]
++    fn posix_failure_preserves_output_and_errno_and_invalid_alignment_wins() {
++        let _observation = Observation::new();
++        let mut output = 0x1234usize as *mut c_void;
++        unsafe { *libc::__errno_location() = libc::EINTR };
++        FAIL_NEXT.store(true, Ordering::Relaxed);
++        let invalid = crate::posix_memalign(&mut output, 3, 64);
++        let pending = FAIL_NEXT.load(Ordering::Relaxed);
++        let failed = crate::posix_memalign(&mut output, 32, 64);
++        assert_eq!(invalid, libc::EINVAL);
++        assert!(pending);
++        assert_eq!(failed, libc::ENOMEM);
++        assert_eq!(output as usize, 0x1234);
++        assert_eq!(unsafe { *libc::__errno_location() }, libc::EINTR);
++        assert_eq!(COUNTS[0].load(Ordering::Relaxed), 1);
++        assert_eq!(COUNTS[1].load(Ordering::Relaxed), 0);
++    }
++
++    #[test]
++    fn invalid_shared_requests_do_not_consume_injection() {
++        let _observation = Observation::new();
++        FAIL_NEXT.store(true, Ordering::Relaxed);
++        let overflow = crate::calloc(usize::MAX, 2);
++        let alignment = crate::aligned_alloc(3, 64);
++        let layout = crate::malloc(usize::MAX);
++        let pending = FAIL_NEXT.swap(false, Ordering::Relaxed);
++        assert!(overflow.is_null() && alignment.is_null() && layout.is_null());
++        assert!(pending);
++        assert_eq!(COUNTS[0].load(Ordering::Relaxed), 0);
++    }
++
++    #[test]
++    fn disabled_observer_leaves_allocator_and_exact_pool_query_usable() {
++        let _observation = Observation::new();
++        unsafe { agnocast_heaphook_test_set_observer(None) };
++        let ptr = crate::malloc(64);
++        assert!(!ptr.is_null());
++        assert!(agnocast_heaphook_test_is_shared(ptr));
++        let pool = crate::AGNOCAST_SHARED_MEMORY.get().unwrap();
++        assert!(!agnocast_heaphook_test_is_shared(ptr::null()));
++        assert!(!agnocast_heaphook_test_is_shared(
++            (pool.start - 1) as *const c_void
++        ));
++        assert!(agnocast_heaphook_test_is_shared(
++            pool.start as *const c_void
++        ));
++        assert!(agnocast_heaphook_test_is_shared(
++            (pool.end - 1) as *const c_void
++        ));
++        assert!(!agnocast_heaphook_test_is_shared(pool.end as *const c_void));
++        unsafe { crate::free(ptr) };
++        assert_eq!(COUNTS[0].load(Ordering::Relaxed), 0);
++        assert_eq!(COUNTS[1].load(Ordering::Relaxed), 0);
++        assert_eq!(COUNTS[2].load(Ordering::Relaxed), 0);
++    }
++}
