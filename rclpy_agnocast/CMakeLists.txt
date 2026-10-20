@@ -69,6 +69,15 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)
 
+  target_compile_definitions(rclpy_agnocast_core PUBLIC BUILD_TESTING)
+  target_sources(rclpy_agnocast_core PRIVATE src/publisher/observation.cpp)
+  target_link_libraries(rclpy_agnocast_core PUBLIC ${CMAKE_DL_LIBS})
+  target_sources(_native PRIVATE src/publisher/bind_observation.cpp)
+
+  ament_add_gtest(test_publisher_observation test/publisher/test_observation.cpp)
+  target_include_directories(test_publisher_observation PRIVATE src)
+  target_link_libraries(test_publisher_observation rclpy_agnocast_core)
+
   add_executable(rclpy_agnocast_shared_buffer_subscriber
     test/support/shared_buffer_subscriber.cpp
   )

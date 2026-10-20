@@ -2,6 +2,7 @@
 
 #include "agnocast/agnocast.hpp"
 #include "rclpy_agnocast_msgs/msg/shared_buffer.hpp"
+#include "publisher/observation.hpp"
 
 #include <mutex>
 #include <set>
@@ -68,35 +69,79 @@ class SharedBufferBackend final : public PublisherBackend
 {
 public:
   explicit SharedBufferBackend(NativePublisher::SharedPtr publisher)
-  : publisher_(std::move(publisher)) {}
+  : publisher_(std::move(publisher))
+  {
+#ifdef BUILD_TESTING
+    observation::record(observation::Event::kCreate);
+#endif
+  }
 
   BorrowedStorage borrow(const std::size_t size) override
   {
     if (loan_) throw std::logic_error("publisher already has a native loan");
-    auto candidate = publisher_->borrow_loaned_message();
+#ifdef BUILD_TESTING
+    observation::record(observation::Event::kBorrow);
+#endif
+    NativeLoan candidate;
+    try {
+      candidate = publisher_->borrow_loaned_message();
+    } catch (...) {
+#ifdef BUILD_TESTING
+      observation::record(observation::Event::kBorrowFailed);
+#endif
+      throw;
+    }
+#ifdef BUILD_TESTING
+    observation::record(
+      observation::Event::kResize, reinterpret_cast<std::uintptr_t>(candidate.get()));
+#endif
     try {
       candidate->data.resize(size);
     } catch (...) {
       candidate.reset();
+#ifdef BUILD_TESTING
+      observation::record(observation::Event::kResizeFailed);
+#endif
       throw;
     }
     auto storage = BorrowedStorage{&candidate->sequence, candidate->data.data(), size};
     loan_ = std::move(candidate);
+#ifdef BUILD_TESTING
+    observation::record(
+      observation::Event::kBorrowed, reinterpret_cast<std::uintptr_t>(loan_.get()),
+      reinterpret_cast<std::uintptr_t>(storage.data));
+#endif
     return storage;
   }
 
   void publish() override
   {
     if (!loan_) throw std::logic_error("publisher has no native loan");
+#ifdef BUILD_TESTING
+    observation::record(observation::Event::kPublish);
+#endif
     try {
       publisher_->publish(std::move(loan_));
     } catch (...) {
       loan_.reset();
       throw;
     }
+#ifdef BUILD_TESTING
+    observation::record(observation::Event::kPublished);
+#endif
   }
 
-  void cancel() noexcept override {loan_.reset();}
+  void cancel() noexcept override
+  {
+    if (!loan_) return;
+#ifdef BUILD_TESTING
+    observation::record(observation::Event::kCancel);
+#endif
+    loan_.reset();
+#ifdef BUILD_TESTING
+    observation::record(observation::Event::kCancelled);
+#endif
+  }
 
 private:
   NativePublisher::SharedPtr publisher_;

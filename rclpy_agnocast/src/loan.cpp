@@ -260,6 +260,17 @@ std::size_t LoanState::active_writable_exports() const {return lifecycle_.export
 
 LoanPhase LoanState::phase() const {return lifecycle_.phase();}
 
+#ifdef BUILD_TESTING
+PublisherWorkerResult LoanState::test_replay_publish()
+{
+  const auto current = phase();
+  if (current != LoanPhase::kPublished && current != LoanPhase::kCancelled) {
+    throw std::logic_error("only a terminal Loan token may be replayed");
+  }
+  return worker_->publish(identity_.publisher_id, identity_.generation);
+}
+#endif
+
 LoanIdentity LoanState::caller_identity(const std::uintptr_t publisher_id) const
 {
   return {publisher_id, identity_.generation, identity_.creator_thread};

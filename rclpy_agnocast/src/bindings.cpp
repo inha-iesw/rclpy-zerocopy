@@ -14,6 +14,9 @@ namespace py = pybind11;
 
 namespace rclpy_agnocast
 {
+#ifdef BUILD_TESTING
+void bind_observation(py::module_ & module);
+#endif
 namespace binding_detail
 {
 
@@ -94,4 +97,7 @@ PYBIND11_MODULE(_native, module)
   }
   rclpy_agnocast::bind_publisher(module);
   rclpy_agnocast::bind_runtime(module);
+#ifdef BUILD_TESTING
+  rclpy_agnocast::bind_observation(module);
+#endif
 }

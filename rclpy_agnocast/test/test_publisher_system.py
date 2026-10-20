@@ -78,6 +78,7 @@ def _publisher_command(config: SystemConfig, topic: str) -> list[str]:
         "1",
         "--max-payload-bytes",
         str(PAYLOAD_LIMIT),
+        "--observe",
     ]
 
 
@@ -189,24 +190,37 @@ def test_actual_alias_exception_and_active_close_recover(backend_pair):
     _publish_and_receive(publisher, subscriber, 32, 402)
 
 
-UNOBSERVED_NATIVE_CASES = (
-    ("PUB-01", "production worker/backend thread IDs are not exposed"),
-    ("PUB-02", "caller and worker Agnocast TLS values are not exposed"),
-    ("PUB-03", "the filling backend-access epoch and 1,000-run are pending"),
-    ("PUB-06", "the production native data pointer is not exposed"),
-    ("PUB-09", "cancel recovery is covered, but terminal TLS zero is not exposed"),
-    ("PUB-11", "held-view deferred-cancel observation is pending"),
-    ("PUB-12", "production stale-token and foreign-thread coverage is pending"),
-    ("PUB-14", "native borrow-entry count is not exposed"),
-    ("PUB-15", "production allocation-failure injection is not available"),
-    ("PUB-17", "worker-TID allocation auditing is not available"),
-    ("PUB-18", "production terminal enqueue count and TLS are not exposed"),
+@pytest.mark.parametrize(
+    "pub_case",
+    ["PUB-01", "PUB-02", "PUB-06", "PUB-09", "PUB-11", "PUB-12",
+     "PUB-14", "PUB-15-borrow-0", "PUB-15-borrow-1", "PUB-15-borrow-2",
+     "PUB-15-resize-0", "PUB-17", "PUB-18"],
 )
+def test_native_observation_contract(backend_pair, pub_case):
+    publisher, subscriber = backend_pair
+    publisher.send(f"observe-case {pub_case}")
+    evidence = publisher.wait_event("OBSERVED")
+    assert evidence["case"] == pub_case
+    if pub_case == "PUB-01":
+        received = subscriber.wait_event("RX")
+        assert int(received["sequence"]) == 8101
+        assert int(received["bytes"]) == 16
+        assert received["content_valid"] == "true"
+    # Recovery is verified by the independent C++ subscriber after every scenario.
+    recovery_size = 1 if pub_case.startswith("PUB-15-") else 32
+    _publish_and_receive(publisher, subscriber, recovery_size, 9100)
 
 
-@pytest.mark.parametrize("pub_case,reason", UNOBSERVED_NATIVE_CASES)
-def test_native_observation_case_is_not_claimed(
-    system_config: SystemConfig, pub_case: str, reason: str
-) -> None:
-    del system_config
-    pytest.xfail(f"{pub_case} unsupported in the current native observation API: {reason}")
+def test_cross_thread_fill_visibility_for_1000_messages(backend_pair):
+    publisher, subscriber = backend_pair
+    for sequence in range(1000):
+        size = (1, 64, PAYLOAD_LIMIT - 1, PAYLOAD_LIMIT)[sequence % 4]
+        publisher.send(f"observe-publish {size} {sequence}")
+        sent = publisher.wait_event("PUBLISHED")
+        received = subscriber.wait_event("RX")
+        assert int(sent["sequence"]) == sequence
+        assert int(received["sequence"]) == sequence
+        assert int(received["bytes"]) == size
+        assert int(received["checksum"]) == payload_checksum(sequence, size)
+        assert received["content_valid"] == "true"
+        assert sent["invalidated"] == "true"

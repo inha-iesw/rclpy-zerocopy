@@ -236,6 +236,15 @@ public:
   /** @brief Return current lifecycle phase. */
   LoanPhase phase() const;
 
+#ifdef BUILD_TESTING
+  /**
+   * @brief Replay a terminal loan's original token to test the worker generation guard.
+   * @return Actual worker validation result without modifying the loan identity.
+   * @throws std::logic_error if this loan has not completed a terminal action.
+   */
+  PublisherWorkerResult test_replay_publish();
+#endif
+
 private:
   LoanIdentity caller_identity(std::uintptr_t publisher_id) const;
   void clear_region() noexcept;

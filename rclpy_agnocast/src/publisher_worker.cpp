@@ -1,4 +1,5 @@
 #include "rclpy_agnocast/publisher_worker.hpp"
+#include "publisher/observation.hpp"
 
 #include <condition_variable>
 #include <map>
@@ -99,6 +100,9 @@ public:
       command_slot_ = {Command::kCancel, publisher_id, 0U, generation, nullptr};
       completion_ready_ = false;
       command_ready_ = true;
+#ifdef BUILD_TESTING
+      observation::enqueued(true);
+#endif
       command_cv_.notify_one();
       return PublisherWorkerError::kNone;
     } catch (...) {
@@ -155,6 +159,9 @@ private:
     if (active_generation_ != generation) return error_result(PublisherWorkerError::kStaleGeneration);
     if (command_ready_) return error_result(PublisherWorkerError::kBusy);
     CommandSlot slot{command, publisher_id, 0U, generation, nullptr};
+#ifdef BUILD_TESTING
+    observation::enqueued(false);
+#endif
     return command_result(submit(state_lock, std::move(slot)));
   }
 
@@ -231,7 +238,18 @@ private:
         slot = std::move(command_slot_);
       }
 
+#ifdef BUILD_TESTING
+      observation::filling(false);
+#endif
       auto completion = execute(slot);
+#ifdef BUILD_TESTING
+      if (
+        slot.command == Command::kBorrow &&
+        completion.error == PublisherWorkerError::kNone)
+      {
+        observation::filling(true);
+      }
+#endif
       const bool should_stop = slot.command == Command::kStop;
       {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -249,6 +267,14 @@ private:
         if (slot.command == Command::kPublish) {
           active_ = false;
         }
+#ifdef BUILD_TESTING
+        if (
+          completion.error == PublisherWorkerError::kNone &&
+          (slot.command == Command::kPublish || slot.command == Command::kCancel))
+        {
+          observation::completed(slot.command == Command::kPublish);
+        }
+#endif
         completion_ = std::move(completion);
         command_ready_ = false;
         completion_ready_ = true;

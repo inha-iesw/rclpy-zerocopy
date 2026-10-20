@@ -33,6 +33,7 @@ class PublisherSession:
     def __init__(self, arguments):
         import rclpy
         from rclpy_agnocast import AgnocastRuntime
+        from rclpy_agnocast import _native
 
         self._rclpy = rclpy
         self._topic = arguments.topic
@@ -41,6 +42,9 @@ class PublisherSession:
         rclpy.init(args=[])
         self._node = rclpy.create_node(f"rclpy_agnocast_system_{os.getpid()}")
         self._runtime = AgnocastRuntime(self._node)
+        if arguments.observe:
+            _native._test_enable_observation()
+        self._observe = arguments.observe
         self._publisher = self._create_publisher()
 
     def _create_publisher(self):
@@ -182,6 +186,8 @@ class PublisherSession:
             "context-error": self.context_error,
             "recreate": self.recreate,
             "close-active": self.close_active,
+            "observe-case": self.observe_case,
+            "observe-publish": self.observe_publish,
         }
         for raw_line in sys.stdin:
             fields = shlex.split(raw_line)
@@ -199,12 +205,30 @@ class PublisherSession:
                     message=str(error),
                 )
 
+    def observe_case(self, arguments):
+        """Execute one real-backend observation scenario."""
+        from publisher_observation import run_case
+
+        _expect(arguments, 1, "observe-case")
+        emit("OBSERVED", case=arguments[0], **run_case(self, arguments[0]))
+
+    def observe_publish(self, arguments):
+        """Publish one directly filled payload with native observation evidence."""
+        from publisher_observation import observed_publish
+
+        _expect(arguments, 2, "observe-publish")
+        size, sequence = map(int, arguments)
+        emit("PUBLISHED", sequence=sequence, **observed_publish(self, size, sequence))
+
     def close(self):
         """Close in the supported adapter-before-rclpy order."""
         try:
             self._publisher.close()
             self._runtime.close()
         finally:
+            if self._observe:
+                from rclpy_agnocast import _native
+                _native._test_disable_observation()
             self._node.destroy_node()
             self._rclpy.shutdown()
 
@@ -214,6 +238,7 @@ def _arguments():
     parser.add_argument("--topic", required=True)
     parser.add_argument("--depth", type=int, required=True)
     parser.add_argument("--max-payload-bytes", type=int, required=True)
+    parser.add_argument("--observe", action="store_true")
     return parser.parse_args()
 
 
