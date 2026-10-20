@@ -1,0 +1,345 @@
+Agnocast embedded logging ownership patch
+
+Base: d9e28957bfe5b1220e218b0c98511d4174ab09e4
+Preserves standalone defaults; embedding runtimes opt out of rcl logging ownership.
+Apply from the Agnocast checkout with:
+  git apply /workspace/rclpy_zerocopy_ws/patches/agnocast-embedded-logging.patch
+diff --git a/src/agnocastlib/include/agnocast/node/agnocast_context.hpp b/src/agnocastlib/include/agnocast/node/agnocast_context.hpp
+index c58a7a0..ad30915 100644
+--- a/src/agnocastlib/include/agnocast/node/agnocast_context.hpp
++++ b/src/agnocastlib/include/agnocast/node/agnocast_context.hpp
+@@ -9,6 +9,18 @@
+ namespace agnocast
+ {
+ 
++/** @brief Select ownership of process-global services during initialization. */
++struct InitOptions
++{
++  /**
++   * @brief Configure rcl logging and finalize it on explicit Agnocast shutdown.
++   *
++   * Set false when an embedding runtime owns logging. That runtime must keep
++   * logging available until Agnocast shutdown completes.
++   */
++  bool configure_logging = true;
++};
++
+ class Context
+ {
+   struct CommandLineParams
+@@ -20,6 +32,20 @@ public:
+   CommandLineParams command_line_params;
+ 
+   void init(int argc, char const * const * argv);
++  /**
++   * @brief Initialize context state using the selected logging policy.
++   *
++   * An initialized context ignores subsequent options. Direct Context users
++   * manage logging cleanup themselves; Context::shutdown() only invalidates state.
++   * Use agnocast::init()/shutdown() to manage the process-global lifetime.
++   *
++   * @param argc Number of command-line arguments.
++   * @param argv Borrowed argument array; may be null when argc is zero.
++   * @param options Logging policy for this initialization.
++   * @return Nothing.
++   * @throws std::runtime_error If ROS arguments cannot be parsed.
++   */
++  void init(int argc, char const * const * argv, const InitOptions & options);
+   void shutdown();
+   bool is_initialized() const { return initialized_; }
+ 
+@@ -36,15 +62,42 @@ private:
+ extern Context g_context;
+ extern std::mutex g_context_mtx;
+ 
+-/// @brief Initialize Agnocast. Must be called once before creating any agnocast::Node.
+-/// This is the counterpart of rclcpp::init() for agnocast::Node.
+-/// @param argc Number of command-line arguments.
+-/// @param argv Command-line argument array.
++/**
++ * @brief Initialize Agnocast with standalone logging ownership.
++ *
++ * Equivalent to init(argc, argv, InitOptions{}).
++ *
++ * @param argc Number of command-line arguments.
++ * @param argv Borrowed argument array; may be null when argc is zero.
++ * @return Nothing.
++ */
+ AGNOCAST_PUBLIC
+ void init(int argc, char const * const * argv);
+ 
+-/// @brief Shut down Agnocast. Should be called before process exit in agnocast::Node processes.
+-/// This is the counterpart of rclcpp::shutdown() for agnocast::Node.
++/**
++ * @brief Initialize Agnocast with explicit process-global logging ownership.
++ *
++ * Must precede creation of agnocast::Node. An already initialized context keeps
++ * its original policy. Signal handler installation and chaining are unchanged.
++ *
++ * @param argc Number of command-line arguments.
++ * @param argv Borrowed argument array; may be null when argc is zero.
++ * @param options Set configure_logging=false to preserve an embedding runtime's logging.
++ * @return Nothing.
++ * @pre Serialize init/shutdown calls and explicitly shut down each lifetime before restarting.
++ * @throws std::runtime_error If ROS arguments cannot be parsed.
++ */
++AGNOCAST_PUBLIC
++void init(int argc, char const * const * argv, const InitOptions & options);
++
++/**
++ * @brief Stop Agnocast and finalize only logging owned by its initialization.
++ *
++ * Explicit shutdown is required even after a signal invalidates the context.
++ * Calls without an owned logging lifetime leave external logging untouched.
++ *
++ * @return Nothing.
++ */
+ AGNOCAST_PUBLIC
+ void shutdown();
+ 
+diff --git a/src/agnocastlib/src/node/agnocast_context.cpp b/src/agnocastlib/src/node/agnocast_context.cpp
+index 15484a2..448fca1 100644
+--- a/src/agnocastlib/src/node/agnocast_context.cpp
++++ b/src/agnocastlib/src/node/agnocast_context.cpp
+@@ -15,7 +15,18 @@ namespace agnocast
+ Context g_context;
+ std::mutex g_context_mtx;
+ 
++namespace
++{
++// Protected by g_context_mtx; signal-driven context invalidation does not release logging.
++bool g_owns_logging = false;
++}  // namespace
++
+ void Context::init(int argc, char const * const * argv)
++{
++  init(argc, argv, InitOptions{});
++}
++
++void Context::init(int argc, char const * const * argv, const InitOptions & options)
+ {
+   if (initialized_) {
+     return;
+@@ -38,13 +49,15 @@ void Context::init(int argc, char const * const * argv)
+   // --disable-external-lib-logs from parsed_arguments_ and registers only the
+   // enabled sub-handlers inside rcl_logging_multiple_output_handler, so stdout
+   // can be suppressed while file logging via spdlog is preserved.
+-  rcl_allocator_t allocator = rcl_get_default_allocator();
+-  rcl_ret_t ret = rcl_logging_configure_with_output_handler(
+-    parsed_arguments_.get(), &allocator, rcl_logging_multiple_output_handler);
+-  if (ret != RCL_RET_OK) {
+-    RCUTILS_LOG_ERROR_NAMED(
+-      "agnocast", "Failed to configure logging: %s", rcl_get_error_string().str);
+-    rcl_reset_error();
++  if (options.configure_logging) {
++    rcl_allocator_t allocator = rcl_get_default_allocator();
++    rcl_ret_t ret = rcl_logging_configure_with_output_handler(
++      parsed_arguments_.get(), &allocator, rcl_logging_multiple_output_handler);
++    if (ret != RCL_RET_OK) {
++      RCUTILS_LOG_ERROR_NAMED(
++        "agnocast", "Failed to configure logging: %s", rcl_get_error_string().str);
++      rcl_reset_error();
++    }
+   }
+ 
+   initialized_ = true;
+@@ -60,29 +73,42 @@ void Context::shutdown()
+ }
+ 
+ void init(int argc, char const * const * argv)
++{
++  init(argc, argv, InitOptions{});
++}
++
++void init(int argc, char const * const * argv, const InitOptions & options)
+ {
+   {
+     std::lock_guard<std::mutex> lock(g_context_mtx);
+-    g_context.init(argc, argv);
++    if (!g_context.is_initialized()) {
++      g_context.init(argc, argv, options);
++      g_owns_logging = g_owns_logging || options.configure_logging;
++    }
+   }
+   SignalHandler::install();
+ }
+ 
+ void shutdown()
+ {
++  bool finalize_logging;
+   {
+     std::lock_guard<std::mutex> lock(g_context_mtx);
+     g_context.shutdown();
++    finalize_logging = g_owns_logging;
++    g_owns_logging = false;
+   }
+ 
+   SignalHandler::notify_all_executors();
+   SignalHandler::uninstall();
+ 
+-  rcl_ret_t ret = rcl_logging_fini();
+-  if (ret != RCL_RET_OK) {
+-    RCUTILS_LOG_ERROR_NAMED(
+-      "agnocast", "Failed to finalize logging: %s", rcl_get_error_string().str);
+-    rcl_reset_error();
++  if (finalize_logging) {
++    rcl_ret_t ret = rcl_logging_fini();
++    if (ret != RCL_RET_OK) {
++      RCUTILS_LOG_ERROR_NAMED(
++        "agnocast", "Failed to finalize logging: %s", rcl_get_error_string().str);
++      rcl_reset_error();
++    }
+   }
+ }
+ 
+diff --git a/src/agnocastlib/test/unit/test_agnocast_context.cpp b/src/agnocastlib/test/unit/test_agnocast_context.cpp
+index 02e9d7b..b3922c1 100644
+--- a/src/agnocastlib/test/unit/test_agnocast_context.cpp
++++ b/src/agnocastlib/test/unit/test_agnocast_context.cpp
+@@ -1,10 +1,13 @@
+ #include "agnocast/node/agnocast_context.hpp"
+ 
+ #include <gtest/gtest.h>
++#include <rcl/error_handling.h>
+ #include <rcl/logging.h>
+ #include <rcutils/logging.h>
+ #include <rcutils/logging_macros.h>
+ 
++#include <stdexcept>
++
+ // =========================================
+ // agnocast::Context --disable-stdout-logs tests
+ // =========================================
+@@ -91,3 +94,132 @@ TEST_F(AgnocastContextStdoutLogsTest, flag_after_double_dash_terminator_is_ignor
+ 
+   EXPECT_FALSE(output.empty()) << "Flag after -- must be ignored; expected stdout output";
+ }
++
++namespace
++{
++void host_output_handler(
++  const rcutils_log_location_t *, int, const char *, rcutils_time_point_value_t, const char *,
++  va_list *)
++{
++}
++}  // namespace
++
++class AgnocastContextLoggingOwnershipTest : public ::testing::Test
++{
++protected:
++  void SetUp() override
++  {
++    agnocast::shutdown();
++    original_handler_ = rcutils_logging_get_output_handler();
++    auto arguments = agnocast::parse_arguments({});
++    auto allocator = rcl_get_default_allocator();
++    ASSERT_EQ(
++      rcl_logging_configure_with_output_handler(
++        arguments.get(), &allocator, rcl_logging_multiple_output_handler),
++      RCL_RET_OK);
++    rcutils_logging_set_output_handler(host_output_handler);
++  }
++
++  void TearDown() override
++  {
++    agnocast::shutdown();
++    EXPECT_EQ(rcl_logging_fini(), RCL_RET_OK);
++    rcl_reset_error();
++    rcutils_logging_set_output_handler(original_handler_);
++  }
++
++  agnocast::InitOptions embedded_options()
++  {
++    agnocast::InitOptions options;
++    options.configure_logging = false;
++    return options;
++  }
++
++  rcutils_logging_output_handler_t original_handler_;
++};
++
++TEST_F(AgnocastContextLoggingOwnershipTest, shutdown_without_init_preserves_host_logging)
++{
++  agnocast::shutdown();
++  EXPECT_EQ(rcutils_logging_get_output_handler(), host_output_handler);
++}
++
++TEST_F(AgnocastContextLoggingOwnershipTest, embedded_lifetime_preserves_host_logging)
++{
++  agnocast::init(0, nullptr, embedded_options());
++  EXPECT_TRUE(agnocast::ok());
++  EXPECT_EQ(rcutils_logging_get_output_handler(), host_output_handler);
++
++  // A repeated init must not replace the first caller's logging policy.
++  agnocast::init(0, nullptr);
++  EXPECT_EQ(rcutils_logging_get_output_handler(), host_output_handler);
++  agnocast::shutdown();
++  EXPECT_FALSE(agnocast::ok());
++  EXPECT_EQ(rcutils_logging_get_output_handler(), host_output_handler);
++  agnocast::shutdown();
++  EXPECT_EQ(rcutils_logging_get_output_handler(), host_output_handler);
++}
++
++TEST_F(AgnocastContextLoggingOwnershipTest, default_init_owns_logging_until_shutdown)
++{
++  agnocast::init(0, nullptr);
++  EXPECT_EQ(rcutils_logging_get_output_handler(), rcl_logging_multiple_output_handler);
++  agnocast::init(0, nullptr, embedded_options());
++  agnocast::shutdown();
++  EXPECT_EQ(rcutils_logging_get_output_handler(), rcutils_logging_console_output_handler);
++
++  rcutils_logging_set_output_handler(host_output_handler);
++  agnocast::shutdown();
++  EXPECT_EQ(rcutils_logging_get_output_handler(), host_output_handler);
++}
++
++TEST_F(AgnocastContextLoggingOwnershipTest, stopped_context_still_finalizes_owned_logging)
++{
++  agnocast::init(0, nullptr);
++  {
++    // The signal processing thread invalidates the context before explicit shutdown.
++    std::lock_guard<std::mutex> lock(agnocast::g_context_mtx);
++    agnocast::g_context.shutdown();
++  }
++  EXPECT_FALSE(agnocast::ok());
++  agnocast::shutdown();
++  EXPECT_EQ(rcutils_logging_get_output_handler(), rcutils_logging_console_output_handler);
++}
++
++TEST_F(AgnocastContextLoggingOwnershipTest, parse_failure_preserves_host_logging_and_allows_retry)
++{
++  const char * argv[] = {"program", "--ros-args", "--log-level"};
++  EXPECT_THROW(agnocast::init(3, argv, embedded_options()), std::runtime_error);
++  rcl_reset_error();
++  EXPECT_FALSE(agnocast::ok());
++  agnocast::shutdown();
++  EXPECT_EQ(rcutils_logging_get_output_handler(), host_output_handler);
++
++  agnocast::init(0, nullptr, embedded_options());
++  EXPECT_TRUE(agnocast::ok());
++  agnocast::shutdown();
++  EXPECT_EQ(rcutils_logging_get_output_handler(), host_output_handler);
++}
++
++TEST_F(AgnocastContextLoggingOwnershipTest, new_lifetime_can_change_logging_policy)
++{
++  agnocast::init(0, nullptr, embedded_options());
++  agnocast::shutdown();
++  agnocast::init(0, nullptr);
++  EXPECT_EQ(rcutils_logging_get_output_handler(), rcl_logging_multiple_output_handler);
++  agnocast::shutdown();
++  rcutils_logging_set_output_handler(host_output_handler);
++  agnocast::init(0, nullptr, embedded_options());
++  agnocast::shutdown();
++  EXPECT_EQ(rcutils_logging_get_output_handler(), host_output_handler);
++}
++
++TEST_F(AgnocastContextLoggingOwnershipTest, failed_default_init_does_not_acquire_host_logging)
++{
++  const char * argv[] = {"program", "--ros-args", "--log-level"};
++  EXPECT_THROW(agnocast::init(3, argv), std::runtime_error);
++  rcl_reset_error();
++  EXPECT_FALSE(agnocast::ok());
++  agnocast::shutdown();
++  EXPECT_EQ(rcutils_logging_get_output_handler(), host_output_handler);
++}

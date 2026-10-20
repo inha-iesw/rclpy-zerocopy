@@ -39,7 +39,9 @@ public:
   explicit NativeSession(const std::string & node_name)
   {
     if (agnocast::ok()) throw std::runtime_error("Agnocast was initialized outside RuntimeCore");
-    agnocast::init(0, nullptr);
+    agnocast::InitOptions init_options;
+    init_options.configure_logging = false;
+    agnocast::init(0, nullptr, init_options);
     try {
       rclcpp::NodeOptions options;
       options.start_parameter_services(false);
