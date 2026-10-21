@@ -5,6 +5,17 @@ import ctypes
 import numpy as np
 
 
+def receipt_settled(subscription, expected):
+    """Require the native receipt, reference resets, and live budget to agree."""
+    stats = subscription.stats
+    observation = subscription._observation
+    return (
+        stats.received_total >= expected
+        and observation.received == stats.received_total
+        and observation.received - observation.released == stats.outstanding_leases
+    )
+
+
 class _PyBuffer(ctypes.Structure):
     _fields_ = [
         ("buf", ctypes.c_void_p), ("obj", ctypes.c_void_p),

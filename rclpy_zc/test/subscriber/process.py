@@ -8,7 +8,6 @@ import signal
 import sys
 import threading
 import time
-from urllib.parse import quote
 
 import numpy as np
 import rclpy
@@ -18,15 +17,8 @@ from rclpy_agnocast import _native
 
 from checks import check_held
 from checks import inspect
-
-
-def emit(name, **fields):
-    """Write one line compatible with the shared process Probe."""
-    values = [f"name={name}"]
-    for key, value in fields.items():
-        text = str(value).lower() if isinstance(value, bool) else str(value)
-        values.append(f"{key}={quote(text, safe='._-/:+')}")
-    print("EVENT " + " ".join(values), flush=True)
+from checks import receipt_settled
+from system_runtime import emit
 
 
 class Session:
@@ -61,11 +53,7 @@ class Session:
     def wait(self, expected):
         deadline = time.monotonic() + 10
         while True:
-            stats = self.subscription.stats
-            observation = self.subscription._observation
-            if (stats.received_total >= expected
-                    and observation.received == stats.received_total
-                    and observation.received - observation.released == stats.outstanding_leases):
+            if receipt_settled(self.subscription, expected):
                 return
             if time.monotonic() >= deadline:
                 raise AssertionError("native receipt did not reach expected count")

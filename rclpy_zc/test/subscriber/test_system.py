@@ -1,6 +1,7 @@
 """Opt-in native subscriber TLD with a separate direct-fill Python publisher."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
 import sys
 import threading
@@ -9,7 +10,8 @@ import uuid
 
 import pytest
 
-from system_runtime import Probe
+from system_runtime import command
+from system_runtime import launch_pair
 from system_runtime import payload_checksum
 from system_runtime import preflight
 from system_runtime import system_tld_requested
@@ -25,36 +27,21 @@ def config():
 
 @pytest.fixture
 def pair_factory(config):
-    probes = []
+    with ExitStack() as stack:
+        def create(count=4, limit=2 * 1024 * 1024):
+            topic = f"/subscriber_tld_{uuid.uuid4().hex}"
+            environment = config.child_environment(20 + uuid.uuid4().int % 180)
+            subscriber = [
+                sys.executable, str(Path(__file__).with_name("process.py")),
+                "--topic", topic, "--count", str(count), "--limit", str(limit),
+            ]
+            publisher = [
+                sys.executable, str(config.publisher_process), "--topic", topic,
+                "--depth", "128", "--max-payload-bytes", str(2 * 1024 * 1024),
+            ]
+            return stack.enter_context(launch_pair(subscriber, publisher, environment))
 
-    def create(count=4, limit=2 * 1024 * 1024):
-        topic = f"/subscriber_tld_{uuid.uuid4().hex}"
-        environment = config.child_environment(20 + uuid.uuid4().int % 180)
-        subscriber = Probe([
-            sys.executable, str(Path(__file__).with_name("process.py")),
-            "--topic", topic, "--count", str(count), "--limit", str(limit),
-        ], environment)
-        probes.append(subscriber)
-        subscriber.wait_event("READY")
-        publisher = Probe([
-            sys.executable, str(config.publisher_process), "--topic", topic,
-            "--depth", "128", "--max-payload-bytes", str(2 * 1024 * 1024),
-        ], environment)
-        probes.append(publisher)
-        publisher.wait_event("READY")
-        wait_connected(subscriber)
-        return publisher, subscriber
-
-    yield create
-    for probe in reversed(probes):
-        probe.shutdown()
-    for probe in probes:
-        assert probe.process.returncode == 0, "\n".join(probe.transcript[-30:])
-
-
-def command(probe, text, event):
-    probe.send(text)
-    return probe.wait_event(event)
+        yield create
 
 
 def publish(publisher, subscriber, size, sequence, received):

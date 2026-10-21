@@ -1,7 +1,8 @@
-"""Subprocess and environment support for the opt-in publisher system TLD."""
+"""Subprocess protocol and exact-artifact environments for publisher/subscriber TLD."""
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from urllib.parse import quote
 
 
 EVENT_PREFIX = "EVENT "
@@ -45,6 +47,11 @@ class SystemConfig:
         environment["ROS_DOMAIN_ID"] = str(domain_id)
         environment["PYTHONUNBUFFERED"] = "1"
         environment["RCUTILS_COLORIZED_OUTPUT"] = "0"
+        # Child entry points live below test/ and import this shared protocol module.
+        test_path = str(Path(__file__).resolve().parent)
+        python_paths = [path for path in environment.get("PYTHONPATH", "").split(":")
+                        if path and path != test_path]
+        environment["PYTHONPATH"] = ":".join([test_path, *python_paths])
 
         preload = _path_entries(environment.get("LD_PRELOAD", ""))
         preload = [entry for entry in preload if Path(entry).name != self.heaphook.name]
@@ -198,6 +205,15 @@ def preflight() -> SystemConfig:
     )
 
 
+def emit(name: str, **fields) -> None:
+    """Write the strict URL-escaped EVENT protocol consumed by every Probe."""
+    tokens = [f"name={name}"]
+    for key, value in fields.items():
+        rendered = str(value).lower() if isinstance(value, bool) else str(value)
+        tokens.append(f"{key}={quote(rendered, safe='._-/:+')}")
+    print(EVENT_PREFIX + " ".join(tokens), flush=True)
+
+
 def parse_event(line: str) -> dict[str, str] | None:
     """Parse one strict space-delimited EVENT record."""
     if not line.startswith(EVENT_PREFIX):
@@ -281,12 +297,37 @@ class Probe:
         return f"{message}: {' '.join(self.command)}\n{tail}"
 
 
+def command(probe: Probe, text: str, event: str) -> dict[str, str]:
+    """Send a command and wait for its named acknowledgement."""
+    probe.send(text)
+    return probe.wait_event(event)
+
+
+@contextmanager
+def launch_pair(subscriber_command: list[str], publisher_command: list[str],
+                environment: dict[str, str]):
+    """Own one connected pair, including cleanup when either child fails startup."""
+    probes = []
+    try:
+        for arguments in (subscriber_command, publisher_command):
+            probe = Probe(arguments, environment)
+            probes.append(probe)
+            probe.wait_event("READY")
+        subscriber, publisher = probes
+        wait_connected(subscriber)
+        yield publisher, subscriber
+    finally:
+        for probe in reversed(probes):
+            probe.shutdown()
+        for probe in probes:
+            assert probe.process.returncode == 0, "\n".join(probe.transcript[-30:])
+
+
 def wait_connected(subscriber: Probe, timeout: float = 15.0) -> None:
     """Poll the subscriber's public endpoint count until a publisher is visible."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        subscriber.send("connections")
-        event = subscriber.wait_event("CONNECTED")
+        event = command(subscriber, "connections", "CONNECTED")
         if int(event["count"]) >= 1 and event.get("connected") == "true":
             return
         time.sleep(0.05)

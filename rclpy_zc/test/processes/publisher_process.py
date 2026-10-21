@@ -6,20 +6,8 @@ import ctypes
 import os
 import shlex
 import sys
-from urllib.parse import quote
 
-
-def _value_text(value):
-    if isinstance(value, bool):
-        return str(value).lower()
-    return quote(str(value), safe="._-/:+")
-
-
-def emit(name, **fields):
-    """Write one atomic line-oriented event for the parent harness."""
-    tokens = [f"name={name}"]
-    tokens.extend(f"{key}={_value_text(value)}" for key, value in fields.items())
-    print("EVENT " + " ".join(tokens), flush=True)
+from system_runtime import emit
 
 
 def _expect(arguments, count, command):
