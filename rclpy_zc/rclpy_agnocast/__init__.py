@@ -2,5 +2,6 @@
 
 from .publisher import Loan, Publisher
 from .runtime import AgnocastRuntime
+from ._native import Lease
 
-__all__ = ["AgnocastRuntime", "Loan", "Publisher"]
+__all__ = ["AgnocastRuntime", "Lease", "Loan", "Publisher"]

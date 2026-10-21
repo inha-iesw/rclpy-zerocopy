@@ -18,6 +18,8 @@ find_package(Threads REQUIRED)
 add_library(rclpy_agnocast_core STATIC
   src/loan.cpp
   src/publisher_worker.cpp
+  src/subscriber/lease.cpp
+  src/subscriber/queue.cpp
 )
 target_compile_features(rclpy_agnocast_core PUBLIC cxx_std_17)
 target_include_directories(rclpy_agnocast_core PUBLIC
@@ -32,6 +34,9 @@ target_link_libraries(rclpy_agnocast_core PUBLIC Threads::Threads)
 add_library(rclpy_agnocast_native STATIC
   src/buffer_owner.cpp
   src/runtime.cpp
+  src/subscriber/buffer_owner.cpp
+  src/subscriber/executor.cpp
+  src/subscriber/native.cpp
 )
 target_compile_features(rclpy_agnocast_native PUBLIC cxx_std_17)
 target_include_directories(rclpy_agnocast_native PUBLIC
@@ -52,6 +57,7 @@ target_link_libraries(rclpy_agnocast_native PUBLIC
 pybind11_add_module(_native MODULE
   src/bindings.cpp
   src/bind_publisher.cpp
+  src/subscriber/bindings.cpp
 )
 target_compile_features(_native PRIVATE cxx_std_17)
 target_link_libraries(_native PRIVATE rclpy_agnocast_native)
@@ -73,6 +79,19 @@ if(BUILD_TESTING)
   target_sources(rclpy_agnocast_core PRIVATE src/publisher/observation.cpp)
   target_link_libraries(rclpy_agnocast_core PUBLIC ${CMAKE_DL_LIBS})
   target_sources(_native PRIVATE src/publisher/bind_observation.cpp)
+  target_sources(_native PRIVATE src/subscriber/bind_testing.cpp)
+
+  ament_add_pytest_test(test_subscriber_lease test/subscriber/test_lease.py TIMEOUT 60)
+  ament_add_gtest(test_subscriber_queue test/subscriber/test_queue.cpp TIMEOUT 60)
+  target_include_directories(test_subscriber_queue PRIVATE src)
+  target_link_libraries(test_subscriber_queue rclpy_agnocast_core)
+  ament_add_pytest_test(test_subscriber_system test/subscriber/test_system.py
+    ENV "RCLPY_AGNOCAST_SUBSCRIBER=$<TARGET_FILE:rclpy_agnocast_shared_buffer_subscriber>"
+    APPEND_ENV "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/test"
+    TIMEOUT 180
+  )
+  set_tests_properties(test_subscriber_system PROPERTIES
+    LABELS "pytest;system;requires_kernel_module;requires_heaphook")
 
   ament_add_gtest(test_publisher_observation test/publisher/test_observation.cpp)
   target_include_directories(test_publisher_observation PRIVATE src)

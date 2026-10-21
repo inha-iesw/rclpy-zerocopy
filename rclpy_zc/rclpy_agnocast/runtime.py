@@ -166,7 +166,7 @@ class AgnocastRuntime:
         return Publisher(handle, runtime_owner=self)
 
     def close(self) -> None:
-        """Quiesce and close; active Loans make this retryably fail."""
+        """Quiesce and close; active Loans or subscriber views make this retryably fail."""
         global _active_runtime
         if self._closed:
             return

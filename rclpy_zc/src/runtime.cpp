@@ -3,6 +3,7 @@
 #include "agnocast/agnocast.hpp"
 #include "rclpy_agnocast_msgs/msg/shared_buffer.hpp"
 #include "publisher/observation.hpp"
+#include "subscriber/native.hpp"
 
 #include <mutex>
 #include <set>
@@ -188,6 +189,7 @@ public:
   RuntimeState state{RuntimeState::kOpen};
   std::shared_ptr<NativeSession> session;
   std::shared_ptr<PublisherWorker> worker;
+  std::shared_ptr<SubscriberRuntime> subscribers;
   std::set<std::uintptr_t> publisher_ids;
   std::uintptr_t next_publisher_id{1U};
 };
@@ -264,6 +266,23 @@ std::shared_ptr<LoanState> RuntimeCore::borrow(
   }
 }
 
+std::shared_ptr<SubscriptionHandle> RuntimeCore::create_subscription(
+  const std::string & topic, const std::size_t depth,
+  const std::size_t max_outstanding_leases, const std::size_t max_payload_bytes)
+{
+  if (topic.empty()) throw std::invalid_argument("topic must not be empty");
+  if (depth == 0 || max_outstanding_leases == 0 || max_payload_bytes == 0) {
+    throw std::invalid_argument("subscriber depth and limits must be positive");
+  }
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->state != RuntimeState::kOpen) throw std::runtime_error("runtime is not open");
+  if (!impl_->subscribers) {
+    impl_->subscribers = std::make_shared<SubscriberRuntime>(impl_->session->node, impl_->session);
+  }
+  return impl_->subscribers->create_subscription(
+    topic, depth, max_outstanding_leases, max_payload_bytes);
+}
+
 PublisherWorkerResult RuntimeCore::remove_publisher(const std::uintptr_t publisher_id) noexcept
 {
   try {
@@ -290,6 +309,7 @@ PublisherWorkerResult RuntimeCore::close() noexcept
     std::unique_lock<std::mutex> lock(impl_->mutex);
     if (impl_->state == RuntimeState::kClosed) return {PublisherWorkerError::kNone, nullptr};
     impl_->state = RuntimeState::kQuiescing;
+    if (impl_->subscribers) impl_->subscribers->quiesce();
     const auto result = impl_->worker->stop();
     if (
       result.error != PublisherWorkerError::kNone &&
@@ -298,10 +318,17 @@ PublisherWorkerResult RuntimeCore::close() noexcept
       return result;
     }
     impl_->publisher_ids.clear();
+    // A Lease busy result occurs after publisher teardown and subscriber executor join.
+    if (impl_->subscribers && !impl_->subscribers->close()) {
+      return {PublisherWorkerError::kBusy,
+        std::make_exception_ptr(std::runtime_error("runtime close: active Lease or view"))};
+    }
     impl_->state = RuntimeState::kClosed;
     auto worker = std::move(impl_->worker);
+    auto subscribers = std::move(impl_->subscribers);
     auto session = std::move(impl_->session);
     lock.unlock();
+    subscribers.reset();
     worker.reset();
     session.reset();
     return {PublisherWorkerError::kNone, nullptr};

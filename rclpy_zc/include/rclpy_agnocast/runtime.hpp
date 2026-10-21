@@ -22,12 +22,13 @@ enum class RuntimeState
 };
 
 class PublisherHandle;
+class SubscriptionHandle;
 
 /**
- * @brief Process-wide owner of the Agnocast node and publisher worker.
+ * @brief Process-wide owner of the Agnocast node and publisher/subscriber workers.
  *
  * Use create() rather than constructing this class directly. A second runtime is rejected until
- * the first runtime and every Loan alias have released their native resources.
+ * the first runtime and every Loan/Lease alias have released their native resources.
  */
 class RuntimeCore : public std::enable_shared_from_this<RuntimeCore>
 {
@@ -64,10 +65,27 @@ public:
     const std::string & topic, std::size_t depth, std::size_t max_payload_bytes);
 
   /**
-   * @brief Quiesce endpoints, destroy them on the worker, then stop the worker.
+   * @brief Create a typed subscriber with bounded retained count and payload bytes.
+   *
+   * @param[in] topic Non-empty ROS topic name.
+   * @param[in] depth Positive native KeepLast history depth.
+   * @param[in] max_outstanding_leases Positive count limit, including queued and exported storage.
+   * @param[in] max_payload_bytes Positive aggregate retained payload limit.
+   * @return A native handle; rclpy callback dispatch is integrated separately.
+   * @throws std::invalid_argument for an empty topic or zero limit/depth.
+   * @throws std::runtime_error if the runtime is not open.
+   * @throws Any exception raised by native endpoint creation.
+   */
+  std::shared_ptr<SubscriptionHandle> create_subscription(
+    const std::string & topic, std::size_t depth, std::size_t max_outstanding_leases,
+    std::size_t max_payload_bytes);
+
+  /**
+   * @brief Quiesce endpoints and join native workers before destroying subscriber resources.
    *
    * @return `kBusy` without destructive cleanup while a Loan remains active; otherwise the first
-   * worker failure. Success and repeated close both return `kNone`.
+   * worker failure. Live subscriber Leases/views also return a retryable busy result after
+   * stopping the executor and draining its queue. Success and repeated close return `kNone`.
    */
   PublisherWorkerResult close() noexcept;
 

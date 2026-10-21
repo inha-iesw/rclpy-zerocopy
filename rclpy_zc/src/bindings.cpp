@@ -2,6 +2,7 @@
 
 #include "rclpy_agnocast/buffer_owner.hpp"
 #include "rclpy_agnocast/runtime.hpp"
+#include "subscriber/native.hpp"
 
 #include <pybind11/pybind11.h>
 
@@ -14,6 +15,7 @@ namespace py = pybind11;
 
 namespace rclpy_agnocast
 {
+void bind_subscriber(py::module_ & module);
 #ifdef BUILD_TESTING
 void bind_observation(py::module_ & module);
 #endif
@@ -75,6 +77,14 @@ void bind_runtime(py::module_ & module)
       py::gil_scoped_release release;
       return runtime->create_publisher(topic, depth, max_payload_bytes);
     }, py::arg("topic"), py::arg("depth"), py::arg("max_payload_bytes"))
+  .def("create_subscription", [](
+      const std::shared_ptr<RuntimeCore> & runtime, const std::string & topic,
+      const std::size_t depth, const std::size_t count, const std::size_t bytes)
+    {
+      py::gil_scoped_release release;
+      return runtime->create_subscription(topic, depth, count, bytes);
+    }, py::arg("topic"), py::arg("depth"), py::arg("max_outstanding_leases"),
+    py::arg("max_payload_bytes"))
   .def("close", [](const std::shared_ptr<RuntimeCore> & runtime) {
       PublisherWorkerResult result{};
       {
@@ -96,6 +106,7 @@ PYBIND11_MODULE(_native, module)
     throw py::error_already_set();
   }
   rclpy_agnocast::bind_publisher(module);
+  rclpy_agnocast::bind_subscriber(module);
   rclpy_agnocast::bind_runtime(module);
 #ifdef BUILD_TESTING
   rclpy_agnocast::bind_observation(module);
