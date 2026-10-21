@@ -170,8 +170,9 @@ class AgnocastRuntime:
             raise ValueError("topic must not be empty")
         depth = _positive_integer("depth", depth)
         limit = _positive_integer("max_payload_bytes", max_payload_bytes)
-        handle = self._native_runtime.create_publisher(topic, depth, limit)
-        return Publisher(handle, runtime_owner=self)
+        with self._lifecycle_lock:
+            handle = self._native_runtime.create_publisher(topic, depth, limit)
+            return Publisher(handle, runtime_owner=self)
 
     def close(self) -> None:
         """Quiesce and close; active Loans or subscriber views make this retryably fail."""
