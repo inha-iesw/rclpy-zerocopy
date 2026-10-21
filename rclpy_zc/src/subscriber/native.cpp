@@ -130,6 +130,20 @@ public:
   : native_session(std::move(session)), node(std::move(value)),
     executor(std::make_unique<SubscriberExecutor>(node)) {}
 
+  // Callers hold mutex; keep endpoint closing ahead of executor/receive failures.
+  void require_open(const SubscriptionState & state) const
+  {
+    if (!accepting || state.closing) {throw std::runtime_error("subscription is closing");}
+  }
+
+  bool begin_close(SubscriptionState & state)
+  {
+    if (state.closed) {return false;}
+    state.closing = true;
+    state.queue.stop_admission();
+    return true;
+  }
+
   void detach(const std::shared_ptr<SubscriptionState> & state)
   {
     if (state->attached) {
@@ -250,7 +264,7 @@ std::shared_ptr<LeaseState> SubscriptionHandle::take()
 {
   auto & impl = *runtime_->impl_;
   std::lock_guard<std::mutex> lock(impl.mutex);
-  if (!impl.accepting || state_->closing) {throw std::runtime_error("subscription is closing");}
+  impl.require_open(*state_);
   impl.executor->check_failure();
   {
     std::lock_guard<std::mutex> failure_lock(state_->failure_mutex);
@@ -265,9 +279,7 @@ void SubscriptionHandle::close()
 {
   auto & impl = *runtime_->impl_;
   std::lock_guard<std::mutex> lock(impl.mutex);
-  if (state_->closed) {return;}
-  state_->closing = true;
-  state_->queue.stop_admission();
+  if (!impl.begin_close(*state_)) {return;}
   auto close_endpoint = [&impl, this]() {
       if (!state_->queue.drain_for_close()) {
         const auto stats = state_->queue.stats();
@@ -287,7 +299,7 @@ std::size_t SubscriptionHandle::publisher_count()
 {
   auto & impl = *runtime_->impl_;
   std::lock_guard<std::mutex> lock(impl.mutex);
-  if (!impl.accepting || state_->closing) {throw std::runtime_error("subscription is closing");}
+  impl.require_open(*state_);
   std::size_t count = 0;
   impl.executor->invoke([this, &count]() {count = state_->subscription->get_publisher_count();});
   return count;

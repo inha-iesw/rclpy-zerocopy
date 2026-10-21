@@ -56,6 +56,7 @@ public:
 
 private:
   void run() noexcept;
+  void throw_if_stopped_locked() const;
   rclcpp::CallbackGroup::SharedPtr control_group_;
   mutable std::mutex control_mutex_;
   bool stopped_{false};

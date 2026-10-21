@@ -41,8 +41,7 @@ void SubscriberExecutor::invoke(std::function<void()> operation)
   auto result = task->get_future();
   {
     std::lock_guard<std::mutex> lock(control_mutex_);
-    if (failure_) {std::rethrow_exception(failure_);}
-    if (stopped_) {throw std::runtime_error("subscriber executor is stopped");}
+    throw_if_stopped_locked();
     auto callable = std::make_shared<std::function<void()>>([task]() {(*task)();});
     std::lock_guard<std::mutex> ready_lock(ready_agnocast_executables_mutex_);
     // Controls precede prefetched data so a hot subscription cannot starve close().
@@ -119,6 +118,11 @@ void SubscriberExecutor::stop() noexcept
 void SubscriberExecutor::check_failure() const
 {
   std::lock_guard<std::mutex> lock(control_mutex_);
+  throw_if_stopped_locked();
+}
+
+void SubscriberExecutor::throw_if_stopped_locked() const
+{
   if (failure_) {std::rethrow_exception(failure_);}
   if (stopped_) {throw std::runtime_error("subscriber executor is stopped");}
 }
