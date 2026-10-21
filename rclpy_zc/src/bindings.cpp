@@ -34,7 +34,7 @@ void throw_worker_error(const char * operation, const PublisherWorkerResult & re
   const std::string prefix = std::string(operation) + ": ";
   switch (result.error) {
     case PublisherWorkerError::kBusy:
-      throw std::runtime_error(prefix + "an active Loan keeps the publisher worker busy");
+      throw std::runtime_error(prefix + "active Loan=1 keeps the publisher worker busy");
     case PublisherWorkerError::kAlreadyExists:
       throw std::runtime_error(prefix + "publisher identity already exists");
     case PublisherWorkerError::kNotFound:

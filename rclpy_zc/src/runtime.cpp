@@ -173,6 +173,10 @@ private:
   const char * operation, const PublisherWorkerResult & result)
 {
   if (result.failure) std::rethrow_exception(result.failure);
+  if (result.error == PublisherWorkerError::kBusy) {
+    throw std::runtime_error(
+            std::string(operation) + ": active Loan=1 keeps the publisher worker busy");
+  }
   throw std::runtime_error(
           std::string(operation) + " failed with worker error " +
           std::to_string(static_cast<int>(result.error)));

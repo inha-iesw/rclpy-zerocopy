@@ -270,8 +270,11 @@ void SubscriptionHandle::close()
   state_->queue.stop_admission();
   auto close_endpoint = [&impl, this]() {
       if (!state_->queue.drain_for_close()) {
+        const auto stats = state_->queue.stats();
         throw std::runtime_error(
-                "subscription close requires every Lease and buffer view to release");
+                "subscription close: active Lease/view=" +
+                std::to_string(stats.outstanding_leases) + ", payload_bytes=" +
+                std::to_string(stats.outstanding_payload_bytes));
       }
       impl.detach(state_);
       impl.release_endpoint(state_);
