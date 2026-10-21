@@ -218,3 +218,17 @@ def test_endpoint_close_recovers_when_spin_fails_before_queued_control_runs(pair
     assert int(closed["received_refs"]) == int(closed["released_refs"]) == 1
     assert int(closed["outstanding_leases"]) == 0
     command(subscriber, "runtime-close", "CLOSED_ENDPOINT")
+
+
+@pytest.mark.parametrize("reason", ["cancel", "failure"])
+def test_receive_executor_and_close_failure_priority_is_preserved(pair_factory, reason):
+    _, subscriber = pair_factory()
+    event = command(subscriber, f"failure-priority {reason}", "FAILURE_PRIORITY")
+    receive_failure = "injected subscriber receive failure"
+    assert unquote(event["receive_take"]) == receive_failure
+    assert unquote(event["receive_wait"]) == receive_failure
+    assert unquote(event["preserved_wait"]) == receive_failure
+    expected_executor = "spin failure" if reason == "failure" else "stopped"
+    assert expected_executor in unquote(event["executor_take"])
+    assert event["stopped_wait"] == "0"
+    assert unquote(event["closing_take"]) == "subscription is closing"

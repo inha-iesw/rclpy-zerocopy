@@ -72,6 +72,17 @@ void bind_subscriber(py::module_ & module)
     module, "SubscriptionHandle");
   subscription
   .def("take", &SubscriptionHandle::take, py::call_guard<py::gil_scoped_release>())
+  .def(
+    "wait_for_wake", &SubscriptionHandle::wait_for_wake,
+    py::call_guard<py::gil_scoped_release>())
+  .def("finish_dispatch", &SubscriptionHandle::finish_dispatch)
+  .def("stop_delivery", &SubscriptionHandle::stop_delivery)
+  .def(
+    "clear_pending", &SubscriptionHandle::clear_pending,
+    py::call_guard<py::gil_scoped_release>())
+  .def(
+    "prepare_close", &SubscriptionHandle::prepare_close,
+    py::call_guard<py::gil_scoped_release>())
   .def("close", &SubscriptionHandle::close, py::call_guard<py::gil_scoped_release>())
   .def_property_readonly("stats", &SubscriptionHandle::stats)
   .def_property_readonly(
@@ -80,6 +91,9 @@ void bind_subscriber(py::module_ & module)
       return handle.publisher_count();
     });
 #ifdef BUILD_TESTING
+  subscription.def(
+    "_test_fail_receive", &SubscriptionHandle::test_fail_receive,
+    py::call_guard<py::gil_scoped_release>());
   lease_binding.def_property_readonly(
     "_native_data_address", [](const LeaseState & lease) {
       return reinterpret_cast<std::uintptr_t>(lease.owner()->buffer().data);

@@ -143,6 +143,29 @@ class Session:
         assert self.subscription._observation.release_tid == tids[0]
         self.stats("RELEASED")
 
+    def failure_priority(self, reason):
+        def failure(operation):
+            try:
+                operation()
+            except RuntimeError as error:
+                return str(error)
+            raise AssertionError("operation did not expose its terminal failure")
+
+        handle = self.subscription
+        handle._test_fail_receive()
+        receive_take = failure(handle.take)
+        receive_wait = failure(lambda: handle.wait_for_wake(0))
+        handle._test_stop_executor(reason == "failure")
+        executor_take = failure(handle.take)
+        preserved_wait = failure(lambda: handle.wait_for_wake(0))
+        handle.prepare_close()
+        stopped_wait = handle.wait_for_wake(0)
+        closing_take = failure(handle.take)
+        handle.close()
+        emit("FAILURE_PRIORITY", receive_take=receive_take, receive_wait=receive_wait,
+             executor_take=executor_take, preserved_wait=preserved_wait,
+             stopped_wait=stopped_wait, closing_take=closing_take)
+
     def dispatch(self, fields):
         command, *arguments = fields
         if command == "connections":
@@ -190,6 +213,8 @@ class Session:
         elif command == "fail-next-control":
             self.subscription._test_fail_next_control()
             emit("CONTROL_ARMED")
+        elif command == "failure-priority":
+            self.failure_priority(arguments[0])
         else:
             raise ValueError(f"unknown command: {command}")
 
@@ -230,6 +255,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as error:
+    except Exception as error:  # Expected signal interruptions are handled by stop_executor.
         emit("ERROR", error=type(error).__name__, message=str(error))
         raise

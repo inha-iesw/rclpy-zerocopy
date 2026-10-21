@@ -15,7 +15,9 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <future>
 #include <limits>
 #include <memory>
 #include <thread>
@@ -27,6 +29,99 @@ namespace
 {
 using rclpy_agnocast::SubscriberQueue;
 const std::uint8_t payload[]{1, 2, 3, 4, 5, 6, 7};
+
+TEST(SubscriberQueue, WakeCoalescesUntilDrainFinishesAndRearmsAfterEmpty)
+{
+  SubscriberQueue queue(4, 28);
+  auto storage = std::make_shared<int>(0);
+  ASSERT_TRUE(queue.push({1, payload, 7, storage}));
+  const auto first = queue.wait_for_wake(0);
+  ASSERT_NE(first, 0U);
+  ASSERT_TRUE(queue.push({2, payload, 7, storage}));
+  EXPECT_EQ(queue.wait_for_wake(0), first);
+  queue.take()->release();
+  queue.take()->release();
+  EXPECT_EQ(queue.take(), nullptr);
+  queue.finish_dispatch();
+  ASSERT_TRUE(queue.push({3, payload, 7, storage}));
+  EXPECT_GT(queue.wait_for_wake(first), first);
+}
+
+TEST(SubscriberQueue, EnqueueBetweenEmptyTakeAndDrainCompletionCannotLoseWake)
+{
+  SubscriberQueue queue(2, 14);
+  auto storage = std::make_shared<int>(0);
+  ASSERT_TRUE(queue.push({1, payload, 7, storage}));
+  auto generation = queue.wait_for_wake(0);
+  for (unsigned index = 0; index < 100; ++index) {
+    queue.take()->release();
+    EXPECT_EQ(queue.take(), nullptr);
+    std::thread producer([&]() {queue.push({index + 2, payload, 7, storage});});
+    producer.join();
+    // Still armed: this enqueue was coalesced with the dispatch just ending.
+    EXPECT_EQ(queue.wait_for_wake(0), generation);
+    queue.finish_dispatch();
+    const auto next = queue.wait_for_wake(generation);
+    EXPECT_GT(next, generation);
+    generation = next;
+  }
+}
+
+TEST(SubscriberQueue, StopWakesAnIdleWaiterWithoutADataNotification)
+{
+  SubscriberQueue queue(1, 7);
+  auto waiter = std::async(std::launch::async, [&]() {return queue.wait_for_wake(0);});
+  EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+  queue.stop_admission();
+  ASSERT_EQ(waiter.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  EXPECT_EQ(waiter.get(), 0U);
+}
+
+TEST(SubscriberQueue, NativeFailureWakesWaiterAndExplicitCloseRemainsPossible)
+{
+  SubscriberQueue queue(1, 7);
+  auto waiter = std::async(std::launch::async, [&]() {return queue.wait_for_wake(0);});
+  queue.fail(std::make_exception_ptr(std::runtime_error("receive failed")));
+  ASSERT_EQ(waiter.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  EXPECT_THROW(waiter.get(), std::runtime_error);
+  queue.stop_admission();
+  EXPECT_EQ(queue.wait_for_wake(0), 0U);
+}
+
+TEST(SubscriberQueue, FailureCheckDoesNotTreatExplicitStopAsFailure)
+{
+  SubscriberQueue queue(1, 7);
+  EXPECT_NO_THROW(queue.rethrow_failure());
+  queue.stop_admission();
+  EXPECT_NO_THROW(queue.rethrow_failure());
+}
+
+TEST(SubscriberQueue, FirstFailureSurvivesLaterFailureAndStorageCleanup)
+{
+  for (const bool receive_first : {false, true}) {
+    SubscriberQueue queue(1, 7);
+    ASSERT_TRUE(queue.push({1, payload, 7, std::make_shared<int>(0)}));
+    const auto receive = std::make_exception_ptr(std::logic_error("receive failure"));
+    const auto executor = std::make_exception_ptr(std::runtime_error("executor failure"));
+    queue.fail(receive_first ? receive : executor);
+    queue.fail(receive_first ? executor : receive);
+    if (receive_first) {
+      EXPECT_THROW(queue.wait_for_wake(0), std::logic_error);
+      EXPECT_THROW(queue.rethrow_failure(), std::logic_error);
+    } else {
+      EXPECT_THROW(queue.wait_for_wake(0), std::runtime_error);
+      EXPECT_THROW(queue.rethrow_failure(), std::runtime_error);
+    }
+    EXPECT_TRUE(queue.drain_for_close());
+    EXPECT_EQ(queue.stats().outstanding_leases, 0U);
+    EXPECT_EQ(queue.wait_for_wake(0), 0U);
+    if (receive_first) {
+      EXPECT_THROW(queue.rethrow_failure(), std::logic_error);
+    } else {
+      EXPECT_THROW(queue.rethrow_failure(), std::runtime_error);
+    }
+  }
+}
 
 TEST(SubscriberQueue, NativeStorageReleasePrecedesAdmissionBudgetReturn)
 {

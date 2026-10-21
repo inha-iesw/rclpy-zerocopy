@@ -102,10 +102,13 @@ public:
         observation->released();
 #endif
       }
-      queue.stop_admission();
-      std::lock_guard<std::mutex> lock(failure_mutex);
-      if (!callback_failure) {callback_failure = failure;}
+      fail_receive(failure);
     }
+  }
+
+  void fail_receive(std::exception_ptr failure) noexcept
+  {
+    queue.fail(std::move(failure));
   }
 
   // Declaration order ensures queued pointers and endpoints die before their native session.
@@ -116,8 +119,6 @@ public:
   bool attached{false};
   bool closing{false};
   bool closed{false};
-  std::mutex failure_mutex;
-  std::exception_ptr callback_failure;
 #ifdef BUILD_TESTING
   std::shared_ptr<ObservationState> observation{std::make_shared<ObservationState>()};
 #endif
@@ -129,6 +130,33 @@ public:
   Impl(std::shared_ptr<agnocast::Node> value, std::shared_ptr<void> session)
   : native_session(std::move(session)), node(std::move(value)),
     executor(std::make_unique<SubscriberExecutor>(node)) {}
+
+  void attach(
+    const std::shared_ptr<SubscriptionState> & state,
+    const std::string & topic, const std::size_t depth)
+  {
+    executor->watch_queue(std::shared_ptr<SubscriberQueue>(state, &state->queue));
+    executor->invoke(
+      [this, state, topic, depth]() {
+        try {
+          state->group = node->create_callback_group(
+            rclcpp::CallbackGroupType::MutuallyExclusive, false);
+          agnocast::SubscriptionOptions options;
+          options.callback_group = state->group;
+          const std::weak_ptr<SubscriptionState> weak = state;
+          state->subscription = node->create_subscription<Message>(
+            topic, depth, [weak](NativeMessage message) noexcept {
+            if (auto target = weak.lock()) {target->receive(std::move(message));}
+          }, options);
+          executor->add_callback_group(state->group, node->get_node_base_interface());
+          state->attached = true;
+        } catch (...) {
+          state->subscription.reset();
+          state->group.reset();
+          throw;
+        }
+      });
+  }
 
   // Callers hold mutex; keep endpoint closing ahead of executor/receive failures.
   void require_open(const SubscriptionState & state) const
@@ -186,26 +214,7 @@ std::shared_ptr<SubscriptionHandle> SubscriberRuntime::create_subscription(
   handle.reset(new SubscriptionHandle(shared_from_this(), state));
   impl_->states.push_back(state);
   try {
-    impl_->executor->invoke(
-      [this, state, topic, depth]() {
-        try {
-          state->group = impl_->node->create_callback_group(
-            rclcpp::CallbackGroupType::MutuallyExclusive, false);
-          agnocast::SubscriptionOptions options;
-          options.callback_group = state->group;
-          const std::weak_ptr<SubscriptionState> weak = state;
-          state->subscription = impl_->node->create_subscription<Message>(
-            topic, depth, [weak](NativeMessage message) noexcept {
-            if (auto target = weak.lock()) {target->receive(std::move(message));}
-          }, options);
-          impl_->executor->add_callback_group(state->group, impl_->node->get_node_base_interface());
-          state->attached = true;
-        } catch (...) {
-          state->subscription.reset();
-          state->group.reset();
-          throw;
-        }
-      });
+    impl_->attach(state, topic, depth);
   } catch (...) {
     impl_->states.pop_back();
     throw;
@@ -222,7 +231,7 @@ void SubscriberRuntime::quiesce() noexcept
   }
 }
 
-bool SubscriberRuntime::close()
+void SubscriberRuntime::prepare_close()
 {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   impl_->accepting = false;
@@ -231,6 +240,12 @@ bool SubscriberRuntime::close()
     state->queue.stop_admission();
   }
   if (impl_->executor) {impl_->executor->stop();}
+}
+
+bool SubscriberRuntime::close()
+{
+  prepare_close();
+  std::lock_guard<std::mutex> lock(impl_->mutex);
   bool idle = true;
   for (const auto & state : impl_->states) {
     impl_->detach(state);
@@ -266,14 +281,31 @@ std::shared_ptr<LeaseState> SubscriptionHandle::take()
   std::lock_guard<std::mutex> lock(impl.mutex);
   impl.require_open(*state_);
   impl.executor->check_failure();
-  {
-    std::lock_guard<std::mutex> failure_lock(state_->failure_mutex);
-    if (state_->callback_failure) {std::rethrow_exception(state_->callback_failure);}
-  }
+  state_->queue.rethrow_failure();
   return state_->queue.take(state_);
 }
 
 SubscriberStats SubscriptionHandle::stats() const {return state_->queue.stats();}
+
+std::uint64_t SubscriptionHandle::wait_for_wake(const std::uint64_t generation)
+{
+  return state_->queue.wait_for_wake(generation);
+}
+
+void SubscriptionHandle::finish_dispatch() noexcept {state_->queue.finish_dispatch();}
+
+void SubscriptionHandle::clear_pending() noexcept {state_->queue.clear();}
+
+void SubscriptionHandle::stop_delivery() noexcept {state_->queue.stop_admission();}
+
+void SubscriptionHandle::prepare_close()
+{
+  auto & impl = *runtime_->impl_;
+  std::lock_guard<std::mutex> lock(impl.mutex);
+  if (!impl.begin_close(*state_)) {return;}
+  // Keep the group attached until final close so new arrivals still release their references.
+  impl.executor->invoke_or_join([]() {});
+}
 
 void SubscriptionHandle::close()
 {
@@ -306,6 +338,16 @@ std::size_t SubscriptionHandle::publisher_count()
 }
 
 #ifdef BUILD_TESTING
+void SubscriptionHandle::test_fail_receive()
+{
+  std::lock_guard<std::mutex> lock(runtime_->impl_->mutex);
+  runtime_->impl_->executor->invoke(
+    [this]() {
+      state_->fail_receive(
+        std::make_exception_ptr(std::runtime_error("injected subscriber receive failure")));
+    });
+}
+
 void SubscriptionHandle::test_stop_executor(const bool fail)
 {
   std::lock_guard<std::mutex> lock(runtime_->impl_->mutex);

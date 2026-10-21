@@ -53,8 +53,10 @@ public:
   /** @brief Create a bounded typed subscription on the native executor thread. */
   std::shared_ptr<SubscriptionHandle> create_subscription(
     const std::string & topic, std::size_t depth, std::size_t max_count, std::size_t max_bytes);
-  /** @brief Stop admission without destroying endpoints, stopping execution or draining queues. */
+  /** @brief Permanently stop admission/notifications, retaining execution, endpoints and queues. */
   void quiesce() noexcept;
+  /** @brief Stop admission and join execution, retaining queues and endpoint resources. */
+  void prepare_close();
   /** @brief Stop execution and drain queues; return false while delivered storage is alive. */
   bool close();
 
@@ -74,11 +76,23 @@ public:
   std::shared_ptr<LeaseState> take();
   /** @brief Read queued, delivered and exported storage accounting under one lock. */
   SubscriberStats stats() const;
+  /** @brief Wait without the manager lock; zero means delivery stopped, failures are rethrown. */
+  std::uint64_t wait_for_wake(std::uint64_t generation);
+  /** @brief Restore notification after a complete or interrupted Python drain. */
+  void finish_dispatch() noexcept;
+  /** @brief Release queued storage after notifier join or a callback exception. */
+  void clear_pending() noexcept;
+  /** @brief Permanently stop admission/notifications without joining or releasing resources. */
+  void stop_delivery() noexcept;
+  /** @brief Stop admission and cross the callback barrier, retaining the native endpoint. */
+  void prepare_close();
   /** @brief Drain and detach this endpoint; throw a retryable error while a Lease is alive. */
   void close();
   /** @brief Return the native graph count; reject access after closing begins. */
   std::size_t publisher_count();
 #ifdef BUILD_TESTING
+  /** @brief Inject receive failure through its recording path, without an allocation fault. */
+  void test_fail_receive();
   /** @brief Read actual receive/reset evidence; available only in test builds. */
   SubscriberObservation observation() const;
   /** @brief Stop the worker independently of runtime close, for lifecycle regression tests. */

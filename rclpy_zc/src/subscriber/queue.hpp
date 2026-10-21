@@ -16,6 +16,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -55,7 +57,15 @@ public:
   bool push(ReceivedBuffer buffer);
   /** @brief Pop a wrapper, pinning endpoint resources only after it leaves the queue. */
   std::shared_ptr<LeaseState> take(std::shared_ptr<void> keepalive = {});
-  /** @brief Stop future admission; existing wrappers and views remain releasable. */
+  /** @brief Wait for a newer notification; zero means explicit stop, failures are rethrown. */
+  std::uint64_t wait_for_wake(std::uint64_t generation);
+  /** @brief Disarm only an empty queue, or notify again after an interrupted drain. */
+  void finish_dispatch() noexcept;
+  /** @brief Stop admission and wake the notifier with a native receive/executor failure. */
+  void fail(std::exception_ptr failure) noexcept;
+  /** @brief Rethrow the first recorded failure, including after explicit stop or queue cleanup. */
+  void rethrow_failure() const;
+  /** @brief Permanently stop admission/notifications; wait returns zero, storage stays releasable. */
   void stop_admission() noexcept;
   /** @brief Release all queued storage outside the accounting lock. */
   void clear() noexcept;
@@ -69,5 +79,10 @@ private:
   std::vector<std::shared_ptr<LeaseBufferOwner>> ring_;
   std::size_t head_{0};
   bool accepting_{true};
+  bool armed_{false};
+  bool notifications_stopped_{false};
+  std::uint64_t generation_{0};
+  std::exception_ptr failure_;
+  std::condition_variable wake_;
 };
 }  // namespace rclpy_agnocast

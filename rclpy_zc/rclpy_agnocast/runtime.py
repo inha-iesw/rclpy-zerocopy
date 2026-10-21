@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import ctypes
+import inspect
 import os
 from pathlib import Path
+from threading import RLock
 from typing import Any, Optional, Set
 
 from . import _native
 from .publisher import Publisher
+from .subscription import Subscription
+from .subscription.endpoint import _close_all
 
 
 class _DlInfo(ctypes.Structure):
@@ -128,7 +132,9 @@ def _positive_integer(name: str, value: int) -> int:
 class AgnocastRuntime:
     """Own the native Agnocast session while retaining the supplied rclpy Node."""
 
-    __slots__ = ("_closed", "_native_runtime", "_rclpy_node")
+    __slots__ = (
+        "_closed", "_native_runtime", "_rclpy_node", "_lifecycle_lock", "_subscriptions"
+    )
 
     def __init__(self, rclpy_node: Any) -> None:
         global _active_runtime
@@ -140,6 +146,8 @@ class AgnocastRuntime:
         self._rclpy_node = rclpy_node
         self._native_runtime = _native.RuntimeCore.create(node_name)
         self._closed = False
+        self._lifecycle_lock = RLock()
+        self._subscriptions = set()
         _active_runtime = self
 
     @property
@@ -168,13 +176,62 @@ class AgnocastRuntime:
     def close(self) -> None:
         """Quiesce and close; active Loans or subscriber views make this retryably fail."""
         global _active_runtime
-        if self._closed:
-            return
-        self._native_runtime.close()
-        self._closed = True
-        self._rclpy_node = None
-        if _active_runtime is self:
-            _active_runtime = None
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            if self._subscriptions:
+                _close_all(tuple(self._subscriptions), self._native_runtime.prepare_close,
+                           self._native_runtime.close)
+            else:
+                self._native_runtime.close()
+            self._closed = True
+            self._rclpy_node = None
+            if _active_runtime is self:
+                _active_runtime = None
+
+    def create_subscription(
+        self,
+        topic: str,
+        callback,
+        *,
+        depth: int,
+        max_outstanding_leases: Optional[int] = None,
+        max_payload_bytes: int,
+    ) -> Subscription:
+        """
+        Deliver SharedBuffer Leases through the Node's executor, with bounded retention.
+
+        The callback must be synchronous. ``max_outstanding_leases`` defaults to depth;
+        ``max_payload_bytes`` bounds aggregate queued, delivered and view-held bytes.
+        Close the returned subscription or this runtime before destroying the Node.
+        """
+        if not isinstance(topic, str):
+            raise TypeError("topic must be a string")
+        if not topic:
+            raise ValueError("topic must not be empty")
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+        if (inspect.iscoroutinefunction(callback)
+                or inspect.isasyncgenfunction(callback)
+                or inspect.iscoroutinefunction(getattr(callback, "__call__", None))
+                or inspect.isasyncgenfunction(getattr(callback, "__call__", None))):
+            raise TypeError("subscription callback must be synchronous")
+        depth = _positive_integer("depth", depth)
+        count = depth if max_outstanding_leases is None else _positive_integer(
+            "max_outstanding_leases", max_outstanding_leases
+        )
+        limit = _positive_integer("max_payload_bytes", max_payload_bytes)
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("runtime is closed")
+            _validate_rclpy_node(self._rclpy_node)
+            for name in ("create_guard_condition", "destroy_guard_condition"):
+                if not callable(getattr(self._rclpy_node, name, None)):
+                    raise TypeError(f"rclpy_node must provide {name}()")
+            handle = self._native_runtime.create_subscription(topic, depth, count, limit)
+            subscription = Subscription(handle, callback, runtime_owner=self)
+            self._subscriptions.add(subscription)
+            return subscription
 
     def __enter__(self) -> "AgnocastRuntime":
         return self

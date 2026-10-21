@@ -82,6 +82,22 @@ if(BUILD_TESTING)
   target_sources(_native PRIVATE src/subscriber/bind_testing.cpp)
 
   ament_add_pytest_test(test_subscriber_lease test/subscriber/test_lease.py TIMEOUT 60)
+  ament_add_pytest_test(test_subscriber_dispatch test/subscriber/test_dispatch.py
+    APPEND_ENV "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/test"
+    TIMEOUT 60
+  )
+  ament_add_pytest_test(test_subscriber_api test/subscriber/test_api.py
+    APPEND_ENV "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/test"
+    TIMEOUT 60
+  )
+  ament_add_pytest_test(test_subscriber_shutdown test/subscriber/test_shutdown.py
+    APPEND_ENV "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/test"
+    TIMEOUT 120
+  )
+  ament_add_pytest_test(test_subscriber_fairness test/subscriber/test_fairness.py
+    APPEND_ENV "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/test"
+    TIMEOUT 60
+  )
   ament_add_gtest(test_subscriber_queue test/subscriber/test_queue.cpp TIMEOUT 60)
   target_include_directories(test_subscriber_queue PRIVATE src)
   target_link_libraries(test_subscriber_queue rclpy_agnocast_core)
@@ -91,6 +107,13 @@ if(BUILD_TESTING)
     TIMEOUT 180
   )
   set_tests_properties(test_subscriber_system PROPERTIES
+    LABELS "pytest;system;requires_kernel_module;requires_heaphook")
+  ament_add_pytest_test(test_subscriber_guard_system test/subscriber/test_guard_system.py
+    ENV "RCLPY_AGNOCAST_SUBSCRIBER=$<TARGET_FILE:rclpy_agnocast_shared_buffer_subscriber>"
+    APPEND_ENV "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/test"
+    TIMEOUT 180
+  )
+  set_tests_properties(test_subscriber_guard_system PROPERTIES
     LABELS "pytest;system;requires_kernel_module;requires_heaphook")
 
   ament_add_gtest(test_publisher_observation test/publisher/test_observation.cpp)
@@ -128,6 +151,7 @@ if(BUILD_TESTING)
   )
   ament_add_pytest_test(test_python_lifecycle
     test/test_python_lifecycle.py
+    APPEND_ENV "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/test"
     TIMEOUT 60
   )
 

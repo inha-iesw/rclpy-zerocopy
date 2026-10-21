@@ -307,10 +307,10 @@ PublisherWorkerResult RuntimeCore::remove_publisher(const std::uintptr_t publish
   }
 }
 
-PublisherWorkerResult RuntimeCore::close() noexcept
+PublisherWorkerResult RuntimeCore::prepare_close() noexcept
 {
   try {
-    std::unique_lock<std::mutex> lock(impl_->mutex);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->state == RuntimeState::kClosed) return {PublisherWorkerError::kNone, nullptr};
     impl_->state = RuntimeState::kQuiescing;
     if (impl_->subscribers) impl_->subscribers->quiesce();
@@ -322,6 +322,20 @@ PublisherWorkerResult RuntimeCore::close() noexcept
       return result;
     }
     impl_->publisher_ids.clear();
+    if (impl_->subscribers) impl_->subscribers->prepare_close();
+    return {PublisherWorkerError::kNone, nullptr};
+  } catch (...) {
+    return {PublisherWorkerError::kOperationFailed, std::current_exception()};
+  }
+}
+
+PublisherWorkerResult RuntimeCore::close() noexcept
+{
+  const auto result = prepare_close();
+  if (result.error != PublisherWorkerError::kNone) return result;
+  try {
+    std::unique_lock<std::mutex> lock(impl_->mutex);
+    if (impl_->state == RuntimeState::kClosed) return {PublisherWorkerError::kNone, nullptr};
     // A Lease busy result occurs after publisher teardown and subscriber executor join.
     if (impl_->subscribers && !impl_->subscribers->close()) {
       return {PublisherWorkerError::kBusy,

@@ -85,6 +85,14 @@ void bind_runtime(py::module_ & module)
       return runtime->create_subscription(topic, depth, count, bytes);
     }, py::arg("topic"), py::arg("depth"), py::arg("max_outstanding_leases"),
     py::arg("max_payload_bytes"))
+  .def("prepare_close", [](const std::shared_ptr<RuntimeCore> & runtime) {
+      PublisherWorkerResult result{};
+      {
+        py::gil_scoped_release release;
+        result = runtime->prepare_close();
+      }
+      binding_detail::throw_worker_error("runtime close", result);
+    })
   .def("close", [](const std::shared_ptr<RuntimeCore> & runtime) {
       PublisherWorkerResult result{};
       {

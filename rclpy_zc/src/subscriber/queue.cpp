@@ -54,6 +54,11 @@ bool SubscriberQueue::push(ReceivedBuffer buffer)
   ++stats.queued_leases;
   ++stats.outstanding_leases;
   stats.outstanding_payload_bytes += size;
+  if (!armed_) {
+    armed_ = true;
+    ++generation_;
+    wake_.notify_one();
+  }
   return true;
 }
 
@@ -72,10 +77,48 @@ std::shared_ptr<LeaseState> SubscriberQueue::take(std::shared_ptr<void> keepaliv
   return lease;
 }
 
+std::uint64_t SubscriberQueue::wait_for_wake(const std::uint64_t generation)
+{
+  std::unique_lock<std::mutex> lock(budget_->mutex);
+  wake_.wait(
+    lock, [&]() {
+      return notifications_stopped_ || failure_ || generation_ != generation;
+    });
+  if (notifications_stopped_) {return 0;}
+  if (failure_) {std::rethrow_exception(failure_);}
+  return generation_;
+}
+
+void SubscriberQueue::finish_dispatch() noexcept
+{
+  std::lock_guard<std::mutex> lock(budget_->mutex);
+  armed_ = budget_->stats.queued_leases != 0;
+  if (armed_ && accepting_) {
+    ++generation_;
+    wake_.notify_one();
+  }
+}
+
+void SubscriberQueue::fail(std::exception_ptr failure) noexcept
+{
+  std::lock_guard<std::mutex> lock(budget_->mutex);
+  accepting_ = false;
+  if (!failure_) {failure_ = std::move(failure);}
+  wake_.notify_all();
+}
+
 void SubscriberQueue::stop_admission() noexcept
 {
   std::lock_guard<std::mutex> lock(budget_->mutex);
   accepting_ = false;
+  notifications_stopped_ = true;
+  wake_.notify_all();
+}
+
+void SubscriberQueue::rethrow_failure() const
+{
+  std::lock_guard<std::mutex> lock(budget_->mutex);
+  if (failure_) {std::rethrow_exception(failure_);}
 }
 
 void SubscriberQueue::clear() noexcept

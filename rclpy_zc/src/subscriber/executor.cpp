@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "queue.hpp"
 #include "agnocast/node/agnocast_node.hpp"
 
 namespace rclpy_agnocast
@@ -105,8 +106,26 @@ void SubscriberExecutor::run() noexcept
   std::lock_guard<std::mutex> lock(control_mutex_);
   stopped_ = true;
   failure_ = failure;
-  std::lock_guard<std::mutex> ready_lock(ready_agnocast_executables_mutex_);
-  ready_agnocast_executables_.clear();
+  {
+    std::lock_guard<std::mutex> ready_lock(ready_agnocast_executables_mutex_);
+    ready_agnocast_executables_.clear();
+  }
+  // Never acquire the manager lock here: its close path holds it while joining this worker.
+  const auto terminal = failure ? failure :
+    std::make_exception_ptr(std::runtime_error("subscriber executor is stopped"));
+  for (const auto & weak : queues_) {
+    if (auto queue = weak.lock()) {queue->fail(terminal);}
+  }
+}
+
+void SubscriberExecutor::watch_queue(const std::shared_ptr<SubscriberQueue> & queue)
+{
+  std::lock_guard<std::mutex> lock(control_mutex_);
+  throw_if_stopped_locked();
+  queues_.erase(
+    std::remove_if(queues_.begin(), queues_.end(), [](const auto & weak) {return weak.expired();}),
+    queues_.end());
+  queues_.push_back(queue);
 }
 
 void SubscriberExecutor::stop() noexcept

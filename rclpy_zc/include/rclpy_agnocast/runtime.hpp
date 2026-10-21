@@ -81,6 +81,14 @@ public:
     std::size_t max_payload_bytes);
 
   /**
+   * @brief Stop native workers while retaining subscriber queues, endpoints and session.
+   *
+   * @return Retryable `kBusy` while a Loan/export is active, otherwise worker result.
+   * @post On success, Python may join notifiers, drain queues and remove guards before close().
+   */
+  PublisherWorkerResult prepare_close() noexcept;
+
+  /**
    * @brief Quiesce endpoints and join native workers before destroying subscriber resources.
    *
    * @return `kBusy` without destructive cleanup while a Loan remains active; otherwise the first

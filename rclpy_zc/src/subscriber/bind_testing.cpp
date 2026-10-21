@@ -53,6 +53,17 @@ public:
     return queue_.push({sequence, storage->data(), storage->size(), std::move(storage)});
   }
   std::shared_ptr<LeaseState> take() {return queue_.take();}
+  std::uint64_t wait_for_wake(std::uint64_t generation)
+  {
+    return queue_.wait_for_wake(generation);
+  }
+  void finish_dispatch() {queue_.finish_dispatch();}
+  void clear_pending() {queue_.clear();}
+  void prepare_close() {queue_.stop_admission();}
+  void fail()
+  {
+    queue_.fail(std::make_exception_ptr(std::runtime_error("injected receive failure")));
+  }
   SubscriberStats stats() const {return queue_.stats();}
   std::size_t release_count() const {return released_->load();}
   std::int64_t release_tid() const {return release_tid_->load();}
@@ -95,6 +106,14 @@ void bind_subscriber_testing(py::module_ & module)
   .def(py::init<std::size_t, std::size_t>())
   .def("push", &TestSubscription::push)
   .def("take", &TestSubscription::take)
+  .def(
+    "wait_for_wake", &TestSubscription::wait_for_wake,
+    py::call_guard<py::gil_scoped_release>())
+  .def("finish_dispatch", &TestSubscription::finish_dispatch)
+  .def("clear_pending", &TestSubscription::clear_pending)
+  .def("prepare_close", &TestSubscription::prepare_close)
+  .def("stop_delivery", &TestSubscription::prepare_close)
+  .def("fail", &TestSubscription::fail)
   .def("close", &TestSubscription::close)
   .def_property_readonly("stats", &TestSubscription::stats)
   .def_property_readonly("release_count", &TestSubscription::release_count)

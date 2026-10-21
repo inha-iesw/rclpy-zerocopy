@@ -5,8 +5,9 @@ import re
 
 import pytest
 
-from rclpy_agnocast import AgnocastRuntime
 from rclpy_agnocast import runtime as runtime_module
+
+from subscriber.fakes import Node, runtime_for_test
 
 
 class _BusyRuntime:
@@ -42,33 +43,9 @@ class _IdlePublisherHandle:
         self.close_calls += 1
 
 
-class _Context:
-    def __init__(self, active: bool) -> None:
-        self._active = active
-
-    def ok(self) -> bool:
-        return self._active
-
-
-class _Node:
-    def __init__(self, active: bool) -> None:
-        self.context = _Context(active)
-
-    def get_name(self) -> str:
-        return "python_node"
-
-
-def _runtime_with(native_runtime):
-    runtime = AgnocastRuntime.__new__(AgnocastRuntime)
-    runtime._closed = False
-    runtime._native_runtime = native_runtime
-    runtime._rclpy_node = object()
-    return runtime
-
-
 def test_runtime_context_preserves_body_exception_when_close_is_busy():
     native_runtime = _BusyRuntime()
-    runtime = _runtime_with(native_runtime)
+    runtime = runtime_for_test(native_runtime, object())
 
     with pytest.raises(LookupError, match="original failure"):
         with runtime:
@@ -80,7 +57,7 @@ def test_runtime_context_preserves_body_exception_when_close_is_busy():
 
 def test_publisher_retains_python_runtime_until_successful_close():
     native_runtime = _IdleRuntime()
-    runtime = _runtime_with(native_runtime)
+    runtime = runtime_for_test(native_runtime, object())
     publisher = runtime.create_publisher("/topic", depth=1, max_payload_bytes=64)
 
     assert publisher._runtime_owner is runtime
@@ -92,7 +69,7 @@ def test_publisher_retains_python_runtime_until_successful_close():
 
 def test_successful_close_releases_process_global_python_keepalive(monkeypatch):
     native_runtime = _IdleRuntime()
-    runtime = _runtime_with(native_runtime)
+    runtime = runtime_for_test(native_runtime, object())
     monkeypatch.setattr(runtime_module, "_active_runtime", runtime, raising=False)
 
     runtime.close()
@@ -102,9 +79,9 @@ def test_successful_close_releases_process_global_python_keepalive(monkeypatch):
 
 def test_rclpy_node_context_must_be_active():
     with pytest.raises(RuntimeError, match="context is not active"):
-        runtime_module._validate_rclpy_node(_Node(active=False))
+        runtime_module._validate_rclpy_node(Node(active=False))
 
-    assert runtime_module._validate_rclpy_node(_Node(active=True)) == "python_node"
+    assert runtime_module._validate_rclpy_node(Node(active=True)) == "python_node"
 
 
 def test_loaded_artifact_check_rejects_non_interposed_heaphook(

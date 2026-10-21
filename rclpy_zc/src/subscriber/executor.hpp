@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include "agnocast/agnocast_executor.hpp"
 #include "agnocast/node/agnocast_only_single_threaded_executor.hpp"
@@ -30,6 +31,7 @@ class Node;
 
 namespace rclpy_agnocast
 {
+class SubscriberQueue;
 /** @brief Serialize endpoint controls with callbacks in the existing Agnocast spin loop. */
 class SubscriberExecutor final : public agnocast::AgnocastOnlySingleThreadedExecutor
 {
@@ -47,6 +49,8 @@ public:
   void stop() noexcept;
   /** @brief Rethrow a failure escaping the native spin loop. */
   void check_failure() const;
+  /** @brief Wake a state-owned queue on natural spin exit, without retaining the endpoint. */
+  void watch_queue(const std::shared_ptr<SubscriberQueue> & queue);
 #ifdef BUILD_TESTING
   /** @brief End spin without changing manager state, optionally through a native exception. */
   void test_stop(bool fail);
@@ -61,6 +65,7 @@ private:
   mutable std::mutex control_mutex_;
   bool stopped_{false};
   std::exception_ptr failure_;
+  std::vector<std::weak_ptr<SubscriberQueue>> queues_;
   std::thread thread_;
 #ifdef BUILD_TESTING
   bool fail_next_control_{false};
