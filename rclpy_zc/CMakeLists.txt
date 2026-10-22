@@ -93,6 +93,7 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_type_registry test/types/test_registry.cpp)
   target_link_libraries(test_type_registry rclpy_agnocast_types)
+  ament_add_pytest_test(test_type_discovery test/types/test_discovery.py TIMEOUT 60)
   ament_add_pytest_test(test_type_native_abi test/types/test_native_abi.py TIMEOUT 60)
 
   target_compile_definitions(rclpy_agnocast_core PUBLIC BUILD_TESTING)
