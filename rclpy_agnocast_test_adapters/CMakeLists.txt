@@ -15,5 +15,17 @@ rclpy_agnocast_generate_adapters(_types TYPES
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_installed_provider test/test_installed_provider.py TIMEOUT 60)
+  find_package(Threads REQUIRED)
+  add_executable(rclpy_agnocast_typed_inspector test/typed/inspector.cpp)
+  target_compile_features(rclpy_agnocast_typed_inspector PRIVATE cxx_std_17)
+  target_link_libraries(rclpy_agnocast_typed_inspector PRIVATE
+    agnocastlib::agnocast rclcpp::rclcpp Threads::Threads
+    rclpy_agnocast_test_msgs::rclpy_agnocast_test_msgs__rosidl_generator_cpp)
+  ament_add_pytest_test(test_typed_system test/typed/test_system.py
+    ENV "RCLPY_AGNOCAST_TYPED_INSPECTOR=$<TARGET_FILE:rclpy_agnocast_typed_inspector>"
+    APPEND_ENV "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/../rclpy_zc/test"
+    TIMEOUT 180)
+  set_tests_properties(test_typed_system PROPERTIES
+    LABELS "pytest;system;requires_kernel_module;requires_heaphook")
 endif()
 ament_package()
