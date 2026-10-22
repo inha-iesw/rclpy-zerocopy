@@ -119,12 +119,14 @@ if(BUILD_TESTING)
   add_dependencies(test_provider_lifetime test_type_provider)
   ament_add_pytest_test(test_type_discovery test/types/test_discovery.py TIMEOUT 60)
   ament_add_pytest_test(test_type_native_abi test/types/test_native_abi.py TIMEOUT 60)
+  ament_add_pytest_test(test_type_bindings test/types/test_bindings.py TIMEOUT 60)
 
   target_compile_definitions(rclpy_agnocast_core PUBLIC BUILD_TESTING)
   target_sources(rclpy_agnocast_core PRIVATE src/publisher/observation.cpp)
   target_link_libraries(rclpy_agnocast_core PUBLIC ${CMAKE_DL_LIBS})
   target_sources(_native PRIVATE src/publisher/bind_observation.cpp)
   target_sources(_native PRIVATE src/subscriber/bind_testing.cpp)
+  target_sources(_native PRIVATE src/types/bind_testing.cpp)
 
   ament_add_pytest_test(test_subscriber_lease test/subscriber/test_lease.py TIMEOUT 60)
   ament_add_pytest_test(test_subscriber_dispatch test/subscriber/test_dispatch.py
