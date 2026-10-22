@@ -10,7 +10,7 @@ namespace rclpy_agnocast
 {
 namespace
 {
-enum class Command {kAdd, kRemove, kBorrow, kPublish, kCancel, kStop};
+enum class Command {kAdd, kRemove, kBorrow, kBorrowRoot, kOperate, kPublish, kCancel, kStop};
 struct CommandSlot
 {
   Command command{Command::kStop};
@@ -18,12 +18,15 @@ struct CommandSlot
   std::size_t size{0U};
   std::uint64_t generation{0U};
   std::unique_ptr<PublisherBackendFactory> factory;
+  void (*operation)(void *){nullptr};
+  void * argument{nullptr};
 };
 struct Completion
 {
   PublisherWorkerError error{PublisherWorkerError::kNone};
   BorrowedRegion region{nullptr, nullptr, 0U, 0U};
   std::exception_ptr failure;
+  void * root{nullptr};
 };
 }  // namespace
 class PublisherWorker::Impl
@@ -88,6 +91,31 @@ public:
   {return terminal_command(Command::kPublish, id, generation);}
   PublisherWorkerResult cancel(const std::uintptr_t id, const std::uint64_t generation)
   {return terminal_command(Command::kCancel, id, generation);}
+  PublisherRootResult borrow_root(const std::uintptr_t publisher_id)
+  {
+    std::lock_guard<std::mutex> api_lock(api_mutex_);
+    std::unique_lock<std::mutex> state_lock(state_mutex_);
+    if (stopped_) return {PublisherWorkerError::kStopped, nullptr, 0U, nullptr};
+    if (active_) return {PublisherWorkerError::kBusy, nullptr, 0U, nullptr};
+    CommandSlot slot{Command::kBorrowRoot, publisher_id, 0U, 0U, nullptr};
+    const auto completion = submit(state_lock, std::move(slot));
+    return {completion.error, completion.root, completion.region.generation, completion.failure};
+  }
+  PublisherWorkerResult operate(
+    const std::uintptr_t publisher_id, const std::uint64_t generation,
+    void (*operation)(void *), void * argument)
+  {
+    std::lock_guard<std::mutex> api_lock(api_mutex_);
+    std::unique_lock<std::mutex> state_lock(state_mutex_);
+    if (stopped_) return error_result(PublisherWorkerError::kStopped);
+    if (!active_ || active_publisher_id_ != publisher_id) {
+      return error_result(PublisherWorkerError::kNotFound);
+    }
+    if (active_generation_ != generation) return error_result(PublisherWorkerError::kStaleGeneration);
+    if (!operation) return error_result(PublisherWorkerError::kOperationFailed);
+    CommandSlot slot{Command::kOperate, publisher_id, 0U, generation, nullptr, operation, argument};
+    return command_result(submit(state_lock, std::move(slot)));
+  }
   PublisherWorkerError cancel_async(
     const std::uintptr_t publisher_id, const std::uint64_t generation) noexcept
   {
@@ -214,6 +242,25 @@ private:
         case Command::kPublish:
           backend->second->publish();
           break;
+        case Command::kBorrowRoot:
+          if (backend == publishers_.end()) {
+            return {PublisherWorkerError::kNotFound, {}, nullptr};
+          }
+          try {
+            completion.root = backend->second->borrow_root();
+          } catch (...) {
+            backend->second->cancel();
+            throw;
+          }
+          if (completion.root == nullptr) {
+            backend->second->cancel();
+            return {PublisherWorkerError::kInvalidStorage, {}, nullptr};
+          }
+          completion.region.generation = next_generation_++;
+          break;
+        case Command::kOperate:
+          slot.operation(slot.argument);
+          break;
         case Command::kCancel:
           backend->second->cancel();
           break;
@@ -244,8 +291,8 @@ private:
       auto completion = execute(slot);
 #ifdef BUILD_TESTING
       if (
-        slot.command == Command::kBorrow &&
-        completion.error == PublisherWorkerError::kNone)
+        ((slot.command == Command::kBorrow || slot.command == Command::kBorrowRoot) &&
+        completion.error == PublisherWorkerError::kNone) || slot.command == Command::kOperate)
       {
         observation::filling(true);
       }
@@ -254,7 +301,7 @@ private:
       {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (completion.error == PublisherWorkerError::kNone) {
-          if (slot.command == Command::kBorrow) {
+          if (slot.command == Command::kBorrow || slot.command == Command::kBorrowRoot) {
             active_ = true;
             active_publisher_id_ = slot.publisher_id;
             active_generation_ = completion.region.generation;
@@ -311,6 +358,12 @@ PublisherWorkerResult PublisherWorker::remove_publisher(const std::uintptr_t pub
 PublisherBorrowResult PublisherWorker::borrow(
   const std::uintptr_t publisher_id, const std::size_t size)
 {return impl_->borrow(publisher_id, size);}
+PublisherRootResult PublisherWorker::borrow_root(const std::uintptr_t publisher_id)
+{return impl_->borrow_root(publisher_id);}
+PublisherWorkerResult PublisherWorker::operate(
+  const std::uintptr_t publisher_id, const std::uint64_t generation,
+  void (*operation)(void *), void * argument)
+{return impl_->operate(publisher_id, generation, operation, argument);}
 PublisherWorkerResult PublisherWorker::publish(
   const std::uintptr_t publisher_id, const std::uint64_t generation)
 {return impl_->publish(publisher_id, generation);}

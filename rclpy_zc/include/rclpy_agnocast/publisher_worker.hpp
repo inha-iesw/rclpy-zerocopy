@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <stdexcept>
 
 namespace rclpy_agnocast
 {
@@ -53,6 +54,15 @@ struct PublisherBorrowResult
   std::exception_ptr failure;
 };
 
+/** @brief Borrowed native root and its one-shot worker identity, or a backend failure. */
+struct PublisherRootResult
+{
+  PublisherWorkerError error;
+  void * root;
+  std::uint64_t generation;
+  std::exception_ptr failure;
+};
+
 /**
  * @brief Typed-publisher operations that must run on the publisher worker.
  *
@@ -72,6 +82,13 @@ public:
    * @return Mutable scalar and payload storage owned by the backend.
    */
   virtual BorrowedStorage borrow(std::size_t size) = 0;
+
+  /**
+   * @brief Borrow a default-constructed root on the publisher worker.
+   * @return Non-null root retained by the backend until publish or cancel.
+   * @throws std::logic_error when this backend supports only SharedBuffer borrows.
+   */
+  virtual void * borrow_root() {throw std::logic_error("backend does not support root borrow");}
 
   /**
    * @brief Publish the currently borrowed native message.
@@ -143,6 +160,29 @@ public:
    * @return Region and generation or a validation/backend failure.
    */
   PublisherBorrowResult borrow(std::uintptr_t publisher_id, std::size_t size);
+
+  /**
+   * @brief Borrow a generated native message using the shared single-loan slot.
+   * @param[in] publisher_id Endpoint identity.
+   * @return Root and generation, or a validation/backend failure with no active loan.
+   */
+  PublisherRootResult borrow_root(std::uintptr_t publisher_id);
+
+  /**
+   * @brief Run a synchronous structural operation without ending the active loan.
+   *
+   * The caller prepares the task before submission. An operation failure leaves the loan
+   * active so its owner can select recovery or cancellation. No task allocation occurs here.
+   *
+   * @param[in] publisher_id Active endpoint identity.
+   * @param[in] generation Active borrow generation.
+   * @param[in] operation Non-null callback executed on the publisher worker.
+   * @param[in,out] argument Caller-owned task valid through completion; may be null.
+   * @return Validation or callback result, preserving any thrown exception.
+   */
+  PublisherWorkerResult operate(
+    std::uintptr_t publisher_id, std::uint64_t generation,
+    void (*operation)(void *), void * argument);
 
   /**
    * @brief Publish an active generation on the worker thread.
