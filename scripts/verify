@@ -3,8 +3,12 @@
 set -eo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 source /opt/ros/humble/setup.bash
-colcon build --symlink-install --packages-up-to rclpy_agnocast \
+colcon build --symlink-install \
+  --packages-up-to rclpy_agnocast_adapters rclpy_agnocast_test_adapters \
   --cmake-args -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
 source install/setup.bash
 ctest --test-dir build/rclpy_agnocast_msgs --output-on-failure --no-tests=error
 ctest --test-dir build/rclpy_agnocast --output-on-failure --no-tests=error
+ctest --test-dir build/rclpy_agnocast_codegen --output-on-failure --no-tests=error
+ctest --test-dir build/rclpy_agnocast_adapters --output-on-failure --no-tests=error
+ctest --test-dir build/rclpy_agnocast_test_adapters --output-on-failure --no-tests=error
