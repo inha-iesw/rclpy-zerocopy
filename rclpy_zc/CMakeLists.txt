@@ -15,6 +15,21 @@ find_package(rclcpp REQUIRED)
 find_package(rclpy_agnocast_msgs REQUIRED)
 find_package(Threads REQUIRED)
 
+add_library(rclpy_agnocast_types SHARED src/types/registry.cpp)
+target_compile_features(rclpy_agnocast_types PUBLIC cxx_std_17)
+target_include_directories(rclpy_agnocast_types PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+target_compile_definitions(rclpy_agnocast_types PUBLIC
+  RCLPY_AGNOCAST_ROS_ABI="${rclcpp_VERSION}:$ENV{ROS_DISTRO}"
+)
+target_link_libraries(rclpy_agnocast_types PRIVATE Threads::Threads)
+install(TARGETS rclpy_agnocast_types EXPORT rclpy_agnocast_types_targets
+  LIBRARY DESTINATION lib
+)
+ament_export_targets(rclpy_agnocast_types_targets HAS_LIBRARY_TARGET)
+
 add_library(rclpy_agnocast_core STATIC
   src/loan.cpp
   src/publisher_worker.cpp
@@ -58,9 +73,10 @@ pybind11_add_module(_native MODULE
   src/bindings.cpp
   src/bind_publisher.cpp
   src/subscriber/bindings.cpp
+  src/types/bindings.cpp
 )
 target_compile_features(_native PRIVATE cxx_std_17)
-target_link_libraries(_native PRIVATE rclpy_agnocast_native)
+target_link_libraries(_native PRIVATE rclpy_agnocast_native rclpy_agnocast_types)
 target_compile_definitions(_native PRIVATE
   $<$<BOOL:${BUILD_TESTING}>:BUILD_TESTING>
 )
@@ -74,6 +90,10 @@ install(TARGETS _native
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)
+
+  ament_add_gtest(test_type_registry test/types/test_registry.cpp)
+  target_link_libraries(test_type_registry rclpy_agnocast_types)
+  ament_add_pytest_test(test_type_native_abi test/types/test_native_abi.py TIMEOUT 60)
 
   target_compile_definitions(rclpy_agnocast_core PUBLIC BUILD_TESTING)
   target_sources(rclpy_agnocast_core PRIVATE src/publisher/observation.cpp)

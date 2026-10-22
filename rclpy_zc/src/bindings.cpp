@@ -107,9 +107,15 @@ void bind_runtime(py::module_ & module)
 }  // namespace
 }  // namespace rclpy_agnocast
 
+namespace rclpy_agnocast
+{
+void bind_types(py::module_ & module);
+}
+
 PYBIND11_MODULE(_native, module)
 {
   module.doc() = "Typed Agnocast CPU zero-copy native adapter";
+  rclpy_agnocast::bind_types(module);
   if (rclpy_agnocast::register_writable_buffer_export_type(module.ptr()) != 0) {
     throw py::error_already_set();
   }
