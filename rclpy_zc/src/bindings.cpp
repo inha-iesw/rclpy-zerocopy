@@ -77,6 +77,12 @@ void bind_runtime(py::module_ & module)
       py::gil_scoped_release release;
       return runtime->create_publisher(topic, depth, max_payload_bytes);
     }, py::arg("topic"), py::arg("depth"), py::arg("max_payload_bytes"))
+  .def("create_typed_publisher", [](
+      const std::shared_ptr<RuntimeCore> & runtime, const std::string & type,
+      const std::string & topic, std::size_t depth, std::size_t maximum) {
+      py::gil_scoped_release release;
+      return runtime->create_typed_publisher(type, topic, depth, maximum);
+    }, py::arg("ros_type"), py::arg("topic"), py::arg("depth"), py::arg("max_storage_bytes"))
   .def("create_subscription", [](
       const std::shared_ptr<RuntimeCore> & runtime, const std::string & topic,
       const std::size_t depth, const std::size_t count, const std::size_t bytes)

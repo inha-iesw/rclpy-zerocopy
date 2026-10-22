@@ -2,6 +2,7 @@
 
 #include "rclpy_agnocast/buffer_owner.hpp"
 #include "rclpy_agnocast/runtime.hpp"
+#include "types/root.hpp"
 
 #include <pybind11/pybind11.h>
 
@@ -278,6 +279,10 @@ void bind_publisher(py::module_ & module)
   auto publisher = py::class_<PublisherHandle, std::shared_ptr<PublisherHandle>>(
     module, "PublisherHandle");
   bind_publisher_methods(publisher);
+  publisher.def("borrow_message", [](const std::shared_ptr<PublisherHandle> & handle) {
+      py::gil_scoped_release release;
+      return handle->borrow_message();
+    });
 
 #ifdef BUILD_TESTING
   auto test_publisher = py::class_<TestPublisher, std::shared_ptr<TestPublisher>>(

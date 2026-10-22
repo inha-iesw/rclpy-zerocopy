@@ -83,6 +83,7 @@ pybind11_add_module(_native MODULE
   src/bind_publisher.cpp
   src/subscriber/bindings.cpp
   src/types/bindings.cpp
+  src/types/bind_root.cpp
 )
 target_compile_features(_native PRIVATE cxx_std_17)
 target_link_libraries(_native PRIVATE rclpy_agnocast_native rclpy_agnocast_types)

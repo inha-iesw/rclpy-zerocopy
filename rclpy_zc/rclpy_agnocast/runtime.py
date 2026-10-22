@@ -190,6 +190,31 @@ class AgnocastRuntime:
             if _active_runtime is self:
                 _active_runtime = None
 
+    def create_typed_publisher(
+        self, message_type, topic: str, *, depth: int, max_storage_bytes: int
+    ):
+        """Create an installed generated endpoint with capacity-based root accounting.
+
+        Discovery and type validation finish before native endpoint creation. This
+        explicit API uses the existing process runtime; Node transport routing is separate.
+        """
+        from .types import resolve_adapter
+        from .types.publisher import TypedPublisher
+
+        if not isinstance(topic, str):
+            raise TypeError("topic must be a string")
+        if not topic:
+            raise ValueError("topic must not be empty")
+        depth = _positive_integer("depth", depth)
+        limit = _positive_integer("max_storage_bytes", max_storage_bytes)
+        descriptor = resolve_adapter(message_type)
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("runtime is closed")
+            handle = self._native_runtime.create_typed_publisher(
+                descriptor['ros_type'], topic, depth, limit)
+            return TypedPublisher(handle, self)
+
     def create_subscription(
         self,
         topic: str,

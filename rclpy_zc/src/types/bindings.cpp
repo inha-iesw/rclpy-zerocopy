@@ -22,6 +22,10 @@ namespace py = pybind11;
 
 namespace rclpy_agnocast
 {
+namespace types
+{
+void bind_root(py::module_ & module);
+}
 
 void bind_types(py::module_ & module)
 {
@@ -48,6 +52,7 @@ void bind_types(py::module_ & module)
       result["native_alignment"] = descriptor.native_alignment;
       return result;
     }, py::arg("ros_type"));
+  types::bind_root(module);
 }
 
 }  // namespace rclpy_agnocast
