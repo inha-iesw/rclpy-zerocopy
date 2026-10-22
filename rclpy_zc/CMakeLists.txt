@@ -115,6 +115,13 @@ if(BUILD_TESTING)
   )
   set_tests_properties(test_subscriber_guard_system PROPERTIES
     LABELS "pytest;system;requires_kernel_module;requires_heaphook")
+  ament_add_pytest_test(test_cpu_checkpoint test/checkpoint
+    ENV "RCLPY_AGNOCAST_SUBSCRIBER=$<TARGET_FILE:rclpy_agnocast_shared_buffer_subscriber>"
+    APPEND_ENV "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/test"
+    TIMEOUT 240
+  )
+  set_tests_properties(test_cpu_checkpoint PROPERTIES
+    LABELS "pytest;system;requires_kernel_module;requires_heaphook")
 
   ament_add_gtest(test_publisher_observation test/publisher/test_observation.cpp)
   target_include_directories(test_publisher_observation PRIVATE src)

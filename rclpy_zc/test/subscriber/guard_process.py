@@ -14,7 +14,7 @@ from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
 
 from rclpy_agnocast import AgnocastRuntime
 
-from checks import check_held, inspect, receipt_settled
+from subscriber.checks import check_held, inspect, receipt_settled
 from system_runtime import emit
 
 
@@ -27,16 +27,18 @@ def wait_until(predicate):
 
 
 class Session:
-    """Own a real Node, instrumented public guards, and explicit executor spins."""
+    """Share public delivery commands, with optional G0 guard-specific observations."""
 
     def __init__(self, arguments):
         self.arguments = arguments
+        self.checkpoint = arguments.checkpoint
         rclpy.init(args=[])
         self.node = rclpy.create_node(f"guard_tld_{os.getpid()}")
         self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.node)
-        self.records = {}
-        self._instrument_guards()
+        if not self.checkpoint:
+            self.records = {}
+            self._instrument_guards()
         self.runtime = AgnocastRuntime(self.node)
         self.mode = "inspect"
         self.received = []
@@ -46,7 +48,8 @@ class Session:
         self.held = []
         self.held_sequence = None
         self.subscription = self.create(self.callback)
-        self.subscription_guard = self.subscription._guard
+        if not self.checkpoint:
+            self.subscription_guard = self.subscription._guard
         self.side = None
         self.timer_count = 0
         self.service_count = 0
@@ -112,27 +115,31 @@ class Session:
 
     def stats(self, name="STATS"):
         handle = self.subscription._handle
-        stats = handle.stats
+        stats = self.subscription.stats
         observation = handle._observation
-        record = self.records[self.subscription_guard]
         fields = {field: getattr(stats, field) for field in (
             "received_total", "delivered_total", "queued_leases", "outstanding_leases",
             "outstanding_payload_bytes", "dropped_outstanding", "dropped_oversize",
         )}
-        emit(name, **fields, received_refs=observation.received,
-             released_refs=observation.released, native_tid=observation.callback_tid,
-             notifier_tid=self.subscription._notifier.native_id,
-             notifier_alive=self.subscription._notifier.is_alive(),
-             caller_tid=threading.get_native_id(), triggers=len(record["triggers"]),
-             dispatches=len(record["dispatches"]),
-             trigger_tids=",".join(map(str, set(record["triggers"]))),
-             dispatch_tids=",".join(map(str, set(record["dispatches"]))),
-             callbacks=len(self.received), side_callbacks=len(self.side_received),
-             sequences=",".join(str(item["sequence"]) for item in self.received),
-             guards=len(list(self.node.guards)), registry=len(self.runtime._subscriptions),
-             timer_count=self.timer_count, service_count=self.service_count,
-             service_samples=",".join(map(str, self.service_samples)),
-             busy_count=len(self.busy))
+        fields.update(received_refs=observation.received, released_refs=observation.released,
+                      caller_tid=threading.get_native_id(), callbacks=len(self.received),
+                      sequences=",".join(str(item["sequence"]) for item in self.received))
+        if not self.checkpoint:
+            record = self.records[self.subscription_guard]
+            fields.update(
+                native_tid=observation.callback_tid,
+                notifier_tid=self.subscription._notifier.native_id,
+                notifier_alive=self.subscription._notifier.is_alive(),
+                triggers=len(record["triggers"]), dispatches=len(record["dispatches"]),
+                trigger_tids=",".join(map(str, set(record["triggers"]))),
+                dispatch_tids=",".join(map(str, set(record["dispatches"]))),
+                side_callbacks=len(self.side_received), guards=len(list(self.node.guards)),
+                registry=len(self.runtime._subscriptions), timer_count=self.timer_count,
+                service_count=self.service_count,
+                service_samples=",".join(map(str, self.service_samples)),
+                busy_count=len(self.busy),
+            )
+        emit(name, **fields)
 
     def spin(self, expected):
         deadline = time.monotonic() + 10
@@ -363,12 +370,16 @@ class Session:
 
     def dispatch(self, fields):
         command, *arguments = fields
+        if self.checkpoint and command not in (
+                "connections", "wait", "stats", "spin", "details", "mode", "release", "recreate"):
+            raise ValueError(f"unsupported checkpoint command: {command}")
         if command == "connections":
             count = self.subscription.publisher_count
             emit("CONNECTED", count=count, connected=count > 0)
         elif command == "wait":
             wait_until(lambda: receipt_settled(self.subscription._handle, int(arguments[0])))
-            wait_until(lambda: bool(self.records[self.subscription._guard]["triggers"]))
+            if not self.checkpoint:
+                wait_until(lambda: bool(self.records[self.subscription._guard]["triggers"]))
             self.stats()
         elif command == "stats":
             self.stats()
@@ -382,6 +393,8 @@ class Session:
         elif command == "details":
             emit("DETAILS", **self.received[-1])
         elif command == "mode":
+            if self.checkpoint and arguments[0] not in ("inspect", "hold-lease", "hold-view"):
+                raise ValueError(f"unsupported checkpoint mode: {arguments[0]}")
             self.mode = arguments[0]
             emit("MODE")
         elif command == "coexist":
@@ -401,12 +414,15 @@ class Session:
             self.stats("SIDE_SPUN")
         elif command == "recreate":
             previous = self.subscription
-            previous_guard = self.subscription_guard
+            if not self.checkpoint:
+                previous_guard = self.subscription_guard
             previous.close()
-            assert not previous._notifier.is_alive()
-            assert previous_guard not in list(self.node.guards)
+            if not self.checkpoint:
+                assert not previous._notifier.is_alive()
+                assert previous_guard not in list(self.node.guards)
             self.subscription = self.create(self.callback)
-            self.subscription_guard = self.subscription._guard
+            if not self.checkpoint:
+                self.subscription_guard = self.subscription._guard
             self.received.clear()
             self.stats("RECREATED")
         elif command == "stop":
@@ -437,9 +453,10 @@ class Session:
             self.side.close()
         self.subscription.close()
         self.runtime.close()
-        assert not list(self.node.guards)
-        assert not self.runtime._subscriptions
-        assert not self.subscription._notifier.is_alive()
+        if not self.checkpoint:
+            assert not list(self.node.guards)
+            assert not self.runtime._subscriptions
+            assert not self.subscription._notifier.is_alive()
         assert self.executor.shutdown(timeout_sec=5)
         self.node.destroy_node()
         rclpy.try_shutdown()
@@ -451,6 +468,8 @@ def main():
     parser.add_argument("--topic", required=True)
     parser.add_argument("--count", type=int, default=256)
     parser.add_argument("--limit", type=int, default=2 * 1024 * 1024)
+    parser.add_argument("--checkpoint", action="store_true",
+                        help="use delivery/ownership commands without G0 guard instrumentation")
     session = Session(parser.parse_args())
     try:
         session.run()
