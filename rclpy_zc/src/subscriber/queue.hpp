@@ -65,7 +65,7 @@ public:
   void fail(std::exception_ptr failure) noexcept;
   /** @brief Rethrow the first recorded failure, including after explicit stop or queue cleanup. */
   void rethrow_failure() const;
-  /** @brief Permanently stop admission/notifications; wait returns zero, storage stays releasable. */
+  /** @brief Permanently stop admission/notifications; wait returns zero, storage releasable. */
   void stop_admission() noexcept;
   /** @brief Release all queued storage outside the accounting lock. */
   void clear() noexcept;
