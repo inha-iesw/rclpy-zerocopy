@@ -120,8 +120,8 @@ def test_type_selection_rebuilds_manifest_without_source_writes_or_overlay_gener
     assert _snapshot(source) == authored
 
 
-def test_plugin_with_incompatible_stl_abi_is_rejected_before_registration(tmp_path):
-    """Import a debug-STL plugin safely and retain an empty runtime type registry."""
+def test_debug_stl_factory_is_rejected_by_loader_before_registration(tmp_path):
+    """Reject the debug-STL Agnocast symbol before PyInit without changing the registry."""
     source, build = tmp_path / 'source', tmp_path / 'build'
     _write_project(source, target='_bad', debug=True)
     _configure(source, build)
@@ -147,7 +147,9 @@ def test_plugin_with_incompatible_stl_abi_is_rejected_before_registration(tmp_pa
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
         except ImportError as error:
-            assert 'adapter ABI mismatch' in str(error), str(error)
+            detail = str(error)
+            assert 'undefined symbol: _ZN8agnocast12publish_core' in detail, detail
+            assert 'NSt7__debug13unordered_map' in detail, detail
         else:
             raise AssertionError('incompatible plugin imported successfully')
         assert_unregistered()

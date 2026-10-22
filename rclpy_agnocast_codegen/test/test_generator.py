@@ -144,7 +144,7 @@ def test_generation_is_deterministic_and_confined_to_output(shares, tmp_path):
     assert source_before == {path: path.read_bytes() for path in source_before}
     manifest = json.loads((first / 'manifest.json').read_text())
     assert manifest == {
-        'manifest_version': 1, 'adapter_abi': 1, 'build_abi': 'test-abi',
+        'manifest_version': 1, 'adapter_abi': 2, 'build_abi': 'test-abi',
         'provider': 'sample_provider', 'module': 'sample_provider._adapter',
         'library': 'lib/python/sample_provider/_adapter.so',
         'types': {name: describe_type(name, shares) for name in
@@ -152,6 +152,7 @@ def test_generation_is_deterministic_and_confined_to_output(shares, tmp_path):
     source = (first / 'provider.cpp').read_text()
     assert 'PYBIND11_MODULE(_adapter, module)' in source
     assert '#include "sample/msg/detail/tree__struct.hpp"' in source
+    assert '#include "sample/msg/detail/tree__traits.hpp"' in source
     assert 'sizeof(sample::msg::Tree)' in source
     assert 'alignof(sample::msg::Tree)' in source
     assert hashlib.sha256((first / 'manifest.json').read_bytes()).hexdigest() in source
@@ -195,3 +196,25 @@ def test_nested_fields_are_checked_without_separate_type_registration(shares, tm
     source = (tmp_path / 'out' / 'provider.cpp').read_text()
     assert 'decltype(std::declval<sample::msg::Leaf>().value), int32_t' in source
     assert source.count('decltype(std::declval<sample::msg::Leaf>().value)') == 1
+
+
+def test_generated_operations_cover_nested_fields_before_their_parent(shares, tmp_path):
+    """Generate executable members for the closure and a factory for declared roots only."""
+    write_idl(shares['sample'], 'Branch', 'sample::msg::Tree tree;',
+              '#include "sample/msg/Tree.idl"')
+    generate('sample_provider', 'sample_provider._adapter', ['sample/msg/Branch'], shares,
+             'test-abi', tmp_path / 'out', 'lib/python/sample_provider/_adapter.so')
+    source = (tmp_path / 'out' / 'provider.cpp').read_text()
+    assert 'scalar_ops<int32_t>()' in source
+    assert 'array_ops<std::array<int16_t, 3>>' in source
+    assert 'sequence_ops<rosidl_runtime_cpp::BoundedVector<uint8_t, 16,' in source
+    assert 'string_ops<std::basic_string<char,' in source
+    assert 'string_ops<std::basic_string<char16_t,' in source
+    assert 'static_cast<sample::msg::Tree *>(object)->children' in source
+    assert source.index('message_ops<sample::msg::Leaf>') < source.index(
+        'message_ops<sample::msg::Tree>')
+    assert source.index('message_ops<sample::msg::Tree>') < source.index(
+        'message_ops<sample::msg::Branch>')
+    assert '&create_endpoint<sample::msg::Branch>' in source
+    assert '&create_endpoint<sample::msg::Tree>' not in source
+    assert '&create_endpoint<sample::msg::Leaf>' not in source

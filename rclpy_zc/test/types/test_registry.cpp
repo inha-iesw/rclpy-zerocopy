@@ -18,6 +18,7 @@
 #include <string>
 
 #include "rclpy_agnocast/types/adapter.hpp"
+#include "rclpy_agnocast/types/field_ops.hpp"
 
 namespace
 {
@@ -27,13 +28,25 @@ using rclpy_agnocast::types::ProviderDescriptor;
 using rclpy_agnocast::types::register_provider;
 using rclpy_agnocast::types::registered_type;
 using rclpy_agnocast::types::runtime_abi_tag;
+using rclpy_agnocast::types::FieldOps;
+using rclpy_agnocast::types::message_ops;
+using rclpy_agnocast::types::Status;
+using rclpy_agnocast::types::NativeEndpoint;
+using rclpy_agnocast::types::error_status;
+using rclpy_agnocast::types::ErrorCode;
+using rclpy_agnocast::types::TypeOps;
+
+const FieldOps root_ops = message_ops<std::uint64_t[2]>(nullptr, 0);
+Status unused_factory(void *, const char *, std::size_t, NativeEndpoint *) noexcept
+{return error_status(ErrorCode::kUnsupported, "registry fixture has no endpoint");}
+const TypeOps operations{&root_ops, unused_factory};
 
 ProviderDescriptor provider(const std::string & suffix)
 {
   return {
     ADAPTER_ABI_VERSION, "provider_" + suffix, "adapter_" + suffix, compiled_abi_tag(),
     std::string(64, 'a'),
-    {{"fixture/msg/" + suffix, std::string(64, 'b'), "[]", 16, 8}}
+    {{"fixture/msg/" + suffix, std::string(64, 'b'), "[]", 16, 8, &operations}}
   };
 }
 
@@ -189,5 +202,28 @@ TEST(TypeRegistry, MissingTypeErrorIdentifiesTheTypeAndBuildTimeRemedy)
     EXPECT_NE(message.find("fixture/msg/NotGenerated"), std::string::npos);
     EXPECT_NE(message.find("build an adapter"), std::string::npos);
   }
+}
+
+TEST(TypeRegistry, MissingOperationsInLastTypeLeavesNoPartialRegistration)
+{
+  auto batch = provider("OperationsFirst");
+  auto last = provider("OperationsLast").types.front();
+  last.ops = nullptr;
+  batch.types.push_back(last);
+  EXPECT_THROW(register_provider(batch, batch.manifest_digest), std::invalid_argument);
+  EXPECT_THROW(registered_type("fixture/msg/OperationsFirst"), std::out_of_range);
+  batch.types.back().ops = &operations;
+  EXPECT_NO_THROW(register_provider(batch, batch.manifest_digest));
+  EXPECT_EQ(registered_type("fixture/msg/OperationsFirst").ops, &operations);
+}
+
+TEST(TypeRegistry, ExecutableOperationsCannotBeReplacedUnderIdenticalMetadata)
+{
+  auto batch = provider("OperationsReplace");
+  register_provider(batch, batch.manifest_digest);
+  const TypeOps replacement{&root_ops, unused_factory};
+  batch.types.front().ops = &replacement;
+  EXPECT_THROW(register_provider(batch, batch.manifest_digest), std::invalid_argument);
+  EXPECT_EQ(registered_type("fixture/msg/OperationsReplace").ops, &operations);
 }
 }  // namespace

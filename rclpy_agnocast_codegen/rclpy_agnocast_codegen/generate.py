@@ -7,13 +7,72 @@ import re
 
 from rosidl_cmake import convert_camel_case_to_lower_case_underscore
 from rosidl_generator_cpp import msg_type_to_cpp
+from rosidl_parser import definition as idl
 
 from .schema import _describe_type
 
 
 _IDENTIFIER = re.compile(r'[A-Za-z_][A-Za-z_0-9]*\Z')
 # Change deliberately when the generator supports a new descriptor contract.
-_SUPPORTED_ADAPTER_ABI = 1
+_SUPPORTED_ADAPTER_ABI = 2
+
+
+def _field_operations(messages):
+    """Emit static, typed accessors with child operations preceding their parents."""
+    lines = []
+    emitted = {}
+
+    def field(type_, symbol):
+        cpp_type = msg_type_to_cpp(type_)
+        if isinstance(type_, idl.BasicType):
+            return f'scalar_ops<{cpp_type}>()'
+        if isinstance(type_, idl.NamespacedType):
+            return message('/'.join(type_.namespaced_name()))
+        if isinstance(type_, (idl.Array, idl.AbstractSequence)):
+            element = field(type_.value_type, symbol + '_element')
+            if isinstance(type_, idl.Array):
+                expression = f'array_ops<{cpp_type}>({element})'
+            else:
+                bound = getattr(type_, 'maximum_size', None)
+                argument = '' if bound is None else f', {bound}'
+                expression = f'sequence_ops<{cpp_type}>({element}{argument})'
+        elif isinstance(type_, (idl.AbstractString, idl.AbstractWString)):
+            bound = getattr(type_, 'maximum_size', None)
+            argument = '' if bound is None else str(bound)
+            expression = f'string_ops<{cpp_type}>({argument})'
+        else:
+            raise ValueError(f'Unsupported ROSIDL field type: {type(type_).__name__}')
+        lines.append(f'const FieldOps {symbol} = {expression};')
+        return '&' + symbol
+
+    def message(name):
+        if name in emitted:
+            return emitted[name]
+        # Numeric symbols avoid collisions between valid package/type identifiers.
+        symbol = f'message_{len(emitted)}'
+        emitted[name] = '&' + symbol
+        cpp_type = name.replace('/', '::')
+        members = []
+        for index, member in enumerate(messages[name].structure.members):
+            operations = field(member.type, f'{symbol}_field_{index}')
+            members.append(
+                '  {' + json.dumps(member.name) + ', ' + operations + ',\n' +
+                '    [](void * object) noexcept -> void * {\n' +
+                f'      return &static_cast<{cpp_type} *>(object)->{member.name};\n' +
+                '    }}')
+        if members:
+            lines.extend([
+                f'const FieldMember {symbol}_members[] = {{',
+                ',\n'.join(members), '};'])
+            argument = f'{symbol}_members, {len(members)}'
+        else:
+            argument = 'nullptr, 0'
+        lines.append(f'const FieldOps {symbol} = message_ops<{cpp_type}>({argument});')
+        return '&' + symbol
+
+    for name in sorted(messages):
+        message(name)
+    return lines, emitted
 
 
 def generate(provider, module, ros_types, package_shares, build_abi, output_dir, library_relative):
@@ -52,6 +111,8 @@ def generate(provider, module, ros_types, package_shares, build_abi, output_dir,
         '#include <type_traits>',
         '#include <utility>',
         '#include "rclpy_agnocast/types/adapter.hpp"',
+        '#include "rclpy_agnocast/types/field_ops.hpp"',
+        '#include "rclpy_agnocast/types/native_factory.hpp"',
         f'static_assert(rclpy_agnocast::types::ADAPTER_ABI_VERSION == {_SUPPORTED_ADAPTER_ABI},',
         '  "generator does not support this adapter ABI");',
     ]
@@ -68,17 +129,26 @@ def generate(provider, module, ros_types, package_shares, build_abi, output_dir,
         package, _, message = name.split('/')
         stem = convert_camel_case_to_lower_case_underscore(message)
         source.append(f'#include "{package}/msg/detail/{stem}__struct.hpp"')
-    for name, schema in types.items():
+        source.append(f'#include "{package}/msg/detail/{stem}__traits.hpp"')
+    operations, roots = _field_operations(messages)
+    for index, (name, schema) in enumerate(types.items()):
         cpp_type = name.replace('/', '::')
+        operations.append(
+            f'const TypeOps type_{index}' + '{' + roots[name] +
+            f', &create_endpoint<{cpp_type}>' + '};')
         fields_json = json.dumps(schema['fields'], sort_keys=True, separators=(',', ':'))
         descriptors.append(
             '      TypeDescriptor{' + json.dumps(name) + ', ' +
             json.dumps(schema['schema_digest']) + ', ' + json.dumps(fields_json) +
-            f', sizeof({cpp_type}), alignof({cpp_type})' + '}')
+            f', sizeof({cpp_type}), alignof({cpp_type}), &type_{index}' + '}')
     source.extend([
         '',
         'using ContainerAllocator = std::allocator<void>;',
         '\n'.join(assertions),
+        'namespace {',
+        'using namespace rclpy_agnocast::types;',
+        '\n'.join(operations),
+        '}  // namespace',
         '',
         f'PYBIND11_MODULE({module.split(".")[-1]}, module)',
         '{',

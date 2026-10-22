@@ -20,7 +20,7 @@ _rclpy_agnocast_headers_digest(types_headers_digest
   "${CMAKE_CURRENT_SOURCE_DIR}/include/rclpy_agnocast/types")
 _rclpy_agnocast_selected_headers_digest(agnocast_headers_digest)
 
-add_library(rclpy_agnocast_types SHARED src/types/registry.cpp)
+add_library(rclpy_agnocast_types SHARED src/types/registry.cpp src/types/operations.cpp)
 target_compile_features(rclpy_agnocast_types PUBLIC cxx_std_17)
 target_include_directories(rclpy_agnocast_types PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -31,7 +31,7 @@ target_compile_definitions(rclpy_agnocast_types PUBLIC
   RCLPY_AGNOCAST_TYPES_HEADERS_SHA256="${types_headers_digest}"
   RCLPY_AGNOCAST_RUNTIME_AGNOCAST_HEADERS_SHA256="${agnocast_headers_digest}"
 )
-target_link_libraries(rclpy_agnocast_types PRIVATE Threads::Threads)
+target_link_libraries(rclpy_agnocast_types PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 install(TARGETS rclpy_agnocast_types EXPORT rclpy_agnocast_types_targets
   LIBRARY DESTINATION lib
 )
@@ -100,6 +100,17 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_type_registry test/types/test_registry.cpp)
   target_link_libraries(test_type_registry rclpy_agnocast_types)
+  ament_add_gtest(test_field_ops test/types/test_field_ops.cpp)
+  target_link_libraries(test_field_ops rclpy_agnocast_types)
+  add_library(test_type_provider MODULE test/types/provider_library.cpp)
+  target_link_libraries(test_type_provider PRIVATE rclpy_agnocast_types)
+  set_target_properties(test_type_provider PROPERTIES
+    CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN YES)
+  ament_add_gtest(test_provider_lifetime test/types/test_provider_lifetime.cpp)
+  target_link_libraries(test_provider_lifetime rclpy_agnocast_types ${CMAKE_DL_LIBS})
+  target_compile_definitions(test_provider_lifetime PRIVATE
+    TEST_PROVIDER_LIBRARY="$<TARGET_FILE:test_type_provider>")
+  add_dependencies(test_provider_lifetime test_type_provider)
   ament_add_pytest_test(test_type_discovery test/types/test_discovery.py TIMEOUT 60)
   ament_add_pytest_test(test_type_native_abi test/types/test_native_abi.py TIMEOUT 60)
 

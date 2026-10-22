@@ -16,6 +16,7 @@ function(rclpy_agnocast_generate_adapters target)
   find_package(rclpy_agnocast REQUIRED)
   find_package(agnocastlib REQUIRED)
   _rclpy_agnocast_selected_headers_digest(agnocast_headers_digest)
+  find_package(rclcpp REQUIRED)
   find_package(ament_cmake_python REQUIRED)
   find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
   find_package(pybind11_vendor REQUIRED)
@@ -81,7 +82,8 @@ function(rclpy_agnocast_generate_adapters target)
       "${generator_dir}/__main__.py" "${output}/arguments.txt"
     VERBATIM
   )
-  target_link_libraries(${target} PRIVATE rclpy_agnocast::rclpy_agnocast_types)
+  target_link_libraries(${target} PRIVATE
+    rclpy_agnocast::rclpy_agnocast_types agnocastlib::agnocast rclcpp::rclcpp)
   foreach(package IN LISTS packages)
     target_link_libraries(${target} PRIVATE ${${package}_TARGETS__rosidl_generator_cpp})
   endforeach()

@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "rclpy_agnocast/types/operations.hpp"
 
 /**
  * @brief Expose the registry ABI tag without passing standard library objects across DSOs.
@@ -44,8 +45,14 @@ namespace rclpy_agnocast
 namespace types
 {
 
-/** @brief Version of the shared descriptor and registration contract. */
-constexpr std::uint32_t ADAPTER_ABI_VERSION = 1;
+/**
+ * @brief Version of the shared descriptor and registration contract.
+ *
+ * Bump for incompatible declarations, callback signatures or operation-table layout in
+ * published types headers, and for incompatible provider-instantiated template semantics.
+ * Header content digests additionally reject stale providers after compatible fixes without a bump.
+ */
+constexpr std::uint32_t ADAPTER_ABI_VERSION = 2;
 
 /**
  * @brief Compute the ABI fingerprint of the including translation unit.
@@ -122,8 +129,8 @@ std::string runtime_abi_tag();
 /**
  * @brief Generated schema metadata for one native ROS message type.
  *
- * Strings and metadata are copied by registration; no plugin-owned pointers survive.
- * fields_json is the generator's canonical JSON field list, not executable operations.
+ * Strings and metadata are copied by registration. Executable operations and their provider
+ * are immutable and pinned for process lifetime. fields_json is canonical field metadata.
  */
 struct TypeDescriptor
 {
@@ -132,6 +139,7 @@ struct TypeDescriptor
   std::string fields_json;  ///< Canonical JSON field metadata from the build generator.
   std::size_t native_size;  ///< sizeof of the generated native C++ message.
   std::size_t native_alignment;  ///< alignof of the generated native C++ message.
+  const TypeOps * ops{nullptr};  ///< Executable native operations, committed with the metadata.
 };
 
 /**

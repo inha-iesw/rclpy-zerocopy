@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <dlfcn.h>
+#include <link.h>
+
 #include <algorithm>
 #include <mutex>
 #include <stdexcept>
@@ -97,10 +100,67 @@ bool digest(const std::string & value)
 bool same_type(const TypeDescriptor & left, const TypeDescriptor & right)
 {
   return std::tie(
-    left.ros_type, left.schema_digest, left.fields_json, left.native_size, left.native_alignment) ==
+    left.ros_type, left.schema_digest, left.fields_json, left.native_size, left.native_alignment,
+    left.ops) ==
          std::tie(
     right.ros_type, right.schema_digest, right.fields_json,
-    right.native_size, right.native_alignment);
+    right.native_size, right.native_alignment, right.ops);
+}
+
+void validate_operations(const FieldOps * ops, std::unordered_set<const FieldOps *> & seen)
+{
+  if (!ops || !ops->dynamic_bytes) {throw std::invalid_argument("missing field operations");}
+  if (!seen.insert(ops).second) {return;}
+  if (ops->kind == FieldKind::kScalar) {
+    if (!ops->read || !ops->write || !ops->item_size) {
+      throw std::invalid_argument("invalid scalar operations");
+    }
+  } else if (ops->kind == FieldKind::kMessage) {
+    if (!ops->child || (ops->member_count && !ops->members)) {
+      throw std::invalid_argument("invalid message operations");
+    }
+    for (std::size_t i = 0; i < ops->member_count; ++i) {
+      if (!ops->members[i].name || !ops->members[i].get) {
+        throw std::invalid_argument("invalid member operations");
+      }
+      validate_operations(ops->members[i].ops, seen);
+    }
+  } else {
+    if (!ops->size || !ops->child || !ops->buffer ||
+      (ops->kind != FieldKind::kArray && (!ops->resize || !ops->minimum_resize_bytes)))
+    {
+      throw std::invalid_argument("invalid container operations");
+    }
+    validate_operations(ops->element, seen);
+  }
+}
+
+void pin_provider(const TypeOps * ops)
+{
+  Dl_info info{};
+  if (!dladdr(reinterpret_cast<const void *>(ops->create), &info)) {
+    throw std::invalid_argument("cannot identify provider callback library");
+  }
+  struct MainImage {void * base; bool found;};
+  MainImage main{info.dli_fbase, false};
+  dl_iterate_phdr(
+    [](dl_phdr_info * image, std::size_t, void * raw) {
+      auto & result = *static_cast<MainImage *>(raw);
+      if (image->dlpi_name[0] == '\0' &&
+      reinterpret_cast<void *>(image->dlpi_addr) == result.base)
+      {
+        result.found = true;
+        return 1;
+      }
+      return 0;
+    }, &main);
+  if (main.found) {
+    return;                 // Native test/embedded providers in the main executable cannot unload.
+  }
+  void * handle = dlopen(info.dli_fname, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
+  if (!handle) {throw std::invalid_argument("cannot pin provider callback library");}
+  // NODELETE preserves code and static operation tables after Python drops its module reference.
+  dlclose(handle);
 }
 
 bool same_provider(const ProviderDescriptor & left, const ProviderDescriptor & right)
@@ -143,6 +203,14 @@ void validate(const ProviderDescriptor & descriptor, const std::string & expecte
     if (!names.insert(type.ros_type).second) {
       throw std::invalid_argument("duplicate adapter type in provider: " + type.ros_type);
     }
+    if (!type.ops || !type.ops->create || !type.ops->root ||
+      type.ops->root->kind != FieldKind::kMessage ||
+      type.ops->root->item_size != type.native_size)
+    {
+      throw std::invalid_argument("invalid executable type operations: " + type.ros_type);
+    }
+    std::unordered_set<const FieldOps *> seen;
+    validate_operations(type.ops->root, seen);
   }
 }
 
@@ -182,6 +250,9 @@ void register_provider(
   providers.emplace(descriptor.provider, descriptor);
   for (const auto & type : descriptor.types) {
     types.emplace(type.ros_type, type);
+  }
+  for (const auto & type : descriptor.types) {
+    pin_provider(type.ops);
   }
   state.providers.swap(providers);
   state.types.swap(types);

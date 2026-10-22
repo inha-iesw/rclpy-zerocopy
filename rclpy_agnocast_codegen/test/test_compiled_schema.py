@@ -1,47 +1,30 @@
-"""Compile generated field assertions; registration uses a test-only ABI stub."""
+"""Compile generated field operations and assertions against the installed adapter ABI."""
 
-import os
 from pathlib import Path
-import shlex
 import subprocess
-import sysconfig
+import sys
 
-import pybind11
+from ament_index_python.packages import get_package_prefix
 import pytest
 
 from rclpy_agnocast_codegen.generate import generate
 
 
-_ADAPTER_HEADER = '''
-#pragma once
-#include <cstddef>
-#include <cstdint>
-#include <string>
-#include <vector>
-
-extern "C" std::uint32_t rclpy_agnocast_adapter_abi_version();
-extern "C" const char * rclpy_agnocast_adapter_build_abi();
-
-namespace rclpy_agnocast { namespace types {
-constexpr std::uint32_t ADAPTER_ABI_VERSION = 1;
-inline std::string compiled_abi_tag() {return "test-abi";}
-struct TypeDescriptor {
-  std::string name;
-  std::string schema_digest;
-  std::string fields;
-  std::size_t size;
-  std::size_t alignment;
-};
-struct ProviderDescriptor {
-  std::uint32_t version;
-  std::string provider;
-  std::string module;
-  std::string build_abi;
-  std::string manifest_digest;
-  std::vector<TypeDescriptor> types;
-};
-void register_provider(const ProviderDescriptor &, const std::string &);
-}}
+_CMAKE_PROJECT = '''
+cmake_minimum_required(VERSION 3.14)
+project(compiled_schema LANGUAGES CXX)
+find_package(rclpy_agnocast REQUIRED)
+find_package(agnocastlib REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(pybind11_vendor REQUIRED)
+find_package(pybind11 CONFIG REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
+add_library(provider OBJECT generated/provider.cpp)
+target_include_directories(provider BEFORE PRIVATE include)
+target_link_libraries(provider PRIVATE
+  rclpy_agnocast::rclpy_agnocast_types agnocastlib::agnocast rclcpp::rclcpp
+  pybind11::headers Python3::Module)
+target_compile_options(provider PRIVATE -fno-diagnostics-color)
 '''
 
 
@@ -49,12 +32,8 @@ _MESSAGE_HEADER = '''
 #pragma once
 #include <cstdint>
 #include <memory>
-#include <vector>
+#include "rosidl_runtime_cpp/bounded_vector.hpp"
 
-namespace rosidl_runtime_cpp {
-template<class T, std::size_t Bound, class Allocator>
-struct BoundedVector : std::vector<T, Allocator> {};
-}
 namespace sample { namespace msg {
 struct Sample {
   SCALAR_MEMBER
@@ -65,37 +44,50 @@ struct Sample {
 '''
 
 
+_MESSAGE_TRAITS = '''
+#pragma once
+#include "sample/msg/detail/sample__struct.hpp"
+#include "rosidl_runtime_cpp/traits.hpp"
+namespace rosidl_generator_traits {
+template<> struct is_message<sample::msg::Sample> : std::true_type {};
+template<> inline const char * name<sample::msg::Sample>() {return "sample/msg/Sample";}
+}
+'''
+
+
 @pytest.fixture
 def generated_source(tmp_path):
-    """Generate from IDL and provide only enough ABI declarations for syntax checking."""
+    """Compile a synthetic message against the real ABI, field helpers and factory."""
     share = tmp_path / 'share' / 'sample'
     (share / 'msg').mkdir(parents=True)
     (share / 'msg' / 'Sample.idl').write_text(
         'module sample { module msg { struct Sample {\n'
         'int32 value; sequence<uint8, 4> values;\n}; }; };\n')
     headers = tmp_path / 'include'
-    adapter_header = headers / 'rclpy_agnocast' / 'types' / 'adapter.hpp'
-    adapter_header.parent.mkdir(parents=True)
-    adapter_header.write_text(_ADAPTER_HEADER)
     message_header = headers / 'sample' / 'msg' / 'detail' / 'sample__struct.hpp'
     message_header.parent.mkdir(parents=True)
+    (message_header.parent / 'sample__traits.hpp').write_text(_MESSAGE_TRAITS)
     output = tmp_path / 'generated'
     generate('sample_provider', 'sample_provider._adapter', ['sample/msg/Sample'],
              {'sample': share}, 'test-abi', output, 'lib/python/sample_provider/_adapter.so')
+    (tmp_path / 'CMakeLists.txt').write_text(_CMAKE_PROJECT)
     return output / 'provider.cpp', headers, message_header
 
 
 def _compile(generated_source, scalar_member, sequence_bound):
-    source, headers, message_header = generated_source
+    source, _, message_header = generated_source
     message_header.write_text(
         _MESSAGE_HEADER.replace('SCALAR_MEMBER', scalar_member)
         .replace('SEQUENCE_BOUND', str(sequence_bound)))
-    compiler = shlex.split(os.environ.get('CXX') or sysconfig.get_config_var('CXX') or 'c++')
-    command = compiler + [
-        '-std=c++17', '-fsyntax-only', '-fno-diagnostics-color',
-        '-I' + str(headers), '-I' + pybind11.get_include(),
-        '-I' + str(Path(sysconfig.get_path('include'))), str(source)]
-    return subprocess.run(command, text=True, capture_output=True, timeout=30)
+    root = source.parent.parent
+    configured = subprocess.run(
+        ['cmake', '-S', str(root), '-B', str(root / 'build'),
+         '-DPython3_EXECUTABLE=' + sys.executable],
+        text=True, capture_output=True, timeout=30)
+    assert configured.returncode == 0, configured.stdout + configured.stderr
+    return subprocess.run(
+        ['cmake', '--build', str(root / 'build'), '-j1'],
+        text=True, capture_output=True, timeout=45)
 
 
 def test_matching_cpp_members_compile(generated_source):
@@ -108,8 +100,13 @@ def test_generator_rejects_unsupported_adapter_header_version(generated_source):
     """Do not label old generator output as supporting a new descriptor contract."""
     _, headers, _ = generated_source
     header = headers / 'rclpy_agnocast' / 'types' / 'adapter.hpp'
-    header.write_text(header.read_text().replace(
-        'ADAPTER_ABI_VERSION = 1', 'ADAPTER_ABI_VERSION = 2'))
+    header.parent.mkdir(parents=True)
+    installed = (Path(get_package_prefix('rclpy_agnocast')) /
+                 'include' / header.relative_to(headers))
+    contents = installed.read_text()
+    changed = contents.replace('ADAPTER_ABI_VERSION = 2', 'ADAPTER_ABI_VERSION = 3')
+    assert changed != contents, 'The installed adapter ABI fixture is stale'
+    header.write_text(changed)
     result = _compile(generated_source, 'std::int32_t value;', 4)
     assert result.returncode != 0, 'Unsupported adapter ABI was accepted'
     assert 'generator does not support this adapter ABI' in result.stderr, result.stderr
