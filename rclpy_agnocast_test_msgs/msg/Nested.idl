@@ -1,0 +1,13 @@
+#include "rclpy_agnocast_test_msgs/msg/Scalars.idl"
+#include "rclpy_agnocast_test_msgs/msg/Containers.idl"
+module rclpy_agnocast_test_msgs {
+  module msg {
+    struct Nested {
+      rclpy_agnocast_test_msgs::msg::Scalars child;
+      rclpy_agnocast_test_msgs::msg::Containers containers;
+      rclpy_agnocast_test_msgs::msg::Scalars fixed_children[2];
+      sequence<rclpy_agnocast_test_msgs::msg::Scalars> children;
+      sequence<rclpy_agnocast_test_msgs::msg::Containers, 4> bounded_children;
+    };
+  };
+};

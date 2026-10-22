@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>rclpy_agnocast_test_adapters</name>
+  <version>0.1.0</version>
+  <description>Generated adapters for ROSIDL type fixtures.</description>
+  <maintainer email="maintainers@example.com">rclpy zerocopy maintainers</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
+  <buildtool_depend>rclpy_agnocast_codegen</buildtool_depend>
+  <build_depend>pybind11_vendor</build_depend>
+  <build_depend>python3-dev</build_depend>
+  <depend>rclpy_agnocast</depend>
+  <depend>rclpy_agnocast_test_msgs</depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>rclpy_agnocast_adapters</test_depend>
+  <test_depend>sensor_msgs</test_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

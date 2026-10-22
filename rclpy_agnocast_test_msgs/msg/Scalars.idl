@@ -1,0 +1,19 @@
+module rclpy_agnocast_test_msgs {
+  module msg {
+    struct Scalars {
+      boolean flag;
+      octet byte_value;
+      char character;
+      int8 signed8;
+      uint8 unsigned8;
+      int16 signed16;
+      uint16 unsigned16;
+      int32 signed32;
+      uint32 unsigned32;
+      int64 signed64;
+      uint64 unsigned64;
+      float real32;
+      double real64;
+    };
+  };
+};

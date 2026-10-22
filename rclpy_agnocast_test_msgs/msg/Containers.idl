@@ -1,0 +1,20 @@
+module rclpy_agnocast_test_msgs {
+  module msg {
+    struct Containers {
+      double fixed[4];
+      boolean fixed_flags[4];
+      sequence<float, 8> bounded;
+      sequence<uint8> values;
+      sequence<boolean, 8> bounded_flags;
+      sequence<boolean> flags;
+      string text;
+      string<16> bounded_text;
+      wstring wide_text;
+      wstring<16> bounded_wide_text;
+      sequence<string> texts;
+      sequence<string<16>, 4> bounded_texts;
+      sequence<wstring> wide_texts;
+      sequence<wstring<16>, 4> bounded_wide_texts;
+    };
+  };
+};
