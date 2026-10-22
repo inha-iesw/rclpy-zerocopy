@@ -53,8 +53,12 @@ constexpr std::uint32_t ADAPTER_ABI_VERSION = 1;
  * Internal linkage prevents symbol interposition from replacing a plugin's tag with
  * the runtime's tag. The exported CMake target supplies the runtime build's ROS
  * dependency identity; it does not independently identify the caller's ROS headers.
+ * The types digest identifies the runtime's published headers. Generated providers and their
+ * probes independently hash headers exported by their selected agnocastlib target; ordinary
+ * registry consumers inherit the runtime's Agnocast identity. Rebuild the runtime whenever its
+ * published headers change, including symlink installs, before rebuilding companion providers.
  *
- * @return Compiler, standard library, language, architecture, and ROS build identity.
+ * @return Compiler, standard library, architecture, ROS and provider header build identity.
  */
 static inline std::string compiled_abi_tag()
 {
@@ -91,6 +95,19 @@ static inline std::string compiled_abi_tag()
   tag += ";ros=" RCLPY_AGNOCAST_ROS_ABI;
 #else
   tag += ";ros=unspecified";
+#endif
+  // The selected macro is separate so a provider never races duplicate inherited -D values.
+#ifdef RCLPY_AGNOCAST_TYPES_HEADERS_SHA256
+  tag += ";types=" RCLPY_AGNOCAST_TYPES_HEADERS_SHA256;
+#else
+  tag += ";types=unspecified";
+#endif
+#ifdef RCLPY_AGNOCAST_SELECTED_AGNOCAST_HEADERS_SHA256
+  tag += ";agnocast=" RCLPY_AGNOCAST_SELECTED_AGNOCAST_HEADERS_SHA256;
+#elif defined(RCLPY_AGNOCAST_RUNTIME_AGNOCAST_HEADERS_SHA256)
+  tag += ";agnocast=" RCLPY_AGNOCAST_RUNTIME_AGNOCAST_HEADERS_SHA256;
+#else
+  tag += ";agnocast=unspecified";
 #endif
   return tag;
 }

@@ -14,6 +14,8 @@ function(rclpy_agnocast_generate_adapters target)
   endif()
   set_property(GLOBAL PROPERTY "_RCLPY_AGNOCAST_PROVIDER_${PROJECT_NAME}" "${target}")
   find_package(rclpy_agnocast REQUIRED)
+  find_package(agnocastlib REQUIRED)
+  _rclpy_agnocast_selected_headers_digest(agnocast_headers_digest)
   find_package(ament_cmake_python REQUIRED)
   find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
   find_package(pybind11_vendor REQUIRED)
@@ -53,12 +55,16 @@ function(rclpy_agnocast_generate_adapters target)
   set(resource_dir "${rclpy_agnocast_codegen_DIR}/../resource")
   add_executable(${target}_abi_probe "${resource_dir}/abi_probe.cpp")
   target_link_libraries(${target}_abi_probe PRIVATE rclpy_agnocast::rclpy_agnocast_types)
+  target_compile_definitions(${target}_abi_probe PRIVATE
+    RCLPY_AGNOCAST_SELECTED_AGNOCAST_HEADERS_SHA256="${agnocast_headers_digest}")
   # This baseline tag is checked before import. Module-specific settings are
   # checked by the extension's C handshake before any C++ registration call.
   set(generator_dir "${rclpy_agnocast_codegen_DIR}/../generator")
   file(GLOB generator_sources "${generator_dir}/rclpy_agnocast_codegen/*.py")
   ament_get_python_install_dir(python_install_dir)
   pybind11_add_module(${target} MODULE "${output}/provider.cpp")
+  target_compile_definitions(${target} PRIVATE
+    RCLPY_AGNOCAST_SELECTED_AGNOCAST_HEADERS_SHA256="${agnocast_headers_digest}")
   get_target_property(module_suffix ${target} SUFFIX)
   set(library_relative "${python_install_dir}/${PROJECT_NAME}/${target}${module_suffix}")
   # Makefiles do not rebuild outputs when only the recipe's arguments change.

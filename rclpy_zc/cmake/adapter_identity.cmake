@@ -1,0 +1,45 @@
+include_guard(GLOBAL)
+
+# Hash the installed header contract independently of prefix, timestamps and symlink targets.
+# GLOB tracks additions/removals; CMAKE_CONFIGURE_DEPENDS also tracks existing file contents.
+function(_rclpy_agnocast_headers_digest output root)
+  file(GLOB_RECURSE headers CONFIGURE_DEPENDS LIST_DIRECTORIES FALSE
+    RELATIVE "${root}" "${root}/*.h" "${root}/*.hpp")
+  if(NOT headers)
+    message(FATAL_ERROR "Adapter identity requires headers under ${root}")
+  endif()
+  list(SORT headers)
+  set(identity)
+  foreach(header IN LISTS headers)
+    file(SHA256 "${root}/${header}" digest)
+    string(APPEND identity "${header}:${digest}\n")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${root}/${header}")
+  endforeach()
+  string(SHA256 digest "${identity}")
+  set(${output} "${digest}" PARENT_SCOPE)
+endfunction()
+
+# Resolve the headers exported by this find_package(agnocastlib), rather than inheriting
+# the runtime's dependency identity. Ambiguous roots cannot describe one compiled contract.
+function(_rclpy_agnocast_selected_headers_digest output)
+  if(NOT TARGET agnocastlib::agnocast)
+    message(FATAL_ERROR "Adapter identity requires the selected agnocastlib::agnocast target")
+  endif()
+  get_target_property(includes agnocastlib::agnocast INTERFACE_INCLUDE_DIRECTORIES)
+  set(roots)
+  foreach(directory IN LISTS includes)
+    if(EXISTS "${directory}/agnocast/node/agnocast_node.hpp" AND
+       EXISTS "${directory}/agnocast/agnocast_publisher.hpp")
+      get_filename_component(root "${directory}/agnocast" REALPATH)
+      list(APPEND roots "${root}")
+    endif()
+  endforeach()
+  list(REMOVE_DUPLICATES roots)
+  list(LENGTH roots count)
+  if(NOT count EQUAL 1)
+    message(FATAL_ERROR "Adapter identity requires exactly one selected Agnocast header root")
+  endif()
+  list(GET roots 0 root)
+  _rclpy_agnocast_headers_digest(digest "${root}")
+  set(${output} "${digest}" PARENT_SCOPE)
+endfunction()

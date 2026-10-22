@@ -15,6 +15,11 @@ find_package(rclcpp REQUIRED)
 find_package(rclpy_agnocast_msgs REQUIRED)
 find_package(Threads REQUIRED)
 
+include(cmake/adapter_identity.cmake)
+_rclpy_agnocast_headers_digest(types_headers_digest
+  "${CMAKE_CURRENT_SOURCE_DIR}/include/rclpy_agnocast/types")
+_rclpy_agnocast_selected_headers_digest(agnocast_headers_digest)
+
 add_library(rclpy_agnocast_types SHARED src/types/registry.cpp)
 target_compile_features(rclpy_agnocast_types PUBLIC cxx_std_17)
 target_include_directories(rclpy_agnocast_types PUBLIC
@@ -23,6 +28,8 @@ target_include_directories(rclpy_agnocast_types PUBLIC
 )
 target_compile_definitions(rclpy_agnocast_types PUBLIC
   RCLPY_AGNOCAST_ROS_ABI="${rclcpp_VERSION}:$ENV{ROS_DISTRO}"
+  RCLPY_AGNOCAST_TYPES_HEADERS_SHA256="${types_headers_digest}"
+  RCLPY_AGNOCAST_RUNTIME_AGNOCAST_HEADERS_SHA256="${agnocast_headers_digest}"
 )
 target_link_libraries(rclpy_agnocast_types PRIVATE Threads::Threads)
 install(TARGETS rclpy_agnocast_types EXPORT rclpy_agnocast_types_targets
@@ -210,4 +217,4 @@ install(DIRECTORY include/rclpy_agnocast/types/
   DESTINATION include/rclpy_agnocast/types
 )
 
-ament_package()
+ament_package(CONFIG_EXTRAS "cmake/adapter_identity.cmake")

@@ -3,11 +3,14 @@
 import hashlib
 import json
 import os
+from pathlib import Path
+import shutil
 import subprocess
 import sys
 import textwrap
 
 import pytest
+from ament_index_python.packages import get_package_prefix, get_package_share_directory
 
 
 _PROVIDER = 'build_contract_provider'
@@ -49,10 +52,12 @@ def _write_project(source, *, types=('std_msgs/msg/Int32',), target='_types', de
         ''') + debug_definition + 'ament_package()\n', encoding='utf-8')
 
 
-def _configure(source, build, *, env=None):
+def _configure(source, build, *, env=None, agnocast_prefix=None):
     return _run([
         'cmake', '-S', source, '-B', build, '-G', 'Unix Makefiles',
-        f'-DPython3_EXECUTABLE={sys.executable}', '-DCMAKE_BUILD_TYPE=Debug'], env=env)
+        f'-DPython3_EXECUTABLE={sys.executable}', '-DCMAKE_BUILD_TYPE=Debug',
+        *([f'-Dagnocastlib_DIR={agnocast_prefix}/share/agnocastlib/cmake']
+          if agnocast_prefix else [])], env=env)
 
 
 def _build(build, *, env=None):
@@ -69,6 +74,13 @@ def _module_path(build, target):
     libraries = list(build.glob(f'{target}*.so'))
     assert len(libraries) == 1, libraries
     return libraries[0]
+
+
+def _header_digest(root):
+    identity = ''.join(
+        f'{path.relative_to(root).as_posix()}:{hashlib.sha256(path.read_bytes()).hexdigest()}\n'
+        for path in sorted(root.rglob('*')) if path.suffix in ('.h', '.hpp'))
+    return hashlib.sha256(identity.encode()).hexdigest()
 
 
 def test_type_selection_rebuilds_manifest_without_source_writes_or_overlay_generator(tmp_path):
@@ -143,6 +155,209 @@ def test_plugin_with_incompatible_stl_abi_is_rejected_before_registration(tmp_pa
         ''')
     output = _run([sys.executable, '-c', probe, _module_path(build, '_bad')], timeout=15)
     assert 'ABI_REJECTED_REGISTRY_UNCHANGED' in output
+
+
+@pytest.mark.parametrize('mismatch', [None, 'ros', 'types', 'agnocast'])
+def test_generated_module_checks_own_abi_tag_after_successful_dlopen(tmp_path, mismatch):
+    """Check link-compatible module-specific ROS, types and Agnocast header identities."""
+    source, build = tmp_path / 'source', tmp_path / 'build'
+    _write_project(source, target='_handshake')
+    header = source / 'module_abi.hpp'
+    macros = {
+        'ros': 'RCLPY_AGNOCAST_ROS_ABI',
+        'types': 'RCLPY_AGNOCAST_TYPES_HEADERS_SHA256',
+        'agnocast': 'RCLPY_AGNOCAST_SELECTED_AGNOCAST_HEADERS_SHA256',
+    }
+    header.write_text(
+        f'#undef {macros[mismatch]}\n'
+        f'#define {macros[mismatch]} "incompatible-test-identity"\n'
+        if mismatch else '#pragma once\n', encoding='utf-8')
+    cmake = source / 'CMakeLists.txt'
+    cmake.write_text(cmake.read_text().replace(
+        'ament_package()',
+        'target_compile_options(_handshake PRIVATE '
+        '-include "${CMAKE_CURRENT_SOURCE_DIR}/module_abi.hpp")\nament_package()'))
+    _configure(source, build)
+    _build(build)
+    manifest = build / '_handshake' / 'manifest.json'
+    probe = textwrap.dedent('''\
+        import ctypes
+        import hashlib
+        import importlib.util
+        import json
+        from pathlib import Path
+        import sys
+        from rclpy_agnocast import _native
+
+        def assert_unregistered():
+            try:
+                _native._registered_type('std_msgs/msg/Int32')
+            except IndexError:
+                return
+            raise AssertionError('plugin registered before the handshake completed')
+
+        manifest_bytes = Path(sys.argv[2]).read_bytes()
+        assert json.loads(manifest_bytes)['build_abi'] == _native._adapter_abi()['build']
+        assert_unregistered()
+        loaded = ctypes.CDLL(sys.argv[1])
+        print('DLOPEN_SUCCEEDED')
+        spec = importlib.util.spec_from_file_location(
+            'build_contract_provider._handshake', sys.argv[1])
+        if sys.argv[3] == 'mismatch':
+            try:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            except ImportError as error:
+                assert str(error) == 'adapter ABI mismatch', str(error)
+            else:
+                raise AssertionError('module-specific ABI mismatch was accepted')
+            assert_unregistered()
+            print('HANDSHAKE_REJECTED_REGISTRY_UNCHANGED')
+        else:
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            assert_unregistered()
+            module._register(hashlib.sha256(manifest_bytes).hexdigest())
+            assert _native._registered_type('std_msgs/msg/Int32')['native_size'] > 0
+            print('MATCHING_HANDSHAKE_REGISTERED')
+        ''')
+    output = _run([
+        sys.executable, '-c', probe, _module_path(build, '_handshake'), manifest,
+        'mismatch' if mismatch else 'matching'], timeout=15)
+    assert 'DLOPEN_SUCCEEDED' in output
+    assert ('HANDSHAKE_REJECTED_REGISTRY_UNCHANGED' if mismatch
+            else 'MATCHING_HANDSHAKE_REGISTERED') in output
+
+
+def test_header_identity_reconfigures_for_content_addition_and_removal(tmp_path):
+    """Track header edits on build alone using a prefix-independent content oracle."""
+    source, build = tmp_path / 'source', tmp_path / 'build'
+    headers = source / 'headers'
+    headers.mkdir(parents=True)
+    first = headers / 'one.hpp'
+    first.write_text('// Initial published contract.\n')
+    identity_helper = (
+        Path(get_package_share_directory('rclpy_agnocast')) / 'cmake' / 'adapter_identity.cmake')
+    (source / 'CMakeLists.txt').write_text(textwrap.dedent(f'''\
+        cmake_minimum_required(VERSION 3.14)
+        project(header_identity NONE)
+        include("{identity_helper}")
+        _rclpy_agnocast_headers_digest(digest "${{CMAKE_CURRENT_SOURCE_DIR}}/headers")
+        file(WRITE "${{CMAKE_CURRENT_BINARY_DIR}}/digest.txt" "${{digest}}")
+        add_custom_target(identity ALL)
+        '''))
+    _run(['cmake', '-S', source, '-B', build, '-G', 'Unix Makefiles'])
+
+    def checked_digest():
+        _build(build)
+        digest = (build / 'digest.txt').read_text()
+        assert digest == _header_digest(headers)
+        return digest
+
+    initial = checked_digest()
+    first.write_text('// Changed published contract.\n')
+    changed = checked_digest()
+    assert changed != initial
+    nested = headers / 'nested' / 'two.h'
+    nested.parent.mkdir()
+    nested.write_text('// Additional published contract.\n')
+    added = checked_digest()
+    assert added != changed
+    nested.unlink()
+    assert checked_digest() == changed
+
+
+@pytest.mark.parametrize('changed_headers', [False, True])
+def test_selected_agnocast_header_identity_is_independent_of_runtime_prefix(
+        tmp_path, changed_headers):
+    """Accept a byte-identical relocation and reject changed headers at both gates."""
+    original = Path(get_package_prefix('agnocastlib'))
+    selected = tmp_path / 'agnocastlib'
+    shutil.copytree(original / 'include', selected / 'include')
+    shutil.copytree(original / 'share' / 'agnocastlib', selected / 'share' / 'agnocastlib')
+    (selected / 'lib').mkdir()
+    (selected / 'lib' / 'libagnocast.so').symlink_to(original / 'lib' / 'libagnocast.so')
+    headers = selected / 'include' / 'agnocast'
+    if changed_headers:
+        header = headers / 'agnocast_publisher.hpp'
+        header.write_text(header.read_text() + '\n// Distinct published inline contract.\n')
+    source, build = tmp_path / 'source', tmp_path / 'build'
+    _write_project(source)
+    _configure(source, build, agnocast_prefix=selected)
+    _build(build)
+
+    manifest = json.loads((build / '_types' / 'manifest.json').read_text())
+    axes = dict(axis.split('=', 1) for axis in manifest['build_abi'].split(';'))
+    published = Path(get_package_prefix('rclpy_agnocast')) / 'include' / 'rclpy_agnocast' / 'types'
+    assert axes['types'] == _header_digest(published)
+    assert axes['agnocast'] == _header_digest(headers)
+    assert (axes['agnocast'] != _header_digest(original / 'include' / 'agnocast')) == (
+        changed_headers)
+    provider = tmp_path / 'provider'
+    resource = Path('share') / _PROVIDER / 'adapters' / 'manifest.json'
+    (provider / resource).parent.mkdir(parents=True)
+    shutil.copyfile(build / '_types' / 'manifest.json', provider / resource)
+    library = provider / manifest['library']
+    library.parent.mkdir(parents=True)
+    library.symlink_to(_module_path(build, '_types'))
+    probe = textwrap.dedent('''\
+        import ctypes
+        import importlib.util
+        import json
+        from pathlib import Path
+        import sys
+        from rclpy_agnocast import _native
+        from rclpy_agnocast.types import discovery
+
+        provider, resource, library = sys.argv[1:4]
+        mismatch = sys.argv[4] == 'mismatch'
+        manifest = json.loads((Path(provider) / resource).read_text())
+        runtime = dict(axis.split('=', 1) for axis in _native._adapter_abi()['build'].split(';'))
+        generated = dict(axis.split('=', 1) for axis in manifest['build_abi'].split(';'))
+        assert generated['types'] == runtime['types']
+        assert (generated['agnocast'] != runtime['agnocast']) == mismatch
+        discovery.get_resources = lambda _: {'build_contract_provider': provider}
+        discovery.get_resource = lambda *_: (resource, provider)
+
+        def assert_unregistered():
+            try:
+                _native._registered_type('std_msgs/msg/Int32')
+            except IndexError:
+                return
+            raise AssertionError('incompatible provider registered a type')
+
+        assert_unregistered()
+        if mismatch:
+            def unexpected_load(*_):
+                raise AssertionError('discovery attempted to import incompatible provider')
+            discovery._load_plugin = unexpected_load
+            try:
+                discovery._resolve_type('std_msgs/msg/Int32')
+            except ValueError as error:
+                assert str(error) == 'adapter ABI mismatch: std_msgs/msg/Int32; rebuild adapter'
+            else:
+                raise AssertionError('discovery accepted incompatible selected headers')
+            assert_unregistered()
+            loaded = ctypes.CDLL(library)
+            spec = importlib.util.spec_from_file_location(manifest['module'], library)
+            try:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            except ImportError as error:
+                assert str(error) == 'adapter ABI mismatch', str(error)
+            else:
+                raise AssertionError('C handshake accepted incompatible selected headers')
+            assert_unregistered()
+            print('SELECTED_HEADERS_REJECTED_AT_BOTH_GATES')
+        else:
+            assert discovery._resolve_type('std_msgs/msg/Int32')['native_size'] > 0
+            print('RELOCATED_HEADERS_REGISTERED')
+        ''')
+    output = _run([
+        sys.executable, '-c', probe, provider, resource, library,
+        'mismatch' if changed_headers else 'matching'], timeout=15)
+    assert ('SELECTED_HEADERS_REJECTED_AT_BOTH_GATES' if changed_headers
+            else 'RELOCATED_HEADERS_REGISTERED') in output
 
 
 def test_in_source_configuration_fails_before_adapter_output(tmp_path):
