@@ -205,8 +205,8 @@ if(BUILD_TESTING)
   endif()
 endif()
 
-install(DIRECTORY include/
-  DESTINATION include
+install(DIRECTORY include/rclpy_agnocast/types/
+  DESTINATION include/rclpy_agnocast/types
 )
 
 ament_package()
