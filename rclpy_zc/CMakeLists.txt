@@ -42,6 +42,7 @@ add_library(rclpy_agnocast_core STATIC
   src/publisher_worker.cpp
   src/subscriber/lease.cpp
   src/subscriber/queue.cpp
+  src/types/root.cpp
 )
 target_compile_features(rclpy_agnocast_core PUBLIC cxx_std_17)
 target_include_directories(rclpy_agnocast_core PUBLIC
@@ -51,7 +52,7 @@ target_include_directories(rclpy_agnocast_core PUBLIC
 set_target_properties(rclpy_agnocast_core PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
-target_link_libraries(rclpy_agnocast_core PUBLIC Threads::Threads)
+target_link_libraries(rclpy_agnocast_core PUBLIC Threads::Threads rclpy_agnocast_types)
 
 add_library(rclpy_agnocast_native STATIC
   src/buffer_owner.cpp
@@ -59,6 +60,7 @@ add_library(rclpy_agnocast_native STATIC
   src/subscriber/buffer_owner.cpp
   src/subscriber/executor.cpp
   src/subscriber/native.cpp
+  src/types/native_publisher.cpp
 )
 target_compile_features(rclpy_agnocast_native PUBLIC cxx_std_17)
 target_include_directories(rclpy_agnocast_native PUBLIC
@@ -102,6 +104,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_type_registry rclpy_agnocast_types)
   ament_add_gtest(test_field_ops test/types/test_field_ops.cpp)
   target_link_libraries(test_field_ops rclpy_agnocast_types)
+  ament_add_gtest(test_type_root test/types/test_root.cpp)
+  target_include_directories(test_type_root PRIVATE src)
+  target_link_libraries(test_type_root rclpy_agnocast_core)
   add_library(test_type_provider MODULE test/types/provider_library.cpp)
   target_link_libraries(test_type_provider PRIVATE rclpy_agnocast_types)
   set_target_properties(test_type_provider PROPERTIES

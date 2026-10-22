@@ -12,6 +12,11 @@
 
 namespace rclpy_agnocast
 {
+namespace types
+{
+class RootOwner;
+struct TypeDescriptor;
+}  // namespace types
 
 /** @brief Observable process-runtime lifecycle. */
 enum class RuntimeState
@@ -65,6 +70,21 @@ public:
     const std::string & topic, std::size_t depth, std::size_t max_payload_bytes);
 
   /**
+   * @brief Create a registered message publisher on the existing native worker.
+   * @param[in] ros_type Fully qualified registered ROS message identity.
+   * @param[in] topic Non-empty resolved ROS topic name.
+   * @param[in] depth Positive KeepLast history depth.
+   * @param[in] max_storage_bytes Positive accounted-storage limit per borrowed root.
+   * @return Publisher retaining this runtime and its immutable type descriptor.
+   * @throws std::invalid_argument for an empty topic or zero depth/limit.
+   * @throws std::out_of_range when no adapter registered the requested type.
+   * @throws std::runtime_error when closing, busy, or native creation fails.
+   */
+  std::shared_ptr<PublisherHandle> create_typed_publisher(
+    const std::string & ros_type, const std::string & topic,
+    std::size_t depth, std::size_t max_storage_bytes);
+
+  /**
    * @brief Create a typed subscriber with bounded retained count and payload bytes.
    *
    * @param[in] topic Non-empty ROS topic name.
@@ -108,6 +128,9 @@ private:
 
   explicit RuntimeCore(std::unique_ptr<Impl> impl);
   std::shared_ptr<LoanState> borrow(std::uintptr_t publisher_id, std::size_t size);
+  std::shared_ptr<types::RootOwner> borrow_message(
+    std::uintptr_t publisher_id, std::shared_ptr<const types::TypeDescriptor> descriptor,
+    std::size_t max_storage_bytes);
   PublisherWorkerResult remove_publisher(std::uintptr_t publisher_id) noexcept;
 
   std::unique_ptr<Impl> impl_;
@@ -115,7 +138,7 @@ private:
   friend class PublisherHandle;
 };
 
-/** @brief One typed SharedBuffer publisher endpoint owned by RuntimeCore's worker. */
+/** @brief One SharedBuffer or generated message endpoint owned by RuntimeCore's worker. */
 class PublisherHandle
 {
 public:
@@ -140,6 +163,15 @@ public:
    * @throws Any exception reported by native borrow or Loan-state allocation.
    */
   std::shared_ptr<LoanState> borrow(std::size_t size);
+
+  /**
+   * @brief Borrow one default-constructed generated root on the native worker.
+   * @return Root owner retaining the worker/session through all field and buffer aliases.
+   * @throws std::logic_error when this is a legacy SharedBuffer publisher.
+   * @throws std::runtime_error when the endpoint is closing or another loan is active.
+   * @throws Any exception from native borrow or root accounting; the loan is rolled back.
+   */
+  std::shared_ptr<types::RootOwner> borrow_message();
 
   /**
    * @brief Publish a Loan using this endpoint identity.
@@ -189,15 +221,18 @@ public:
 private:
   PublisherHandle(
     std::shared_ptr<RuntimeCore> runtime, std::uintptr_t publisher_id,
-    std::size_t max_payload_bytes)
+    std::size_t max_payload_bytes,
+    std::shared_ptr<const types::TypeDescriptor> typed_descriptor = nullptr)
   : runtime_(std::move(runtime)),
     publisher_id_(publisher_id),
-    max_payload_bytes_(max_payload_bytes) {}
+    max_payload_bytes_(max_payload_bytes),
+    typed_descriptor_(std::move(typed_descriptor)) {}
 
   mutable std::mutex mutex_;
   std::shared_ptr<RuntimeCore> runtime_;
   const std::uintptr_t publisher_id_;
   const std::size_t max_payload_bytes_;
+  std::shared_ptr<const types::TypeDescriptor> typed_descriptor_;
   bool accepting_{true};
   bool closed_{false};
 

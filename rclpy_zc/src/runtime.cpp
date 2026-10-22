@@ -4,6 +4,9 @@
 #include "rclpy_agnocast_msgs/msg/shared_buffer.hpp"
 #include "publisher/observation.hpp"
 #include "subscriber/native.hpp"
+#include "types/native_publisher.hpp"
+#include "types/root.hpp"
+#include "rclpy_agnocast/types/adapter.hpp"
 
 #include <mutex>
 #include <set>
@@ -270,6 +273,60 @@ std::shared_ptr<LoanState> RuntimeCore::borrow(
   }
 }
 
+std::shared_ptr<PublisherHandle> RuntimeCore::create_typed_publisher(
+  const std::string & ros_type, const std::string & topic, const std::size_t depth,
+  const std::size_t max_storage_bytes)
+{
+  if (topic.empty()) throw std::invalid_argument("topic must not be empty");
+  if (depth == 0U) throw std::invalid_argument("depth must be positive");
+  if (topic.find('\0') != std::string::npos) {
+    throw std::invalid_argument("topic must not contain NUL");
+  }
+  if (max_storage_bytes == 0U) {
+    throw std::invalid_argument("max_storage_bytes must be positive");
+  }
+  auto descriptor = std::make_shared<const types::TypeDescriptor>(types::registered_type(ros_type));
+  std::unique_ptr<PublisherHandle> handle;
+  std::unique_lock<std::mutex> lock(impl_->mutex);
+  if (impl_->state != RuntimeState::kOpen || !impl_->worker || !impl_->session) {
+    throw std::runtime_error("runtime is not open");
+  }
+  if (impl_->next_publisher_id == 0U) throw std::overflow_error("publisher identity exhausted");
+  const auto publisher_id = impl_->next_publisher_id++;
+  handle.reset(new PublisherHandle(
+      shared_from_this(), publisher_id, max_storage_bytes, descriptor));
+  auto factory = types::native_publisher_factory(
+    impl_->session->node.get(), topic, depth, descriptor);
+  impl_->publisher_ids.insert(publisher_id);
+  const auto result = impl_->worker->add_publisher(publisher_id, factory);
+  if (result.error != PublisherWorkerError::kNone) {
+    impl_->publisher_ids.erase(publisher_id);
+    throw_worker_failure("typed publisher creation", result);
+  }
+  lock.unlock();
+  return std::shared_ptr<PublisherHandle>(std::move(handle));
+}
+
+std::shared_ptr<types::RootOwner> RuntimeCore::borrow_message(
+  const std::uintptr_t publisher_id, std::shared_ptr<const types::TypeDescriptor> descriptor,
+  const std::size_t max_storage_bytes)
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->state != RuntimeState::kOpen || !impl_->worker) {
+    throw std::runtime_error("runtime is not open");
+  }
+  if (impl_->publisher_ids.count(publisher_id) == 0U) {
+    throw std::runtime_error("publisher is closed");
+  }
+  const auto result = impl_->worker->borrow_root(publisher_id);
+  if (result.error != PublisherWorkerError::kNone) {
+    throw_worker_failure("typed publisher borrow", {result.error, result.failure});
+  }
+  return types::RootOwner::create(
+    impl_->worker, publisher_id, result.generation, result.root,
+    *descriptor, max_storage_bytes);
+}
+
 std::shared_ptr<SubscriptionHandle> RuntimeCore::create_subscription(
   const std::string & topic, const std::size_t depth,
   const std::size_t max_outstanding_leases, const std::size_t max_payload_bytes)
@@ -367,8 +424,17 @@ std::shared_ptr<LoanState> PublisherHandle::borrow(const std::size_t size)
 {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!accepting_ || closed_) throw std::runtime_error("publisher is closing or closed");
+  if (typed_descriptor_) throw std::logic_error("typed publisher requires borrow_message");
   if (size > max_payload_bytes_) throw std::invalid_argument("payload exceeds configured limit");
   return runtime_->borrow(publisher_id_, size);
+}
+
+std::shared_ptr<types::RootOwner> PublisherHandle::borrow_message()
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!accepting_ || closed_) throw std::runtime_error("publisher is closing or closed");
+  if (!typed_descriptor_) throw std::logic_error("SharedBuffer publisher requires borrow");
+  return runtime_->borrow_message(publisher_id_, typed_descriptor_, max_payload_bytes_);
 }
 
 PublisherWorkerResult PublisherHandle::close() noexcept
