@@ -18,7 +18,7 @@ class TypedPublisher:
         return Message(self._handle.borrow_message())
 
     def _root(self, message):
-        if not isinstance(message, Message) or message._path:
+        if not isinstance(message, Message) or message._path or message._readonly:
             raise TypeError('publish/cancel requires a borrowed native root')
         if message._owner.publisher_id != self._handle.id:
             raise TypeError('native root belongs to another publisher')

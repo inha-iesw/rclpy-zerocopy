@@ -259,6 +259,52 @@ class AgnocastRuntime:
             self._subscriptions.add(subscription)
             return subscription
 
+    def create_typed_subscription(
+        self, message_type, topic: str, callback, *, depth: int, limits,
+        callback_group=None,
+    ):
+        """
+        Deliver generated immutable messages, retaining capacity charges through aliases.
+
+        Synchronous and coroutine callbacks execute through the supplied callback group
+        or the Node's default group. All three SubscriptionLimits values are mandatory.
+        """
+        from rclpy.callback_groups import CallbackGroup
+
+        from .subscription.limits import SubscriptionLimits
+        from .subscription.typed import TypedSubscription
+        from .types import resolve_adapter
+
+        if not isinstance(topic, str):
+            raise TypeError('topic must be a string')
+        if not topic:
+            raise ValueError('topic must not be empty')
+        if not callable(callback):
+            raise TypeError('callback must be callable')
+        if (inspect.isasyncgenfunction(callback)
+                or inspect.isasyncgenfunction(getattr(callback, '__call__', None))):
+            raise TypeError('subscription callback must not be an async generator')
+        depth = _positive_integer('depth', depth)
+        if depth > (1 << 32) - 1:
+            raise ValueError('depth must fit UINT32_MAX')
+        if not isinstance(limits, SubscriptionLimits):
+            raise TypeError('limits must be SubscriptionLimits')
+        if callback_group is not None and not isinstance(callback_group, CallbackGroup):
+            raise TypeError('callback_group must be a CallbackGroup')
+        descriptor = resolve_adapter(message_type)
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError('runtime is closed')
+            _validate_rclpy_node(self._rclpy_node)
+            group = callback_group or self._rclpy_node.default_callback_group
+            handle = self._native_runtime.create_typed_subscription(
+                descriptor['ros_type'], topic, depth, limits.max_messages,
+                limits.max_retained_bytes, limits.max_message_bytes)
+            subscription = TypedSubscription(
+                handle, callback, runtime_owner=self, callback_group=group)
+            self._subscriptions.add(subscription)
+            return subscription
+
     def __enter__(self) -> "AgnocastRuntime":
         return self
 

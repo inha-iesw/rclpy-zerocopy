@@ -14,12 +14,13 @@ def _index(value):
 
 
 class _Proxy:
-    __slots__ = ('_owner', '_path', '_generation')
+    __slots__ = ('_owner', '_path', '_generation', '_readonly')
 
-    def __init__(self, owner, path=(), generation=0):
+    def __init__(self, owner, path=(), generation=0, *, readonly=False):
         object.__setattr__(self, '_owner', owner)
         object.__setattr__(self, '_path', path)
         object.__setattr__(self, '_generation', generation)
+        object.__setattr__(self, '_readonly', readonly)
 
     def _info(self):
         return self._owner.info(self._path, self._generation)
@@ -32,16 +33,23 @@ class _Proxy:
         if child['kind'] == 'scalar':
             return self._owner.read(path, generation)
         cls = Message if child['kind'] == 'message' else Field
-        return cls(self._owner, path, generation)
+        return cls(self._owner, path, generation, readonly=self._readonly)
+
+    def _require_writable(self):
+        if self._readonly:
+            raise TypeError('received message is read-only')
 
 
 class Message(_Proxy):
-    """Native root or nested message; field access never constructs an owning ROS message.
+    """
+    Native root or nested message; field access never constructs an owning ROS message.
 
     Resize every dynamic field before the first write or buffer export, then reacquire
     child proxies from the root. A successful resize invalidates all older child proxies.
-    Use a root in a synchronous context on its creator thread. Unpublished context exit
+    Use a borrowed root in a synchronous context on its creator thread. Unpublished context exit
     cancels on the worker, deferring cleanup while a writable buffer remains alive.
+    Received messages are read-only; their fields and buffers share the native owner
+    independently of callback lifetime and cannot be used as producer loan contexts.
     """
 
     __slots__ = ()
@@ -57,6 +65,7 @@ class Message(_Proxy):
 
     def __setattr__(self, name, value):
         """Assign a scalar directly and freeze the root structure on success."""
+        self._require_writable()
         info = self._info()
         try:
             index = info['members'].index(name)
@@ -66,6 +75,7 @@ class Message(_Proxy):
 
     def __enter__(self):
         """Validate a root loan before entering its synchronous context."""
+        self._require_writable()
         if self._path:
             raise TypeError('only the borrowed root is a loan context')
         self._info()
@@ -73,6 +83,7 @@ class Message(_Proxy):
 
     def __exit__(self, exception_type, exception, traceback):
         """Cancel unpublished storage while preserving the body exception."""
+        self._require_writable()
         del exception, traceback
         try:
             self._owner.cancel(self._owner.publisher_id, True)
@@ -97,18 +108,21 @@ class Field(_Proxy):
 
     def __setitem__(self, index, value):
         """Write a checked scalar element directly into native storage."""
+        self._require_writable()
         info = self._info()
         self._owner.write((*self._path, _index(index)), info['generation'], value)
 
     def resize(self, size):
         """Resize on the native worker in PREPARE; reacquire field proxies afterward."""
+        self._require_writable()
         self._owner.resize(self._path, self._generation, _index(size))
 
     def buffer(self):
-        """Export writable native-endian elements and freeze the root's structure.
+        """
+        Export native-endian elements, read-only for a received message.
 
-        Release all memoryviews and derived consumers before publish. Consumers must
-        release before their source view; use the supported Tensor API once available
+        A producer export freezes structure. Release views and consumers before publish.
+        Consumers must release before their source view; use the Tensor API once available
         for independent Tensor ownership. Packed boolean sequences reject export.
         String buffers hold UTF-8 bytes or native-endian UTF-16 code units.
         """
