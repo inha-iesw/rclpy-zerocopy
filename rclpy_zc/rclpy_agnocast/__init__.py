@@ -5,6 +5,7 @@ from .runtime import AgnocastRuntime
 from .subscription import Subscription
 from ._native import Lease
 from .subscription.limits import SubscriptionLimits
+from .compat import Node
 
-__all__ = ["AgnocastRuntime", "Lease", "Loan", "Publisher", "Subscription",
+__all__ = ["AgnocastRuntime", "Lease", "Loan", "Node", "Publisher", "Subscription",
            "SubscriptionLimits"]
