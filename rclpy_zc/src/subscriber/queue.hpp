@@ -36,19 +36,24 @@ struct SubscriberStats
   std::size_t queued_leases{0};
   std::size_t outstanding_leases{0};
   std::size_t outstanding_payload_bytes{0};
+  std::size_t outstanding_accounted_bytes{0};
+  std::uint64_t dropped_count_full{0};
+  std::uint64_t dropped_bytes_full{0};
 };
 
 struct SubscriberBudget
 {
   std::mutex mutex;
   SubscriberStats stats;
+  std::size_t retained_bytes{0};
 };
 
 /** @brief Preallocated DropNewest ring; popping does not return count or byte reservations. */
 class SubscriberQueue
 {
 public:
-  SubscriberQueue(std::size_t max_count, std::size_t max_bytes);
+  SubscriberQueue(
+    std::size_t max_count, std::size_t max_bytes, std::size_t max_message_bytes = 0);
   ~SubscriberQueue();
   SubscriberQueue(const SubscriberQueue &) = delete;
   SubscriberQueue & operator=(const SubscriberQueue &) = delete;
@@ -75,6 +80,7 @@ public:
 
 private:
   const std::size_t max_bytes_;
+  const std::size_t max_message_bytes_;
   std::shared_ptr<SubscriberBudget> budget_;
   std::vector<std::shared_ptr<LeaseBufferOwner>> ring_;
   std::size_t head_{0};

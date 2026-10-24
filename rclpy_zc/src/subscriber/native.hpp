@@ -20,6 +20,7 @@
 #include <string>
 
 #include "queue.hpp"
+#include "rclpy_agnocast/types/adapter.hpp"
 
 namespace agnocast
 {
@@ -53,6 +54,11 @@ public:
   /** @brief Create a bounded typed subscription on the native executor thread. */
   std::shared_ptr<SubscriptionHandle> create_subscription(
     const std::string & topic, std::size_t depth, std::size_t max_count, std::size_t max_bytes);
+  /** @brief Create a registered subscription sharing the existing retained-owner queue. */
+  std::shared_ptr<SubscriptionHandle> create_typed_subscription(
+    std::shared_ptr<const types::TypeDescriptor> descriptor, const std::string & topic,
+    std::size_t depth, std::size_t max_count, std::size_t max_bytes,
+    std::size_t max_message_bytes);
   /** @brief Permanently stop admission/notifications, retaining execution, endpoints and queues. */
   void quiesce() noexcept;
   /** @brief Stop admission and join execution, retaining queues and endpoint resources. */
@@ -93,6 +99,8 @@ public:
 #ifdef BUILD_TESTING
   /** @brief Inject receive failure through its recording path, without an allocation fault. */
   void test_fail_receive();
+  /** @brief Inject bad_alloc after typed native ownership adoption, before accounting/admission. */
+  void test_fail_next_typed_receive();
   /** @brief Read actual receive/reset evidence; available only in test builds. */
   SubscriberObservation observation() const;
   /** @brief Stop the worker independently of runtime close, for lifecycle regression tests. */

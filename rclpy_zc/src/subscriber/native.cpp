@@ -21,7 +21,9 @@
 
 #include <algorithm>
 #include <exception>
+#include <limits>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -46,10 +48,14 @@ struct ObservationState
 
   void received(const NativeMessage & message)
   {
+    received(reinterpret_cast<std::uintptr_t>(message->data.data()));
+  }
+  void received(std::uintptr_t address)
+  {
     std::lock_guard<std::mutex> lock(mutex);
     ++value.received;
     value.callback_tid = syscall(SYS_gettid);
-    value.native_data_address = reinterpret_cast<std::uintptr_t>(message->data.data());
+    value.native_data_address = address;
   }
   void released()
   {
@@ -72,13 +78,28 @@ struct NativeStorage
   }
 #endif
 };
+
+struct TypedSubscriptionStorage
+{
+  types::NativeSubscriptionEndpoint endpoint;
+  ~TypedSubscriptionStorage() {reset();}
+  void reset() noexcept
+  {
+    if (endpoint.object) {endpoint.destroy(endpoint.object);}
+    endpoint = {};
+  }
+};
 }  // namespace
 
 class SubscriptionState
 {
 public:
-  SubscriptionState(std::shared_ptr<void> session, std::size_t count, std::size_t bytes)
-  : native_session(std::move(session)), queue(count, bytes) {}
+  SubscriptionState(
+    std::shared_ptr<void> session, std::size_t count, std::size_t bytes,
+    std::size_t max_message_bytes = 0,
+    std::shared_ptr<const types::TypeDescriptor> type = {})
+  : native_session(std::move(session)), descriptor(std::move(type)),
+    queue(count, bytes, max_message_bytes) {}
 
   void receive(NativeMessage message) noexcept
   {
@@ -111,16 +132,60 @@ public:
     queue.fail(std::move(failure));
   }
 
+  static void receive_typed(
+    void * context, types::NativeReceived message, types::Status status) noexcept
+  {
+    auto & self = *static_cast<SubscriptionState *>(context);
+    try {
+      types::check_status(status);
+#ifdef BUILD_TESTING
+      self.observation->received(reinterpret_cast<std::uintptr_t>(message.root));
+      auto release = [callback = message.release, observation = self.observation](void * owner) {
+          callback(owner);
+          observation->released();
+        };
+#else
+      auto release = message.release;
+#endif
+      // shared_ptr calls release even if its control-block allocation fails.
+      auto storage = std::shared_ptr<void>(message.owner, release);
+#ifdef BUILD_TESTING
+      // Exercise rollback after successful adoption, not shared_ptr allocator fault injection.
+      if (self.fail_next_typed_receive) {
+        self.fail_next_typed_receive = false;
+        throw std::bad_alloc();
+      }
+#endif
+      const auto & descriptor = *self.descriptor;
+      std::size_t dynamic = 0;
+      types::check_status(
+        descriptor.ops->root->dynamic_bytes(
+          {const_cast<void *>(message.root), descriptor.ops->root}, &dynamic));
+      if (dynamic > std::numeric_limits<std::size_t>::max() - descriptor.native_size) {
+        throw std::invalid_argument("accounted storage overflow");
+      }
+      ReceivedBuffer value{++self.identity, nullptr, descriptor.native_size + dynamic,
+        std::move(storage), message.root, self.descriptor};
+      self.queue.push(std::move(value));
+    } catch (...) {
+      self.fail_receive(std::current_exception());
+    }
+  }
+
   // Declaration order ensures queued pointers and endpoints die before their native session.
   std::shared_ptr<void> native_session;
   rclcpp::CallbackGroup::SharedPtr group;
   NativeSubscription::SharedPtr subscription;
+  TypedSubscriptionStorage typed_subscription;
+  std::shared_ptr<const types::TypeDescriptor> descriptor;
   SubscriberQueue queue;
+  std::uint64_t identity{0};
   bool attached{false};
   bool closing{false};
   bool closed{false};
 #ifdef BUILD_TESTING
   std::shared_ptr<ObservationState> observation{std::make_shared<ObservationState>()};
+  bool fail_next_typed_receive{false};
 #endif
 };
 
@@ -141,17 +206,25 @@ public:
         try {
           state->group = node->create_callback_group(
             rclcpp::CallbackGroupType::MutuallyExclusive, false);
-          agnocast::SubscriptionOptions options;
-          options.callback_group = state->group;
-          const std::weak_ptr<SubscriptionState> weak = state;
-          state->subscription = node->create_subscription<Message>(
-            topic, depth, [weak](NativeMessage message) noexcept {
-            if (auto target = weak.lock()) {target->receive(std::move(message));}
-          }, options);
+          if (state->descriptor) {
+            types::check_status(
+              state->descriptor->ops->subscribe(
+                node.get(), topic.c_str(), depth, &state->group, state.get(),
+                &SubscriptionState::receive_typed, &state->typed_subscription.endpoint));
+          } else {
+            agnocast::SubscriptionOptions options;
+            options.callback_group = state->group;
+            const std::weak_ptr<SubscriptionState> weak = state;
+            state->subscription = node->create_subscription<Message>(
+              topic, depth, [weak](NativeMessage message) noexcept {
+              if (auto target = weak.lock()) {target->receive(std::move(message));}
+            }, options);
+          }
           executor->add_callback_group(state->group, node->get_node_base_interface());
           state->attached = true;
         } catch (...) {
           state->subscription.reset();
+          state->typed_subscription.reset();
           state->group.reset();
           throw;
         }
@@ -183,6 +256,7 @@ public:
   void release_endpoint(const std::shared_ptr<SubscriptionState> & state)
   {
     state->subscription.reset();
+    state->typed_subscription.reset();
     state->group.reset();
     state->native_session.reset();
     state->closed = true;
@@ -206,11 +280,20 @@ std::shared_ptr<SubscriptionHandle> SubscriberRuntime::create_subscription(
   const std::string & topic, const std::size_t depth,
   const std::size_t max_count, const std::size_t max_bytes)
 {
+  return create_typed_subscription({}, topic, depth, max_count, max_bytes, 0);
+}
+
+std::shared_ptr<SubscriptionHandle> SubscriberRuntime::create_typed_subscription(
+  std::shared_ptr<const types::TypeDescriptor> descriptor, const std::string & topic,
+  const std::size_t depth, const std::size_t max_count, const std::size_t max_bytes,
+  const std::size_t max_message_bytes)
+{
   // The handle's rollback destructor must run after the manager lock is released.
   std::unique_ptr<SubscriptionHandle> handle;
   std::lock_guard<std::mutex> lock(impl_->mutex);
   if (!impl_->accepting) {throw std::runtime_error("subscriber runtime is closing");}
-  auto state = std::make_shared<SubscriptionState>(impl_->native_session, max_count, max_bytes);
+  auto state = std::make_shared<SubscriptionState>(
+    impl_->native_session, max_count, max_bytes, max_message_bytes, std::move(descriptor));
   handle.reset(new SubscriptionHandle(shared_from_this(), state));
   impl_->states.push_back(state);
   try {
@@ -333,7 +416,15 @@ std::size_t SubscriptionHandle::publisher_count()
   std::lock_guard<std::mutex> lock(impl.mutex);
   impl.require_open(*state_);
   std::size_t count = 0;
-  impl.executor->invoke([this, &count]() {count = state_->subscription->get_publisher_count();});
+  impl.executor->invoke(
+    [this, &count]() {
+      if (state_->descriptor) {
+        auto & endpoint = state_->typed_subscription.endpoint;
+        types::check_status(endpoint.publisher_count(endpoint.object, &count));
+      } else {
+        count = state_->subscription->get_publisher_count();
+      }
+    });
   return count;
 }
 
@@ -352,6 +443,15 @@ void SubscriptionHandle::test_stop_executor(const bool fail)
 {
   std::lock_guard<std::mutex> lock(runtime_->impl_->mutex);
   runtime_->impl_->executor->test_stop(fail);
+}
+
+void SubscriptionHandle::test_fail_next_typed_receive()
+{
+  auto & impl = *runtime_->impl_;
+  std::lock_guard<std::mutex> lock(impl.mutex);
+  impl.require_open(*state_);
+  if (!state_->descriptor) {throw std::invalid_argument("typed subscription required");}
+  impl.executor->invoke([this]() {state_->fail_next_typed_receive = true;});
 }
 
 void SubscriptionHandle::test_fail_next_control()

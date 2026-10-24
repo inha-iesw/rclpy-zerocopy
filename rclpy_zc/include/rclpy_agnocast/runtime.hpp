@@ -101,6 +101,24 @@ public:
     std::size_t max_payload_bytes);
 
   /**
+   * @brief Create a registered immutable subscriber with retained-storage admission limits.
+   *
+   * @param[in] ros_type Fully qualified registered ROS message identity.
+   * @param[in] topic Non-empty resolved topic name without NUL characters.
+   * @param[in] depth Positive native KeepLast history depth.
+   * @param[in] max_messages Positive retained-root limit across queue, callbacks and aliases.
+   * @param[in] max_retained_bytes Positive aggregate accounted-storage limit.
+   * @param[in] max_message_bytes Positive accounted-storage limit for one received root.
+   * @return Native handle retaining its endpoint until every delivered alias is released.
+   * @throws std::invalid_argument for an empty topic or zero depth/limit.
+   * @throws std::out_of_range when no adapter registered the requested type.
+   * @throws std::runtime_error when closing or native endpoint creation fails.
+   */
+  std::shared_ptr<SubscriptionHandle> create_typed_subscription(
+    const std::string & ros_type, const std::string & topic, std::size_t depth,
+    std::size_t max_messages, std::size_t max_retained_bytes, std::size_t max_message_bytes);
+
+  /**
    * @brief Stop native workers while retaining subscriber queues, endpoints and session.
    *
    * @return Retryable `kBusy` while a Loan/export is active, otherwise worker result.

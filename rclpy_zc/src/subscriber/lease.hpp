@@ -21,6 +21,10 @@
 
 namespace rclpy_agnocast
 {
+namespace types
+{
+struct TypeDescriptor;
+}
 struct SubscriberBudget;
 class SubscriberQueue;
 
@@ -31,6 +35,9 @@ struct ReceivedBuffer
   const std::uint8_t * data;
   std::size_t size;
   std::shared_ptr<void> storage;
+  // Typed deliveries charge size as accounted root storage; data is unused in that mode.
+  const void * typed_root{nullptr};
+  std::shared_ptr<const types::TypeDescriptor> descriptor{};
 };
 
 /** @brief Keep native storage and its admission reservation until the last buffer alias dies. */

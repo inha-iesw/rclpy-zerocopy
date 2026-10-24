@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "subscriber/queue.hpp"
+#include "rclpy_agnocast/types/adapter.hpp"
 
 namespace
 {
@@ -228,4 +229,38 @@ TEST(SubscriberQueue, ConcurrentProducersAndConsumerRespectBoundsAndReleaseEvery
   EXPECT_EQ(stats.outstanding_payload_bytes, 0U);
   EXPECT_EQ(released, 800U);
 }
+TEST(SubscriberQueue, TypedAdmissionSeparatesCountBytesAndSingleMessageLimits)
+{
+  SubscriberQueue queue(2, 15, 10);
+  auto type = std::make_shared<rclpy_agnocast::types::TypeDescriptor>();
+  auto storage = std::make_shared<int>(0);
+  auto input = [&](std::size_t bytes) {
+      rclpy_agnocast::ReceivedBuffer value{0, nullptr, bytes, storage};
+      value.typed_root = storage.get();
+      value.descriptor = type;
+      return value;
+    };
+  ASSERT_TRUE(queue.push(input(8)));
+  auto first = queue.take();
+  EXPECT_FALSE(queue.push(input(8)));
+  EXPECT_EQ(queue.stats().dropped_bytes_full, 1U);
+  ASSERT_TRUE(queue.push(input(7)));
+  EXPECT_FALSE(queue.push(input(1)));
+  EXPECT_EQ(queue.stats().dropped_count_full, 1U);
+  EXPECT_FALSE(queue.push(input(11)));
+  EXPECT_EQ(queue.stats().dropped_oversize, 1U);
+  EXPECT_EQ(queue.stats().outstanding_accounted_bytes, 15U);
+  EXPECT_EQ(queue.stats().outstanding_payload_bytes, 0U);
+  EXPECT_EQ(queue.stats().dropped_outstanding, 0U);
+  auto alias = first->owner();
+  first->release();
+  EXPECT_EQ(queue.stats().outstanding_accounted_bytes, 15U);
+  queue.clear();
+  EXPECT_EQ(queue.stats().outstanding_accounted_bytes, 8U);
+  alias.reset();
+  EXPECT_EQ(queue.stats().outstanding_accounted_bytes, 0U);
+  EXPECT_EQ(queue.stats().outstanding_leases, 0U);
+  EXPECT_TRUE(queue.push(input(8)));
+}
+
 }  // namespace

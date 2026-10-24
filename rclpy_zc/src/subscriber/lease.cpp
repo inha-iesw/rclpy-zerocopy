@@ -32,7 +32,10 @@ LeaseBufferOwner::~LeaseBufferOwner()
   if (reserved_) {
     std::lock_guard<std::mutex> lock(budget_->mutex);
     --budget_->stats.outstanding_leases;
-    budget_->stats.outstanding_payload_bytes -= buffer_.size;
+    budget_->retained_bytes -= buffer_.size;
+    if (buffer_.descriptor) {budget_->stats.outstanding_accounted_bytes -= buffer_.size;} else {
+      budget_->stats.outstanding_payload_bytes -= buffer_.size;
+    }
   }
   // keepalive_ is destroyed after native storage and the reservation have been returned.
 }

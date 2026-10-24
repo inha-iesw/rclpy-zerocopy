@@ -5,6 +5,7 @@
 #include <pybind11/stl.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -15,6 +16,8 @@
 
 #include "native_publisher.hpp"
 #include "root.hpp"
+#include "lease_root.hpp"
+#include "../subscriber/queue.hpp"
 #include "rclpy_agnocast/types/field_ops.hpp"
 
 namespace py = pybind11;
@@ -260,10 +263,106 @@ private:
   std::size_t maximum_;
   bool closed_{false};
 };
+
+// Use actual native members as the pointer/storage oracle, independent of Python exports.
+class TestTypedSubscription
+{
+public:
+  TestTypedSubscription(std::size_t count, std::size_t bytes, std::size_t maximum)
+  : queue_(count, bytes, maximum)
+  {
+    if (!maximum) {throw std::invalid_argument("max_message_bytes must be positive");}
+    static const TypeOps ops{message_fields(), create};
+    descriptor_ = std::make_shared<TypeDescriptor>(
+      TypeDescriptor{
+            "binding_test/msg/Message", std::string(64, 'a'), "[]", sizeof(TestMessage),
+            alignof(TestMessage), &ops});
+  }
+  bool push(std::int32_t seed, std::size_t count)
+  {
+    if (count > 8) {throw std::invalid_argument("fixture count exceeds bound");}
+    auto storage = std::shared_ptr<TestMessage>(
+      new TestMessage(), [released = released_](auto * p) {
+        delete p;
+        ++*released;
+      });
+    storage->signed_value = seed;
+    for (std::size_t i = 0; i < count; ++i) {
+      storage->values.push_back(seed + static_cast<std::int32_t>(i));
+    }
+    storage->packed = {true, false, true};
+    storage->children = {{{seed + 10, seed + 11}}};
+    storage->text = "typed-" + std::to_string(seed);
+    storage->wide = u"wide";
+    address_ = reinterpret_cast<std::uintptr_t>(storage->values.data());
+    accounted_ = sizeof(TestMessage) + storage->values.capacity() * sizeof(std::int32_t) +
+      (storage->packed.capacity() + 7) / 8 + storage->children.capacity() * sizeof(Child) +
+      storage->children[0].values.capacity() * sizeof(std::int32_t) +
+      string_bytes(storage->text) + string_bytes(storage->wide);
+    std::size_t dynamic = 0;
+    check_status(
+      descriptor_->ops->root->dynamic_bytes(
+        {storage.get(), descriptor_->ops->root}, &dynamic));
+    ReceivedBuffer value{++identity_, nullptr, sizeof(TestMessage) + dynamic, storage,
+      storage.get(), descriptor_};
+    return queue_.push(std::move(value));
+  }
+  std::shared_ptr<RootLeaseOwner> take()
+  {
+    auto lease = queue_.take();
+    return lease ? std::make_shared<RootLeaseOwner>(lease->owner()) : nullptr;
+  }
+  std::uint64_t wait_for_wake(std::uint64_t generation)
+  {return queue_.wait_for_wake(generation);}
+  void finish_dispatch() {queue_.finish_dispatch();}
+  void clear_pending() {queue_.clear();}
+  void prepare_close() {queue_.stop_admission();}
+  SubscriberStats stats() const {return queue_.stats();}
+  std::size_t release_count() const {return released_->load();}
+  std::uintptr_t address() const {return address_;}
+  std::size_t accounted_bytes() const {return accounted_;}
+  void close()
+  {
+    if (!queue_.drain_for_close()) {throw std::runtime_error("active root or view");}
+  }
+
+private:
+  template<typename String>
+  static std::size_t string_bytes(const String & value)
+  {
+    const auto object = reinterpret_cast<std::uintptr_t>(&value);
+    const auto data = reinterpret_cast<std::uintptr_t>(value.data());
+    return data >= object && data - object < sizeof(String) ? 0 :
+           (value.capacity() + 1) * sizeof(typename String::value_type);
+  }
+  SubscriberQueue queue_;
+  std::shared_ptr<const TypeDescriptor> descriptor_;
+  std::shared_ptr<std::atomic<std::size_t>> released_{
+    std::make_shared<std::atomic<std::size_t>>(0)};
+  std::uintptr_t address_{0};
+  std::size_t accounted_{0};
+  std::uint64_t identity_{0};
+};
 }  // namespace
 
 void bind_typed_testing(py::module_ & module)
 {
+  py::class_<TestTypedSubscription>(module, "_TestTypedSubscription")
+  .def(py::init<std::size_t, std::size_t, std::size_t>())
+  .def("push", &TestTypedSubscription::push, py::arg("seed"), py::arg("count") = 3)
+  .def("take", &TestTypedSubscription::take)
+  .def(
+    "wait_for_wake", &TestTypedSubscription::wait_for_wake,
+    py::call_guard<py::gil_scoped_release>())
+  .def("finish_dispatch", &TestTypedSubscription::finish_dispatch)
+  .def("clear_pending", &TestTypedSubscription::clear_pending)
+  .def("prepare_close", &TestTypedSubscription::prepare_close)
+  .def("stop_delivery", &TestTypedSubscription::prepare_close)
+  .def("close", &TestTypedSubscription::close)
+  .def_property_readonly("stats", &TestTypedSubscription::stats)
+  .def_property_readonly("release_count", &TestTypedSubscription::release_count)
+  .def_property_readonly("last_data_address", &TestTypedSubscription::address)
+  .def_property_readonly("last_accounted_bytes", &TestTypedSubscription::accounted_bytes);
   py::class_<TestTypedPublisher>(module, "_TestTypedPublisher")
   .def(py::init<std::size_t>())
   .def(

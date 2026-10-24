@@ -91,6 +91,14 @@ void bind_runtime(py::module_ & module)
       return runtime->create_subscription(topic, depth, count, bytes);
     }, py::arg("topic"), py::arg("depth"), py::arg("max_outstanding_leases"),
     py::arg("max_payload_bytes"))
+  .def("create_typed_subscription", [](
+      const std::shared_ptr<RuntimeCore> & runtime, const std::string & type,
+      const std::string & topic, std::size_t depth, std::size_t count,
+      std::size_t bytes, std::size_t maximum) {
+      py::gil_scoped_release release;
+      return runtime->create_typed_subscription(type, topic, depth, count, bytes, maximum);
+    }, py::arg("ros_type"), py::arg("topic"), py::arg("depth"), py::arg("max_messages"),
+    py::arg("max_retained_bytes"), py::arg("max_message_bytes"))
   .def("prepare_close", [](const std::shared_ptr<RuntimeCore> & runtime) {
       PublisherWorkerResult result{};
       {

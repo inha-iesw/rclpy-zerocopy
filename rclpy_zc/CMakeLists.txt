@@ -43,6 +43,7 @@ add_library(rclpy_agnocast_core STATIC
   src/subscriber/lease.cpp
   src/subscriber/queue.cpp
   src/types/root.cpp
+  src/types/lease_root.cpp
 )
 target_compile_features(rclpy_agnocast_core PUBLIC cxx_std_17)
 target_include_directories(rclpy_agnocast_core PUBLIC
@@ -84,6 +85,7 @@ pybind11_add_module(_native MODULE
   src/subscriber/bindings.cpp
   src/types/bindings.cpp
   src/types/bind_root.cpp
+  src/types/bind_lease_root.cpp
 )
 target_compile_features(_native PRIVATE cxx_std_17)
 target_link_libraries(_native PRIVATE rclpy_agnocast_native rclpy_agnocast_types)
@@ -120,6 +122,7 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_type_discovery test/types/test_discovery.py TIMEOUT 60)
   ament_add_pytest_test(test_type_native_abi test/types/test_native_abi.py TIMEOUT 60)
   ament_add_pytest_test(test_type_bindings test/types/test_bindings.py TIMEOUT 60)
+  ament_add_pytest_test(test_type_lease_bindings test/types/test_lease_bindings.py TIMEOUT 60)
 
   target_compile_definitions(rclpy_agnocast_core PUBLIC BUILD_TESTING)
   target_sources(rclpy_agnocast_core PRIVATE src/publisher/observation.cpp)

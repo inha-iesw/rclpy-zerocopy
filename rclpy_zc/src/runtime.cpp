@@ -344,6 +344,27 @@ std::shared_ptr<SubscriptionHandle> RuntimeCore::create_subscription(
     topic, depth, max_outstanding_leases, max_payload_bytes);
 }
 
+std::shared_ptr<SubscriptionHandle> RuntimeCore::create_typed_subscription(
+  const std::string & ros_type, const std::string & topic, const std::size_t depth,
+  const std::size_t max_messages, const std::size_t max_retained_bytes,
+  const std::size_t max_message_bytes)
+{
+  if (topic.empty() || topic.find('\0') != std::string::npos) {
+    throw std::invalid_argument("topic must be non-empty and contain no NUL");
+  }
+  if (!depth || !max_messages || !max_retained_bytes || !max_message_bytes) {
+    throw std::invalid_argument("subscriber depth and limits must be positive");
+  }
+  auto descriptor = std::make_shared<const types::TypeDescriptor>(types::registered_type(ros_type));
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (impl_->state != RuntimeState::kOpen) {throw std::runtime_error("runtime is not open");}
+  if (!impl_->subscribers) {
+    impl_->subscribers = std::make_shared<SubscriberRuntime>(impl_->session->node, impl_->session);
+  }
+  return impl_->subscribers->create_typed_subscription(
+    std::move(descriptor), topic, depth, max_messages, max_retained_bytes, max_message_bytes);
+}
+
 PublisherWorkerResult RuntimeCore::remove_publisher(const std::uintptr_t publisher_id) noexcept
 {
   try {

@@ -19,8 +19,11 @@
 
 namespace rclpy_agnocast
 {
-SubscriberQueue::SubscriberQueue(const std::size_t max_count, const std::size_t max_bytes)
-: max_bytes_(max_bytes), budget_(std::make_shared<SubscriberBudget>()), ring_(max_count)
+SubscriberQueue::SubscriberQueue(
+  const std::size_t max_count, const std::size_t max_bytes,
+  const std::size_t max_message_bytes)
+: max_bytes_(max_bytes), max_message_bytes_(max_message_bytes ? max_message_bytes : max_bytes),
+  budget_(std::make_shared<SubscriberBudget>()), ring_(max_count)
 {
   if (max_count == 0 || max_bytes == 0) {
     throw std::invalid_argument("subscriber count and byte limits must be positive");
@@ -37,23 +40,28 @@ bool SubscriberQueue::push(ReceivedBuffer buffer)
   ++stats.received_total;
   if (!accepting_) {return false;}
   const auto size = owner->buffer().size;
-  if (size > max_bytes_) {
+  if (size > max_message_bytes_) {
     ++stats.dropped_oversize;
     return false;
   }
+  const bool typed = static_cast<bool>(owner->buffer().descriptor);
+  if (stats.outstanding_leases == ring_.size()) {
+    if (typed) {++stats.dropped_count_full;} else {++stats.dropped_outstanding;}
+    return false;
+  }
   // Subtraction avoids overflow even for a limit of SIZE_MAX.
-  if (
-    stats.outstanding_leases == ring_.size() ||
-    size > max_bytes_ - stats.outstanding_payload_bytes)
-  {
-    ++stats.dropped_outstanding;
+  if (size > max_bytes_ - budget_->retained_bytes) {
+    if (typed) {++stats.dropped_bytes_full;} else {++stats.dropped_outstanding;}
     return false;
   }
   owner->reserved_ = true;
   ring_[(head_ + stats.queued_leases) % ring_.size()] = std::move(owner);
   ++stats.queued_leases;
   ++stats.outstanding_leases;
-  stats.outstanding_payload_bytes += size;
+  budget_->retained_bytes += size;
+  if (typed) {stats.outstanding_accounted_bytes += size;} else {
+    stats.outstanding_payload_bytes += size;
+  }
   if (!armed_) {
     armed_ = true;
     ++generation_;

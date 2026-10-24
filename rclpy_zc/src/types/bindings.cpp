@@ -25,6 +25,7 @@ namespace rclpy_agnocast
 namespace types
 {
 void bind_root(py::module_ & module);
+void bind_lease_root(py::module_ & module);
 #ifdef BUILD_TESTING
 void bind_typed_testing(py::module_ & module);
 #endif
@@ -56,6 +57,7 @@ void bind_types(py::module_ & module)
       return result;
     }, py::arg("ros_type"));
   types::bind_root(module);
+  types::bind_lease_root(module);
 #ifdef BUILD_TESTING
   types::bind_typed_testing(module);
 #endif

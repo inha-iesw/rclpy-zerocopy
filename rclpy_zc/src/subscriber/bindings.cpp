@@ -18,6 +18,7 @@
 #include "lease.hpp"
 #include "native.hpp"
 #include "queue.hpp"
+#include "../types/lease_root.hpp"
 
 namespace py = pybind11;
 namespace rclpy_agnocast
@@ -36,7 +37,10 @@ void bind_subscriber(py::module_ & module)
   .def_readonly("dropped_oversize", &SubscriberStats::dropped_oversize)
   .def_readonly("queued_leases", &SubscriberStats::queued_leases)
   .def_readonly("outstanding_leases", &SubscriberStats::outstanding_leases)
-  .def_readonly("outstanding_payload_bytes", &SubscriberStats::outstanding_payload_bytes);
+  .def_readonly("outstanding_payload_bytes", &SubscriberStats::outstanding_payload_bytes)
+  .def_readonly("outstanding_accounted_bytes", &SubscriberStats::outstanding_accounted_bytes)
+  .def_readonly("dropped_count_full", &SubscriberStats::dropped_count_full)
+  .def_readonly("dropped_bytes_full", &SubscriberStats::dropped_bytes_full);
 
   auto lease_binding = py::class_<LeaseState, std::shared_ptr<LeaseState>>(
     module, "Lease", "Read-only SharedBuffer ownership; release consumers before source views.");
@@ -71,7 +75,20 @@ void bind_subscriber(py::module_ & module)
   auto subscription = py::class_<SubscriptionHandle, std::shared_ptr<SubscriptionHandle>>(
     module, "SubscriptionHandle");
   subscription
-  .def("take", &SubscriptionHandle::take, py::call_guard<py::gil_scoped_release>())
+  .def(
+    "take", [](SubscriptionHandle & handle) -> py::object {
+      std::shared_ptr<LeaseState> lease;
+      {
+        py::gil_scoped_release release;
+        lease = handle.take();
+      }
+      if (!lease) {return py::none();}
+      auto owner = lease->owner();
+      if (owner->buffer().descriptor) {
+        return py::cast(std::make_shared<types::RootLeaseOwner>(std::move(owner)));
+      }
+      return py::cast(std::move(lease));
+    })
   .def(
     "wait_for_wake", &SubscriptionHandle::wait_for_wake,
     py::call_guard<py::gil_scoped_release>())
@@ -109,6 +126,9 @@ void bind_subscriber(py::module_ & module)
     "_test_stop_executor", &SubscriptionHandle::test_stop_executor,
     py::call_guard<py::gil_scoped_release>());
   subscription.def("_test_fail_next_control", &SubscriptionHandle::test_fail_next_control);
+  subscription.def(
+    "_test_fail_next_typed_receive", &SubscriptionHandle::test_fail_next_typed_receive,
+    py::call_guard<py::gil_scoped_release>());
   bind_subscriber_testing(module);
 #endif
 }
