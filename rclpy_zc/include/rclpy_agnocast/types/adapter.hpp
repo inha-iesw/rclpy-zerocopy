@@ -52,7 +52,7 @@ namespace types
  * published types headers, and for incompatible provider-instantiated template semantics.
  * Header content digests additionally reject stale providers after compatible fixes without a bump.
  */
-constexpr std::uint32_t ADAPTER_ABI_VERSION = 2;
+constexpr std::uint32_t ADAPTER_ABI_VERSION = 3;
 
 /**
  * @brief Compute the ABI fingerprint of the including translation unit.

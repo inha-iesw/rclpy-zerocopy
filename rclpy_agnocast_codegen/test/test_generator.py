@@ -144,7 +144,7 @@ def test_generation_is_deterministic_and_confined_to_output(shares, tmp_path):
     assert source_before == {path: path.read_bytes() for path in source_before}
     manifest = json.loads((first / 'manifest.json').read_text())
     assert manifest == {
-        'manifest_version': 1, 'adapter_abi': 2, 'build_abi': 'test-abi',
+        'manifest_version': 1, 'adapter_abi': 3, 'build_abi': 'test-abi',
         'provider': 'sample_provider', 'module': 'sample_provider._adapter',
         'library': 'lib/python/sample_provider/_adapter.so',
         'types': {name: describe_type(name, shares) for name in
@@ -154,6 +154,7 @@ def test_generation_is_deterministic_and_confined_to_output(shares, tmp_path):
     assert '#include "sample/msg/detail/tree__struct.hpp"' in source
     assert '#include "sample/msg/detail/tree__traits.hpp"' in source
     assert 'sizeof(sample::msg::Tree)' in source
+    assert '&create_subscription_endpoint<sample::msg::Tree>' in source
     assert 'alignof(sample::msg::Tree)' in source
     assert hashlib.sha256((first / 'manifest.json').read_bytes()).hexdigest() in source
     assert 'register_provider(provider, expected_manifest_digest)' in source

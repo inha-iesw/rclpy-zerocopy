@@ -14,7 +14,7 @@ from .schema import _describe_type
 
 _IDENTIFIER = re.compile(r'[A-Za-z_][A-Za-z_0-9]*\Z')
 # Change deliberately when the generator supports a new descriptor contract.
-_SUPPORTED_ADAPTER_ABI = 2
+_SUPPORTED_ADAPTER_ABI = 3
 
 
 def _field_operations(messages):
@@ -135,7 +135,7 @@ def generate(provider, module, ros_types, package_shares, build_abi, output_dir,
         cpp_type = name.replace('/', '::')
         operations.append(
             f'const TypeOps type_{index}' + '{' + roots[name] +
-            f', &create_endpoint<{cpp_type}>' + '};')
+            f', &create_endpoint<{cpp_type}>, &create_subscription_endpoint<{cpp_type}>' + '};')
         fields_json = json.dumps(schema['fields'], sort_keys=True, separators=(',', ':'))
         descriptors.append(
             '      TypeDescriptor{' + json.dumps(name) + ', ' +

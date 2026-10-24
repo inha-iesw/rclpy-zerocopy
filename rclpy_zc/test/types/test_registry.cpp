@@ -36,10 +36,16 @@ using rclpy_agnocast::types::error_status;
 using rclpy_agnocast::types::ErrorCode;
 using rclpy_agnocast::types::TypeOps;
 
+Status unused_subscription(
+  void *, const char *, std::size_t, void *, void *,
+  rclpy_agnocast::types::NativeReceive,
+  rclpy_agnocast::types::NativeSubscriptionEndpoint *) noexcept
+{return {rclpy_agnocast::types::ErrorCode::kUnsupported, "fixture has no subscription"};}
+
 const FieldOps root_ops = message_ops<std::uint64_t[2]>(nullptr, 0);
 Status unused_factory(void *, const char *, std::size_t, NativeEndpoint *) noexcept
 {return error_status(ErrorCode::kUnsupported, "registry fixture has no endpoint");}
-const TypeOps operations{&root_ops, unused_factory};
+const TypeOps operations{&root_ops, unused_factory, unused_subscription};
 
 ProviderDescriptor provider(const std::string & suffix)
 {
@@ -221,9 +227,20 @@ TEST(TypeRegistry, ExecutableOperationsCannotBeReplacedUnderIdenticalMetadata)
 {
   auto batch = provider("OperationsReplace");
   register_provider(batch, batch.manifest_digest);
-  const TypeOps replacement{&root_ops, unused_factory};
+  const TypeOps replacement{&root_ops, unused_factory, unused_subscription};
   batch.types.front().ops = &replacement;
   EXPECT_THROW(register_provider(batch, batch.manifest_digest), std::invalid_argument);
   EXPECT_EQ(registered_type("fixture/msg/OperationsReplace").ops, &operations);
+}
+
+TEST(TypeRegistry, MissingSubscriberFactoryRejectsProviderBeforeMutation)
+{
+  auto batch = provider("MissingSubscriber");
+  const TypeOps incomplete{&root_ops, unused_factory};
+  batch.types.front().ops = &incomplete;
+  EXPECT_THROW(register_provider(batch, batch.manifest_digest), std::invalid_argument);
+  EXPECT_THROW(registered_type("fixture/msg/MissingSubscriber"), std::out_of_range);
+  batch.types.front().ops = &operations;
+  EXPECT_NO_THROW(register_provider(batch, batch.manifest_digest));
 }
 }  // namespace

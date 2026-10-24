@@ -203,7 +203,7 @@ void validate(const ProviderDescriptor & descriptor, const std::string & expecte
     if (!names.insert(type.ros_type).second) {
       throw std::invalid_argument("duplicate adapter type in provider: " + type.ros_type);
     }
-    if (!type.ops || !type.ops->create || !type.ops->root ||
+    if (!type.ops || !type.ops->create || !type.ops->subscribe || !type.ops->root ||
       type.ops->root->kind != FieldKind::kMessage ||
       type.ops->root->item_size != type.native_size)
     {

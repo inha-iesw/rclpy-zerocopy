@@ -30,8 +30,14 @@ Status fail_creation(void *, const char *, std::size_t, NativeEndpoint * endpoin
   }
 }
 
+Status unused_subscription(
+  void *, const char *, std::size_t, void *, void *,
+  rclpy_agnocast::types::NativeReceive,
+  rclpy_agnocast::types::NativeSubscriptionEndpoint *) noexcept
+{return {rclpy_agnocast::types::ErrorCode::kUnsupported, "fixture has no subscription"};}
+
 const auto root = message_ops<std::int64_t>(nullptr, 0);
-const TypeOps operations{&root, fail_creation};
+const TypeOps operations{&root, fail_creation, unused_subscription};
 const ProviderDescriptor provider{
   ADAPTER_ABI_VERSION, "lifetime_test_provider", "lifetime_test_provider._plugin",
   compiled_abi_tag(), std::string(64, 'a'),

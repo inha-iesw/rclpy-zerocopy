@@ -66,10 +66,12 @@ struct FieldMember
  *
  * Every callback catches exceptions locally. References are non-owning and valid only while
  * the root is alive and its structure is unchanged. resize runs exclusively on the publisher
- * worker. Scalar access runs on the loan creator thread. dynamic_bytes excludes this object's
+ * worker. Mutable loan access runs on its creator thread. dynamic_bytes excludes this object's
  * inline sizeof storage, includes capacity and nested allocations, and checks overflow.
  * minimum_resize_bytes reports a pre-allocation lower bound for this container alone;
  * nested storage and growth slack are checked by dynamic_bytes after resize.
+ * size, child, read, buffer and dynamic_bytes must not mutate storage: subscriber roots
+ * invoke these callbacks on immutable native messages, possibly from different threads.
  * Unavailable operations are null. bound is SIZE_MAX for unbounded containers.
  */
 struct FieldOps
@@ -111,11 +113,44 @@ struct NativeEndpoint
 };
 
 /**
+ * @brief Transfer one immutable native reference from the provider to the runtime.
+ *
+ * receive owns owner on entry and must invoke release exactly once, including admission
+ * rejection and allocation failures. root remains valid until release(owner) completes.
+ */
+struct NativeReceived
+{
+  const void * root{nullptr};
+  void * owner{nullptr};
+  void (* release)(void * owner) noexcept = nullptr;
+};
+
+/** @brief Native receive entry point; a failed Status carries no message ownership. */
+using NativeReceive = void (*)(void * context, NativeReceived message, Status status) noexcept;
+
+/**
+ * @brief Type-erased subscription controlled by the subscriber runtime.
+ *
+ * Creation and graph queries run on the subscriber executor. destroy runs only after
+ * callbacks are joined/detached and admitted references are gone; after executor join,
+ * the closing caller may run destruction. The runtime retains the node/session throughout.
+ * publisher_count reports native graph state without exceptions crossing the provider ABI.
+ */
+struct NativeSubscriptionEndpoint
+{
+  void * object{nullptr};
+  void (* destroy)(void * object) noexcept = nullptr;
+  Status (* publisher_count)(void * object, std::size_t * count) noexcept = nullptr;
+};
+
+/**
  * @brief Executable operations registered atomically with the type's schema metadata.
  *
  * create receives a non-null agnocast::Node pointer and a borrowed null-terminated topic.
  * It constructs a native publisher on the worker and writes a complete endpoint on success;
  * failures leave the output empty. root and callback code remain pinned for process lifetime.
+ * subscribe additionally borrows a pointer to rclcpp::CallbackGroup::SharedPtr, copied by
+ * the provider. context must remain alive until the endpoint is detached and destroyed.
  */
 struct TypeOps
 {
@@ -123,6 +158,10 @@ struct TypeOps
   Status (* create)(
     void * node, const char * topic, std::size_t depth,
     NativeEndpoint * endpoint) noexcept;
+  Status (* subscribe)(
+    void * node, const char * topic, std::size_t depth, void * callback_group,
+    void * context, NativeReceive receive,
+    NativeSubscriptionEndpoint * endpoint) noexcept = nullptr;
 };
 
 /** @brief Runtime-owned exception for an explicitly unsupported field operation. */

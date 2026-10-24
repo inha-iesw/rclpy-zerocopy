@@ -104,7 +104,7 @@ def test_generator_rejects_unsupported_adapter_header_version(generated_source):
     installed = (Path(get_package_prefix('rclpy_agnocast')) /
                  'include' / header.relative_to(headers))
     contents = installed.read_text()
-    changed = contents.replace('ADAPTER_ABI_VERSION = 2', 'ADAPTER_ABI_VERSION = 3')
+    changed = contents.replace('ADAPTER_ABI_VERSION = 3', 'ADAPTER_ABI_VERSION = 4')
     assert changed != contents, 'The installed adapter ABI fixture is stale'
     header.write_text(changed)
     result = _compile(generated_source, 'std::int32_t value;', 4)
