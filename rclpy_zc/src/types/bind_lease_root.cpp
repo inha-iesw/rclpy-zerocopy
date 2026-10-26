@@ -5,6 +5,7 @@
 #include <memory>
 #include <utility>
 #include "lease_root.hpp"
+#include "../tensor/bindings.hpp"
 
 namespace py = pybind11;
 namespace rclpy_agnocast
@@ -72,6 +73,9 @@ void bind_lease_root(py::module_ & module)
   root
   .def("info", &field_info)
   .def("read", &read)
+  .def("tensor_info", &tensor::tensor_info<RootLeaseOwner>)
+  .def("dlpack", &tensor::subscriber_capsule)
+  .def_static("discard_dlpack", &tensor::discard_capsule)
   .def(
     "text_bytes", [](const RootLeaseOwner & root, const FieldPath & path,
     std::uint64_t generation) {

@@ -18,6 +18,10 @@ namespace rclpy_agnocast
 void bind_subscriber(py::module_ & module);
 #ifdef BUILD_TESTING
 void bind_observation(py::module_ & module);
+namespace tensor
+{
+void bind_testing(py::module_ & module);
+}
 #endif
 namespace binding_detail
 {
@@ -138,5 +142,6 @@ PYBIND11_MODULE(_native, module)
   rclpy_agnocast::bind_runtime(module);
 #ifdef BUILD_TESTING
   rclpy_agnocast::bind_observation(module);
+  rclpy_agnocast::tensor::bind_testing(module);
 #endif
 }

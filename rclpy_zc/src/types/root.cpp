@@ -186,6 +186,18 @@ void RootOwner::resize(const FieldPath & path, std::uint64_t generation, std::si
     throw;
   }
 }
+#ifdef BUILD_TESTING
+const void * RootOwner::native_data(const FieldPath & path, std::uint64_t generation) const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto ref = resolve(path, generation);
+  if (!ref.ops->buffer) {throw std::invalid_argument("field does not support a buffer");}
+  BufferSpan span;
+  check_status(ref.ops->buffer(ref, &span));
+  return span.data;
+}
+#endif
+
 BufferSpan RootOwner::acquire_export(const FieldPath & path, std::uint64_t generation)
 {
   std::lock_guard<std::mutex> lock(mutex_);

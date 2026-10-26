@@ -28,6 +28,7 @@
 
 #include "queue.hpp"
 #include "native.hpp"
+#include "agnocast/agnocast_utils.hpp"
 
 namespace py = pybind11;
 namespace rclpy_agnocast
@@ -102,6 +103,7 @@ bool wait_holding_gil(
 
 void bind_subscriber_testing(py::module_ & module)
 {
+  module.def("_test_agnocast_shm_name", &agnocast::create_shm_name);
   py::class_<TestSubscription>(module, "_TestSubscription")
   .def(py::init<std::size_t, std::size_t>())
   .def("push", &TestSubscription::push)

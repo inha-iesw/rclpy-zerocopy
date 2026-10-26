@@ -122,11 +122,27 @@ class Field(_Proxy):
         Export native-endian elements, read-only for a received message.
 
         A producer export freezes structure. Release views and consumers before publish.
-        Consumers must release before their source view; use the Tensor API once available
-        for independent Tensor ownership. Packed boolean sequences reject export.
+        Consumers must release before their source view; use as_tensor() for independent
+        Tensor ownership. Packed boolean sequences reject export.
         String buffers hold UTF-8 bytes or native-endian UTF-16 code units.
         """
         return self._owner.buffer(self._path, self._generation)
+
+    def as_tensor(self, *, shape=None):
+        """
+        Share a dense native-endian numeric field with a CPU Torch Tensor, without copying.
+
+        Shape defaults to (len(field),); its product must equal the native element count.
+        Contiguous stride volume must fit int64 even for empty shapes, so some empty
+        shapes accepted by Torch are rejected before native storage is exported.
+        Torch is optional until this call. Producer Tensor storage, including slice/detach
+        aliases, must be released before publish or cancel. Received tensors require an
+        actual read-only mapping from another process and retain the whole root budget.
+        Use read-only operations or clone() on received tensors: in-place writes can fault
+        at the OS mapping boundary. Direct raw-pointer/frombuffer escape is unsupported.
+        """
+        from ..tensor import as_tensor
+        return as_tensor(self._owner, self._path, self._generation, shape=shape)
 
     def to_text(self):
         """Explicitly copy and decode a string without changing the preparation phase."""

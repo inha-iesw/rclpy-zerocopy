@@ -88,6 +88,7 @@ pybind11_add_module(_native MODULE
   src/types/bindings.cpp
   src/types/bind_root.cpp
   src/types/bind_lease_root.cpp
+  src/tensor/bindings.cpp
 )
 target_compile_features(_native PRIVATE cxx_std_17)
 target_link_libraries(_native PRIVATE rclpy_agnocast_native rclpy_agnocast_types)
@@ -128,6 +129,8 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_type_native_abi test/types/test_native_abi.py TIMEOUT 60)
   ament_add_pytest_test(test_type_bindings test/types/test_bindings.py TIMEOUT 60)
   ament_add_pytest_test(test_type_lease_bindings test/types/test_lease_bindings.py TIMEOUT 60)
+  ament_add_pytest_test(test_cpu_tensor test/tensor/test_cpu_tensor.py TIMEOUT 120)
+  ament_add_pytest_test(test_cpu_tensor_readonly test/tensor/test_readonly.py TIMEOUT 120)
   ament_add_pytest_test(test_compat_node test/compat/test_node.py TIMEOUT 60)
   ament_add_pytest_test(test_typed_subscriber_api test/subscriber/test_typed_api.py TIMEOUT 60)
   ament_add_pytest_test(test_typed_subscriber_dispatch test/subscriber/test_typed_dispatch.py
@@ -139,6 +142,7 @@ if(BUILD_TESTING)
   target_sources(_native PRIVATE src/publisher/bind_observation.cpp)
   target_sources(_native PRIVATE src/subscriber/bind_testing.cpp)
   target_sources(_native PRIVATE src/types/bind_testing.cpp)
+  target_sources(_native PRIVATE src/tensor/bind_testing.cpp)
 
   ament_add_pytest_test(test_subscriber_lease test/subscriber/test_lease.py TIMEOUT 60)
   ament_add_pytest_test(test_subscriber_dispatch test/subscriber/test_dispatch.py

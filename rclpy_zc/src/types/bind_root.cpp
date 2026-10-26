@@ -6,6 +6,7 @@
 #include <string>
 #include <utility>
 #include "root.hpp"
+#include "../tensor/bindings.hpp"
 
 namespace py = pybind11;
 namespace rclpy_agnocast
@@ -113,9 +114,13 @@ void bind_root(py::module_ & module)
     module, "_TypedBuffer",
     py::buffer_protocol())
   .def_buffer(&BufferOwner::buffer);
-  py::class_<RootOwner, std::shared_ptr<RootOwner>>(module, "_RootOwner")
+  auto root = py::class_<RootOwner, std::shared_ptr<RootOwner>>(module, "_RootOwner");
+  root
   .def("info", &field_info)
   .def("read", &read)
+  .def("tensor_info", &tensor::tensor_info<RootOwner>)
+  .def("dlpack", &tensor::producer_capsule)
+  .def_static("discard_dlpack", &tensor::discard_capsule)
   .def(
     "text_bytes", [](const RootOwner & root, const FieldPath & path, std::uint64_t generation) {
       return py::bytes(root.text_bytes(path, generation));
@@ -160,6 +165,13 @@ void bind_root(py::module_ & module)
       result["exports"] = value.exports;
       return result;
     });
+#ifdef BUILD_TESTING
+  root.def(
+    "_native_data_address", [](const RootOwner & owner, const FieldPath & path,
+    std::uint64_t generation) {
+      return reinterpret_cast<std::uintptr_t>(owner.native_data(path, generation));
+    }, py::arg("path"), py::arg("generation") = 0);
+#endif
 }
 }  // namespace types
 }  // namespace rclpy_agnocast

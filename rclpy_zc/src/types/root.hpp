@@ -62,6 +62,10 @@ public:
   void abandon() noexcept;
   RootSnapshot snapshot() const;
   std::uintptr_t publisher_id() const {return publisher_id_;}
+#ifdef BUILD_TESTING
+  // Address observation must not acquire an export or freeze the loan's structure.
+  const void * native_data(const FieldPath & path, std::uint64_t generation) const;
+#endif
 
 private:
   RootOwner(
