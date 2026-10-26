@@ -131,6 +131,12 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_type_lease_bindings test/types/test_lease_bindings.py TIMEOUT 60)
   ament_add_pytest_test(test_cpu_tensor test/tensor/test_cpu_tensor.py TIMEOUT 120)
   ament_add_pytest_test(test_cpu_tensor_readonly test/tensor/test_readonly.py TIMEOUT 120)
+  ament_add_pytest_test(test_cpu_tensor_system test/tensor/test_system.py
+    ENV "RCLPY_AGNOCAST_SUBSCRIBER=$<TARGET_FILE:rclpy_agnocast_shared_buffer_subscriber>"
+    APPEND_ENV "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/test"
+    TIMEOUT 300)
+  set_tests_properties(test_cpu_tensor_system PROPERTIES
+    LABELS "pytest;system;requires_kernel_module;requires_heaphook")
   ament_add_pytest_test(test_compat_node test/compat/test_node.py TIMEOUT 60)
   ament_add_pytest_test(test_typed_subscriber_api test/subscriber/test_typed_api.py TIMEOUT 60)
   ament_add_pytest_test(test_typed_subscriber_dispatch test/subscriber/test_typed_dispatch.py

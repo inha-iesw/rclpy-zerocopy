@@ -2,8 +2,6 @@
 
 import ctypes
 
-import numpy as np
-
 
 def receipt_settled(subscription, expected):
     """Require the native receipt, reference resets, and live budget to agree."""
@@ -46,6 +44,8 @@ def buffer_address(view):
 
 def inspect(lease, observation):
     """Validate every byte, RO enforcement, and three addresses on one real Lease."""
+    import numpy as np
+
     sequence = lease.sequence
     view = lease.buffer
     array = np.frombuffer(view, dtype=np.uint8)
