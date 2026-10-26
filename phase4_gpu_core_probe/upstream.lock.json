@@ -1,0 +1,29 @@
+{
+  "repository": "https://github.com/dskkato/ros2_cuda_ipc",
+  "revision": "0e8933c8e58ffa7f1240a4c9efda3a2b84e5398c",
+  "archive_sha256": "1d2f66a1f00a029cea17004b92e685875569c90aabbea9c61f7473614428a17f",
+  "patches": [],
+  "components": {
+    "ros2_cuda_ipc_msgs": {"version": "0.5.0", "license": "MIT"},
+    "ros2_cuda_ipc_core": {"version": "0.5.0", "license": "MIT"},
+    "ros2_cuda_ipc_image": {"version": "0.5.0", "license": "MIT"},
+    "ros2_cuda_ipc_pointcloud2": {"version": "0.5.0", "license": "MIT"},
+    "ros2_cuda_ipc_py": {"version": "0.5.0", "license": "MIT"},
+    "examples/multi_process_image_fanout": {"version": "0.5.0", "license": "MIT"}
+  },
+  "contract_sha256": {
+    "LICENSE": "3c537d37d4f97aeacb29eed44e7fa2a079e642efc66937936baaad15772fa598",
+    "ros2_cuda_ipc_msgs/msg/BufferCore.msg": "53fd660c49657b356d470ce7bc948eec1f408ebb3a8e3debfd719e641b24c13b",
+    "ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/buffer_metadata/buffer_metadata.hpp": "1e1cac60347d07fa38fac6ed949292ea25b9289587ba8fcdf5c2ade006e458b5",
+    "ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/transport/buffer_descriptor.hpp": "90363f8d5ff0db20c8f1e98dc34f674ffda49c67ce9e2f0c1721a6a5f51462bc"
+  },
+  "dlpack": {
+    "repository": "https://github.com/dmlc/dlpack",
+    "tag": "v1.3",
+    "revision": "84d107bf416c6bab9ae68ad285876600d230490d",
+    "archive_sha256": "9978ddb7f533fcee7e0c0ab81a978257d3f8dc475eb83319a5e632738cafb271",
+    "license": "Apache-2.0",
+    "cmake_override": "FETCHCONTENT_SOURCE_DIR_DLPACK",
+    "cmake_options": {"BUILD_MOCK": "OFF"}
+  }
+}
