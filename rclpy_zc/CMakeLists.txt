@@ -42,8 +42,10 @@ add_library(rclpy_agnocast_core STATIC
   src/publisher_worker.cpp
   src/subscriber/lease.cpp
   src/subscriber/queue.cpp
+  src/subscriber/provenance.cpp
   src/types/root.cpp
   src/types/lease_root.cpp
+  src/tensor/export.cpp
 )
 target_compile_features(rclpy_agnocast_core PUBLIC cxx_std_17)
 target_include_directories(rclpy_agnocast_core PUBLIC
@@ -110,6 +112,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_type_root test/types/test_root.cpp)
   target_include_directories(test_type_root PRIVATE src)
   target_link_libraries(test_type_root rclpy_agnocast_core)
+  ament_add_gtest(test_tensor_export test/tensor/test_export.cpp)
+  target_include_directories(test_tensor_export PRIVATE src)
+  target_link_libraries(test_tensor_export rclpy_agnocast_core)
   add_library(test_type_provider MODULE test/types/provider_library.cpp)
   target_link_libraries(test_type_provider PRIVATE rclpy_agnocast_types)
   set_target_properties(test_type_provider PROPERTIES

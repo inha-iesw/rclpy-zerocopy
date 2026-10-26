@@ -3,6 +3,7 @@
 #include "lease_root.hpp"
 #include <stdexcept>
 #include <utility>
+#include "../subscriber/provenance.hpp"
 
 namespace rclpy_agnocast
 {
@@ -73,6 +74,16 @@ BufferSpan RootLeaseOwner::buffer(const FieldPath & path, std::uint64_t generati
   {
     throw BufferBusy("invalid or oversized native buffer");
   }
+  return span;
+}
+
+BufferSpan RootLeaseOwner::foreign_readonly_buffer(
+  const FieldPath & path, std::uint64_t generation) const
+{
+  const auto span = buffer(path, generation);
+  const auto & received = owner_->buffer();
+  require_readonly_mapping(
+    received.typed_root, received.descriptor->native_size, span.data, span.size * span.item_size);
   return span;
 }
 }  // namespace types

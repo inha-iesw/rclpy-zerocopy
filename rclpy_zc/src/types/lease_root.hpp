@@ -22,6 +22,8 @@ public:
   ScalarValue read(const FieldPath & path, std::uint64_t generation) const;
   std::string text_bytes(const FieldPath & path, std::uint64_t generation) const;
   BufferSpan buffer(const FieldPath & path, std::uint64_t generation) const;
+  // Raw-pointer consumers require OS-enforced foreign RO storage, beyond buffer flags.
+  BufferSpan foreign_readonly_buffer(const FieldPath & path, std::uint64_t generation) const;
   std::size_t accounted_bytes() const noexcept {return owner_->buffer().size;}
 #ifdef BUILD_TESTING
   const void * native_root() const noexcept {return owner_->buffer().typed_root;}
