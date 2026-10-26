@@ -1,0 +1,2384 @@
+--- a/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/backend/memory_backend.hpp
++++ b/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/backend/memory_backend.hpp
+@@ -48,4 +48,11 @@
+                             std::vector<GpuBufferBlock>& blocks);
+ void destroy_vmm_fd_memory(std::vector<GpuBufferBlock>& blocks) noexcept;
+ 
++/**
++ * @brief Close idle VMM resources, retaining identities on any failed cleanup.
++ * @param blocks Owning block vector; failed resources remain owned.
++ * @return true when all resources were released, false on cleanup failure.
++ */
++bool try_destroy_vmm_fd_memory(std::vector<GpuBufferBlock>& blocks) noexcept;
++
+ }  // namespace ros2_cuda_ipc_core::backend
+--- a/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/backend/memory_importer.hpp
++++ b/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/backend/memory_importer.hpp
+@@ -29,12 +29,14 @@
+         context(std::move(other.context)),
+         vmm_address(other.vmm_address),
+         vmm_allocation(other.vmm_allocation),
+-        allocation_size(other.allocation_size) {
++        allocation_size(other.allocation_size),
++        vmm_mapped(other.vmm_mapped) {
+     other.dev_ptr = nullptr;
+     other.event = nullptr;
+     other.vmm_address = 0;
+     other.vmm_allocation = 0;
+     other.allocation_size = 0;
++    other.vmm_mapped = false;
+   }
+ 
+   void* dev_ptr = nullptr;
+@@ -43,13 +45,22 @@
+   CUdeviceptr vmm_address = 0;
+   CUmemGenericAllocationHandle vmm_allocation = 0;
+   std::size_t allocation_size = 0;
++  bool vmm_mapped = false;
+ };
+ 
+ class VmmFdMemoryImporter {
+  public:
++  /**
++   * @brief Import one VMM descriptor without caching GPU state.
++   * @param msg Validated bounded descriptor.
++   * @param event_handle Producer IPC completion event.
++   * @param cleanup_failed Optional nonowning output set on partial cleanup failure.
++   * @return Resource owner or empty; failed cleanup requires process epoch poison.
++   */
+   std::optional<ImportedResources> import(
+       const ros2_cuda_ipc_msgs::msg::BufferCore& msg,
+-      const CUipcEventHandle& event_handle) const;
++      const CUipcEventHandle& event_handle,
++      bool* cleanup_failed = nullptr) const;
+ };
+ 
+ bool release_imported_resources(const ImportedResources& imported) noexcept;
+--- a/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/buffer_metadata/buffer_ref.hpp
++++ b/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/buffer_metadata/buffer_ref.hpp
+@@ -14,6 +14,9 @@
+ /// Internal RAII owner for one process-shared reference to one GPU block.
+ class BufferRef {
+  public:
++  /** @brief Exclusive writer marker; incompatible with the legacy namespace. */
++  static constexpr uint32_t kWriter = UINT32_MAX;
++
+   struct PublisherReservation {
+     std::shared_ptr<BufferMetadata> mapping;
+     uint64_t uid = 0;
+--- a/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/detail/buffer_metadata_cache.hpp
++++ b/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/detail/buffer_metadata_cache.hpp
+@@ -25,8 +25,7 @@
+   explicit BufferMetadataCache(AttachFn attach_fn = [](uint32_t publisher_pid,
+                                                        uint32_t block_id) {
+     return buffer_metadata::BufferMetadata::attach(
+-        "/ros2_cuda_ipc_" + std::to_string(publisher_pid) + "_" +
+-        std::to_string(block_id));
++        buffer_metadata::shm_name_for_block(publisher_pid, block_id));
+   });
+   ~BufferMetadataCache();
+ 
+--- a/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/detail/cuda_driver_context.hpp
++++ b/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/detail/cuda_driver_context.hpp
+@@ -109,14 +109,35 @@
+   /**
+    * @brief Retain the primary context for a validated CUDA device ordinal.
+    *
+-   * CUDA failures are returned in the result. Allocation of the wrapper can
+-   * still throw std::bad_alloc after the CUDA retain succeeds; that path
+-   * balances the retain before propagating the exception.
++   * CUDA failures are returned in the result. Wrapper and shared ownership
++   * storage are allocated before retaining CUDA state, so allocation failure
++   * cannot leak or double-release a retained primary context. A failed primary
++   * release permanently rejects later retains; the ambiguous driver retain is
++   * left untouched until process restart. Manager/mapper admission bounds the
++   * owners already in flight when failure is observed.
+    */
+   static CudaResult<std::shared_ptr<CudaDeviceContext>> retain_primary(
+       int device_id);
+ 
++  /**
++   * @brief Inspect sticky primary-release failure shared by this process.
++   * @return true when new manager/mapper admission must remain disabled.
++   */
++  static bool primary_release_failed() noexcept;
++
+   CudaResult<CudaContextGuard> push_current() const;
++
++  /**
++   * @brief Validate a stream identity before exposing or submitting GPU work.
++   *
++   * Default/legacy streams require this primary context to be current during
++   * admission. Bound owners push it before cleanup on any host thread.
++   * Per-thread sentinel streams are rejected because
++   * movable owners cannot preserve their host-thread identity.
++   * @param stream Explicit primary-context stream or primary default stream.
++   * @return true only when the exact retained context owns the stream.
++   */
++  bool owns_stream(CUstream stream) const noexcept;
+ 
+   int device_id() const noexcept { return device_id_; }
+   CUdevice device() const noexcept { return device_; }
+--- a/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/detail/interprocess_event.hpp
++++ b/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/detail/interprocess_event.hpp
+@@ -15,8 +15,15 @@
+ /// Owns one publisher-side interprocess event and its exported IPC handle.
+ class InterprocessEvent {
+  public:
+-  static CudaResult<std::unique_ptr<InterprocessEvent>> create(
+-      std::shared_ptr<CudaDeviceContext> context);
++  /**
++   * @brief Allocate ownership before creating or exporting the CUDA event.
++   * @param context Retained primary context.
++   * @param owner Initially empty output; retains partial event state on failure.
++   * @return Creation/export status; caller must close or quarantine failed owner.
++   */
++  static CudaResult<void> create(
++      std::shared_ptr<CudaDeviceContext> context,
++      std::unique_ptr<InterprocessEvent>& owner);
+ 
+   ~InterprocessEvent() noexcept;
+ 
+@@ -26,6 +33,18 @@
+   InterprocessEvent& operator=(InterprocessEvent&&) = delete;
+ 
+   CudaResult<void> record(CUstream stream) const noexcept;
++
++  /**
++   * @brief Query completion without blocking the host.
++   * @return CUDA_SUCCESS, CUDA_ERROR_NOT_READY, or the fail-closed CUDA error.
++   */
++  CUresult query() const noexcept;
++
++  /**
++   * @brief Destroy a completed event, preserving identity on CUDA failure.
++   * @return true when the event was destroyed or already closed.
++   */
++  bool try_close() noexcept;
+ 
+   const transport::EventHandlePayload& ipc_handle() const noexcept {
+     return ipc_handle_;
+--- a/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/detail/mapped_publication.hpp
++++ b/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/detail/mapped_publication.hpp
+@@ -34,10 +34,12 @@
+  private:
+   MappedPublication(std::shared_ptr<const backend::ImportedResources> resource,
+                     std::unique_ptr<buffer_metadata::BufferRef> buffer_ref,
+-                    std::size_t byte_size, int device_id) noexcept;
++                    std::size_t byte_size, int device_id,
++                    std::shared_ptr<void> admission = {}) noexcept;
+ 
+   std::shared_ptr<const backend::ImportedResources> resource_;
+   std::unique_ptr<buffer_metadata::BufferRef> buffer_ref_;
++  std::shared_ptr<void> admission_;
+   std::size_t byte_size_ = 0;
+   int device_id_ = -1;
+ 
+--- a/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/detail/read_handle_factory.hpp
++++ b/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/detail/read_handle_factory.hpp
+@@ -20,7 +20,8 @@
+   static std::unique_ptr<MappedPublication> make_publication(
+       std::shared_ptr<const backend::ImportedResources> resource,
+       std::unique_ptr<buffer_metadata::BufferRef> buffer_ref,
+-      std::size_t byte_size, int device_id);
++      std::size_t byte_size, int device_id,
++                    std::shared_ptr<void> admission = {});
+ 
+   /// Enqueue the producer wait and commit the publication into a ReadHandle.
+   /// The publication retains ownership if any operation before the wait
+--- a/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/publisher/gpu_buffer_manager.hpp
++++ b/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/publisher/gpu_buffer_manager.hpp
+@@ -15,12 +15,12 @@
+ 
+ class GpuBufferManager;
+ 
+-/// Represents one active publish attempt.
+-///
+-/// The owning GpuBufferManager must outlive every PublishBlock created from
+-/// it. Calling GpuBufferManager::reset() invalidates block resource
+-/// operations. Destruction cancels an ordinary uncommitted reservation, while
+-/// a failed preparation intentionally retains its reservation until reset.
++/**
++ * @brief Exclusive publish reservation bound to one producer stream.
++ *
++ * The bound stream must outlive prepare/cancel. A block retains its pool even
++ * after manager destruction; abandonment records completion before release.
++ */
+ class PublishBlock {
+  public:
+   /// Move a publish block while transferring ownership of its reservation.
+@@ -42,8 +42,9 @@
+ 
+   /// Build the descriptor, record the ready event, and commit the reservation.
+   ///
+-  /// A successful return commits the Publisher reservation. A failed
+-  /// preparation leaves the block unavailable until GpuBufferManager::reset().
++  /// A successful return commits the publisher reservation. A caller stream
++  /// mismatch preserves a valid block for retry/cancel. Other preparation
++  /// failures poison the pool and require all involved GPU processes to restart.
+   /// The subsequent middleware publish result does not affect block lifecycle.
+   ///
+   /// @return The descriptor when preparation and commit succeed; a failed
+@@ -51,7 +52,7 @@
+   [[nodiscard]] detail::CudaResult<transport::BufferDescriptor> prepare_publish(
+       CUstream stream) noexcept;
+ 
+-  /// Cancel an active reservation. A failed preparation cannot be cancelled.
++  /// Cancel an active reservation, including after a caller stream mismatch.
+   void cancel() noexcept;
+ 
+   /// Check whether the block can still be used for publishing.
+@@ -61,18 +62,19 @@
+   /// Allow the manager to construct blocks only from valid reservations.
+   friend class GpuBufferManager;
+ 
+-  PublishBlock(GpuBufferManager* owner,
++  PublishBlock(std::shared_ptr<GpuBufferPool> owner,
+                GpuBufferPool::BlockReservation reservation) noexcept;
+   void move_from(PublishBlock&& other) noexcept;
+   void quarantine(const char* step,
+                   const detail::CudaDriverError* error = nullptr) noexcept;
+ 
+-  GpuBufferManager* owner_ = nullptr;
++  std::shared_ptr<GpuBufferPool> owner_;
+   GpuBufferPool::BlockReservation reservation_{};
+ };
+ 
+ /// Owns the GPU buffer pool and shared-memory block reservations used for
+-/// publishing.
++/// publishing. Failed primary-context release disables further GPU admission
++/// in this process until restart.
+ class GpuBufferManager {
+  public:
+   /// Configuration for a GPU buffer manager.
+@@ -90,7 +92,11 @@
+   /// Construct a manager with the given configuration.
+   explicit GpuBufferManager(Config config);
+ 
+-  /// Release manager-owned resources.
++  /**
++   * @brief Drop ownership without waiting for GPU/read completion.
++   * @note A final busy pool becomes a bounded draining epoch. Later initialise
++   * retries its close; actual terminal failures require process restart.
++   */
+   ~GpuBufferManager();
+ 
+   GpuBufferManager(const GpuBufferManager&) = delete;
+@@ -103,8 +109,20 @@
+   /// @return true when both pools are initialized successfully.
+   bool initialise();
+ 
+-  /// Release pool resources and reset the manager to an uninitialized state.
++  /// Attempt close; busy resources remain live and block replacement.
+   void reset() noexcept;
++
++  /**
++   * @brief Close an idle pool without freeing active GPU work or reads.
++   * @return true when closed, false while busy or poisoned.
++   */
++  bool try_close() noexcept;
++
++  /**
++   * @brief Distinguish terminal GPU failure from transient close activity.
++   * @return true when further GPU use requires process restart.
++   */
++  bool poisoned() const noexcept;
+ 
+   /// Check whether the block pool is initialized.
+   bool is_initialised() const noexcept;
+@@ -112,10 +130,13 @@
+   /// Return the process locator carried by every block descriptor.
+   uint32_t publisher_pid() const noexcept;
+ 
+-  /// Reserve a block for a new publish attempt.
+-  /// @return A publish block when a reservation is available; std::nullopt
+-  /// otherwise.
+-  [[nodiscard]] std::optional<PublishBlock> acquire_for_publish();
++  /**
++   * @brief Reserve a block for writes on one explicit stream.
++   * @param producer_stream Primary-context stream receiving every write; PER_THREAD rejected.
++   * @return A stream-bound reservation, or empty when unavailable.
++   */
++  [[nodiscard]] std::optional<PublishBlock> acquire_for_publish(
++      CUstream producer_stream);
+ 
+  private:
+   /// Allow a block to delegate resource operations to its owning manager
+@@ -133,7 +154,7 @@
+   bool cancel(const GpuBufferPool::BlockReservation& reservation) noexcept;
+ 
+   Config config_;
+-  GpuBufferPool buffer_pool_;
++  std::shared_ptr<GpuBufferPool> buffer_pool_;
+ };
+ 
+ }  // namespace ros2_cuda_ipc_core::publisher
+--- a/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/publisher/gpu_buffer_pool.hpp
++++ b/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/publisher/gpu_buffer_pool.hpp
+@@ -6,6 +6,7 @@
+ #include <cuda.h>
+ 
+ #include <cstdint>
++#include <atomic>
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+@@ -34,9 +35,15 @@
+     uint64_t uid = 0;
+     uint32_t publisher_pid = 0;
+     uint32_t pool_index = 0;
++    CUstream producer_stream = nullptr;
+   };
+ 
+   explicit GpuBufferPool(std::size_t block_count);
++  /**
++   * @brief Retain busy resources without waiting for producer/read completion.
++   * @note Healthy draining resources are closed by a later initialise retry;
++   * terminal CUDA failures require process restart.
++   */
+   ~GpuBufferPool();
+ 
+   GpuBufferPool(const GpuBufferPool&) = delete;
+@@ -45,7 +52,20 @@
+   GpuBufferPool& operator=(GpuBufferPool&&) = delete;
+ 
+   bool initialise(uint64_t byte_size, int device_index);
++  /** @brief Attempt close; a busy pool remains live. */
+   void reset() noexcept;
++  /**
++   * @brief Close only after every producer event and reader has completed.
++   * @return false while any reservation, read, or CUDA failure prevents close.
++   * @note Transient activity does not poison the pool. Final destruction retains
++   * a draining epoch; later initialise retries its close before allocating anew.
++   */
++  bool try_close() noexcept;
++  /**
++   * @brief Distinguish terminal failure from transient producer/read activity.
++   * @return true when this pool or process epoch requires process restart.
++   */
++  bool poisoned() const noexcept;
+   bool is_initialised() const noexcept { return initialised_; }
+   bool matches(uint64_t byte_size, int device_index) const noexcept;
+   std::size_t size() const noexcept { return blocks_.size(); }
+@@ -60,7 +80,12 @@
+                                         CUstream stream) noexcept;
+   const GpuBufferBlock* resources(uint32_t pool_index) const noexcept;
+ 
+-  std::optional<BlockReservation> reserve_for_publish();
++  /**
++   * @brief Reserve storage for writes on one stream until commit/cancel.
++   * @param producer_stream Stream kept valid through commit/cancel.
++   * @return Exclusive reservation, or empty when unavailable/poisoned.
++   */
++  std::optional<BlockReservation> reserve_for_publish(CUstream producer_stream);
+   void* device_ptr(const BlockReservation& reservation) const noexcept;
+   detail::CudaResult<void> record_ready(const BlockReservation& reservation,
+                                         CUstream stream) noexcept;
+@@ -70,9 +95,14 @@
+   bool cancel(const BlockReservation& reservation) noexcept;
+ 
+  private:
++  friend class PublishBlock;
+   /// Pool is a publisher-local block allocation and reuse strategy.
+   bool allocate_blocks();
+   void destroy_blocks() noexcept;
++  bool destroy_blocks_locked() noexcept;
++  static bool drain_retired_epoch() noexcept;
++  void retire_blocks() noexcept;
++  void mark_failed() noexcept;
+   bool owns(const BlockReservation& reservation) const noexcept;
+ 
+   std::size_t block_count_;
+@@ -83,6 +113,7 @@
+   int device_index_ = -1;
+   uint32_t publisher_pid_ = 0;
+   bool initialised_ = false;
++  std::atomic<bool> poisoned_{false};
+   std::shared_ptr<detail::CudaDeviceContext> context_;
+ };
+ 
+--- a/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/subscriber/buffer_mapper.hpp
++++ b/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/subscriber/buffer_mapper.hpp
+@@ -22,12 +22,26 @@
+ 
+ /// Maps a BufferCore descriptor into a stream-bound ReadHandle.
+ ///
+-/// An empty optional is the complete public failure result.  Detailed
+-/// buffer_ref, import, backend, and CUDA diagnostics are written to the
+-/// internal log.
++/// map returns an empty optional on failure; poisoned() distinguishes terminal
++/// cleanup failure from transient capacity or publication unavailability.
++/// Detailed import, reference, and CUDA diagnostics are written to the log.
+ class BufferMapper {
+  public:
+-  BufferMapper();
++  /** @brief Mandatory limits shared across every live process mapper alias. */
++  struct Config {
++    std::size_t max_inflight_reads = 0;
++    uint64_t max_message_bytes = 0;
++  };
++
++  /**
++   * @brief Join the process read epoch before any metadata or CUDA import.
++   * @param config Nonzero limits; concurrent live epochs must use equal limits.
++   * @throws std::invalid_argument If either limit is zero.
++   * @throws std::logic_error If a live epoch uses different limits.
++   * @note Failed GPU cleanup poisons the epoch until process restart. Failed
++   * primary-context release disables all new GPU admission in this process.
++   */
++  explicit BufferMapper(Config config);
+   ~BufferMapper();
+ 
+   BufferMapper(BufferMapper&&) noexcept;
+@@ -35,8 +49,20 @@
+   BufferMapper(const BufferMapper&) = delete;
+   BufferMapper& operator=(const BufferMapper&) = delete;
+ 
++  /**
++   * @brief Admit and map one publication, retaining its slot through GPU completion.
++   * @param msg Descriptor with nonzero size within configured message limit.
++   * @param consumer_stream Primary-context stream kept valid through destruction; PER_THREAD rejected.
++   * @return A read owner, or empty on capacity, descriptor, import or CUDA failure.
++   */
+   std::optional<ReadHandle> map(const ros2_cuda_ipc_msgs::msg::BufferCore& msg,
+                                 CUstream consumer_stream) const;
++
++  /**
++   * @brief Distinguish terminal cleanup failure from read-capacity exhaustion.
++   * @return true when this read epoch or primary-context state requires restart.
++   */
++  bool poisoned() const noexcept;
+ 
+  private:
+   friend std::unique_ptr<detail::MappedPublication> detail::acquire_publication(
+--- a/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/subscriber/read_handle.hpp
++++ b/ros2_cuda_ipc_core/include/ros2_cuda_ipc_core/subscriber/read_handle.hpp
+@@ -18,7 +18,8 @@
+ /// mapper.  Destroying the handle records consumer completion and keeps the
+ /// publication buffer_ref alive until that completion has been observed.  The
+ /// supplied consumer stream must remain valid until handle destruction has
+-/// completed the completion-event record.
++/// completed the completion-event record. Destruction may run on another host
++/// thread: a bound legacy/default stream uses the retained primary context.
+ class ReadHandle {
+  public:
+   ReadHandle() noexcept;
+--- a/ros2_cuda_ipc_core/src/backend/memory_backend.cpp
++++ b/ros2_cuda_ipc_core/src/backend/memory_backend.cpp
+@@ -15,6 +15,7 @@
+ #include <cerrno>
+ #include <cstring>
+ #include <memory>
++#include <limits>
+ #include <mutex>
+ #include <stdexcept>
+ #include <thread>
+@@ -36,7 +37,9 @@
+   if (remainder == 0) {
+     return value;
+   }
+-  return value + alignment - remainder;
++  const auto addition = alignment - remainder;
++  return value > std::numeric_limits<uint64_t>::max() - addition
++             ? 0 : value + addition;
+ }
+ 
+ /**
+@@ -141,11 +144,14 @@
+     running_.store(false, std::memory_order_release);
+     if (listen_fd_ >= 0) {
+       ::shutdown(listen_fd_, SHUT_RDWR);
++    }
++    if (worker_.joinable()) {
++      worker_.join();
++    }
++    // The worker reads listen_fd_; keep it unchanged until accept has exited.
++    if (listen_fd_ >= 0) {
+       ::close(listen_fd_);
+       listen_fd_ = -1;
+-    }
+-    if (worker_.joinable()) {
+-      worker_.join();
+     }
+     ::unlink(path_.c_str());
+   }
+@@ -210,7 +216,7 @@
+     cmsg->cmsg_type = SCM_RIGHTS;
+     cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+     std::memcpy(CMSG_DATA(cmsg), &fd_, sizeof(int));
+-    if (::sendmsg(client, &msg, 0) < 0) {
++    if (::sendmsg(client, &msg, MSG_NOSIGNAL) < 0) {
+       RCUTILS_LOG_WARN_NAMED(
+           "ros2_cuda_ipc_core.backend.vmm_fd", "sendmsg failed on %s: %s",
+           path_.c_str(), ros2_cuda_ipc_core::detail::errno_to_string().c_str());
+@@ -251,27 +257,40 @@
+  * the FD, and stops the Unix socket server.
+  */
+ struct VmmFdBlockState {
+-  ~VmmFdBlockState() {
+-    if (server) {
+-      server->stop();
+-      server.reset();
++  ~VmmFdBlockState() { (void)try_close(); }
++
++  bool try_close() noexcept {
++    try {
++      if (server) {
++        server->stop();
++        server.reset();
++      }
++    } catch (...) {
++      return false;
+     }
+     if (shareable_fd >= 0) {
+       ::close(shareable_fd);
+       shareable_fd = -1;
+     }
+-    if (address && allocation_size > 0) {
+-      cuMemUnmap(address, allocation_size);
+-      cuMemAddressFree(address, allocation_size);
++    if (mapped) {
++      if (cuMemUnmap(address, allocation_size) != CUDA_SUCCESS) return false;
++      mapped = false;
++    }
++    if (address && allocation_size) {
++      if (cuMemAddressFree(address, allocation_size) != CUDA_SUCCESS) return false;
++      address = 0;
+     }
+     if (allocation) {
+-      cuMemRelease(allocation);
+-    }
++      if (cuMemRelease(allocation) != CUDA_SUCCESS) return false;
++      allocation = 0;
++    }
++    return true;
+   }
+ 
+   CUmemGenericAllocationHandle allocation = 0;
+   CUdeviceptr address = 0;
+   std::size_t allocation_size = 0;
++  bool mapped = false;
+   int shareable_fd = -1;
+   std::string uuid;
+   std::unique_ptr<UnixFdServer> server;
+@@ -308,8 +327,11 @@
+   }
+ 
+   const uint64_t aligned_size = align_up(frame_size_bytes, granularity);
++  if (aligned_size == 0 || aligned_size > std::numeric_limits<std::size_t>::max())
++    return false;
+   for (auto& block : blocks) {
+-    auto state = std::make_unique<VmmFdBlockState>();
++    block.vmm_fd_state = std::make_unique<VmmFdBlockState>();
++    auto& state = block.vmm_fd_state;
+     state->allocation_size = aligned_size;
+ 
+     CUdeviceptr address = 0;
+@@ -343,6 +365,7 @@
+       return false;
+     }
+ 
++    state->mapped = true;
+     CUmemAccessDesc access_desc{};
+     access_desc.location = prop.location;
+     // Allow both read and write so publishers/subscribers can update content.
+@@ -395,17 +418,23 @@
+     // Store the socket path so subscribers know which socket to contact.
+     block.vmm_socket_path = socket_path;
+     block.device_ptr = reinterpret_cast<void*>(state->address);
+-    block.vmm_fd_state = std::move(state);
++
+   }
+   return true;
+ }
+ 
+-void destroy_vmm_fd_memory(std::vector<GpuBufferBlock>& blocks) noexcept {
++bool try_destroy_vmm_fd_memory(std::vector<GpuBufferBlock>& blocks) noexcept {
+   for (auto& block : blocks) {
++    if (block.vmm_fd_state && !block.vmm_fd_state->try_close()) return false;
+     block.device_ptr = nullptr;
+     block.vmm_fd_state.reset();
+     block.vmm_socket_path.clear();
+   }
++  return true;
+ }
+ 
++void destroy_vmm_fd_memory(std::vector<GpuBufferBlock>& blocks) noexcept {
++  (void)try_destroy_vmm_fd_memory(blocks);
++}
++
+ }  // namespace ros2_cuda_ipc_core::backend
+--- a/ros2_cuda_ipc_core/src/backend/memory_importer.cpp
++++ b/ros2_cuda_ipc_core/src/backend/memory_importer.cpp
+@@ -12,6 +12,7 @@
+ #include <cerrno>
+ #include <cstring>
+ #include <optional>
++#include <limits>
+ #include <string>
+ 
+ #include "ros2_cuda_ipc_core/detail/cuda_util.hpp"
+@@ -20,6 +21,20 @@
+ namespace ros2_cuda_ipc_core::backend {
+ 
+ namespace {
++
++// Imported SCM_RIGHTS FDs must close even when context/heap acquisition throws.
++class ScopedFd {
++ public:
++  explicit ScopedFd(int fd) noexcept : fd_(fd) {}
++  ~ScopedFd() noexcept { reset(); }
++  int get() const noexcept { return fd_; }
++  void reset() noexcept {
++    if (fd_ >= 0) ::close(fd_);
++    fd_ = -1;
++  }
++ private:
++  int fd_;
++};
+ 
+ std::size_t align_up_size(std::size_t value, std::size_t alignment) {
+   if (alignment == 0) {
+@@ -29,7 +44,9 @@
+   if (remainder == 0) {
+     return value;
+   }
+-  return value + alignment - remainder;
++  const auto addition = alignment - remainder;
++  return value > std::numeric_limits<std::size_t>::max() - addition
++             ? 0 : value + addition;
+ }
+ 
+ std::optional<int> request_fd_from_publisher(const std::string& path) {
+@@ -49,12 +66,12 @@
+     return std::nullopt;
+   }
+ 
++  ScopedFd socket_owner(sock);
+   sockaddr_un addr{};
+   addr.sun_family = AF_UNIX;
+   if (path.size() >= sizeof(addr.sun_path)) {
+     RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.backend.vmm_fd",
+                            "Socket path %s is too long", path.c_str());
+-    ::close(sock);
+     return std::nullopt;
+   }
+   std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+@@ -62,7 +79,6 @@
+     RCUTILS_LOG_WARN_NAMED(
+         "ros2_cuda_ipc_core.backend.vmm_fd", "connect(%s) failed: %s",
+         path.c_str(), ros2_cuda_ipc_core::detail::errno_to_string().c_str());
+-    ::close(sock);
+     return std::nullopt;
+   }
+ 
+@@ -74,12 +90,11 @@
+   msg.msg_iovlen = 1;
+   msg.msg_control = cmsg_buf;
+   msg.msg_controllen = sizeof(cmsg_buf);
+-  const ssize_t received = ::recvmsg(sock, &msg, 0);
++  const ssize_t received = ::recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
+   if (received <= 0) {
+     RCUTILS_LOG_WARN_NAMED(
+         "ros2_cuda_ipc_core.backend.vmm_fd", "recvmsg on %s failed: %s",
+         path.c_str(), ros2_cuda_ipc_core::detail::errno_to_string().c_str());
+-    ::close(sock);
+     return std::nullopt;
+   }
+ 
+@@ -89,13 +104,11 @@
+     RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.backend.vmm_fd",
+                            "recvmsg on %s missing SCM_RIGHTS payload",
+                            path.c_str());
+-    ::close(sock);
+     return std::nullopt;
+   }
+ 
+   int fd = -1;
+   std::memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
+-  ::close(sock);
+   if (fd < 0) {
+     RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.backend.vmm_fd",
+                            "recvmsg returned invalid fd for %s", path.c_str());
+@@ -108,7 +121,8 @@
+ 
+ std::optional<ImportedResources> VmmFdMemoryImporter::import(
+     const ros2_cuda_ipc_msgs::msg::BufferCore& msg,
+-    const CUipcEventHandle& event_handle) const {
++    const CUipcEventHandle& event_handle, bool* cleanup_failed) const {
++  if (cleanup_failed) *cleanup_failed = false;
+   const std::string& socket_path = msg.vmm_socket_path;
+   if (socket_path.size() >= sizeof(sockaddr_un::sun_path)) {
+     RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.backend.vmm_fd",
+@@ -122,13 +136,13 @@
+     return std::nullopt;
+   }
+ 
++  ScopedFd received_fd(*fd_opt);
+   auto context_result = detail::CudaDeviceContext::retain_primary(
+       static_cast<int>(msg.device_id));
+   if (!context_result) {
+     RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.backend.vmm_fd",
+                            "Failed to retain CUDA primary context: %s",
+                            context_result.error().to_string().c_str());
+-    ::close(fd_opt.value());
+     return std::nullopt;
+   }
+   auto context = std::move(context_result).value();
+@@ -137,20 +151,32 @@
+     RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.backend.vmm_fd",
+                            "Failed to activate CUDA context: %s",
+                            guard_result.error().to_string().c_str());
+-    ::close(fd_opt.value());
+     return std::nullopt;
+   }
+   auto guard = std::move(guard_result).value();
+ 
+-  ImportedResources imported;
++  auto holder = std::make_unique<ImportedResources>();
++  auto& imported = *holder;
+   imported.context = context;
++  struct PartialImport {
++    std::unique_ptr<ImportedResources>& value;
++    bool* failed;
++    bool armed = true;
++    ~PartialImport() noexcept {
++      if (armed && !release_imported_resources(*value)) {
++        if (failed) *failed = true;
++        // Preserve the CUDA identity and primary-context retain until exit.
++        (void)value.release();
++      }
++    }
++  } partial{holder, cleanup_failed};
+ 
+   void* os_handle =
+-      reinterpret_cast<void*>(static_cast<intptr_t>(fd_opt.value()));
++      reinterpret_cast<void*>(static_cast<intptr_t>(received_fd.get()));
+   CUresult cu_res =
+       cuMemImportFromShareableHandle(&imported.vmm_allocation, os_handle,
+                                      CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
+-  ::close(fd_opt.value());
++  received_fd.reset();
+   if (cu_res != CUDA_SUCCESS) {
+     RCUTILS_LOG_WARN_NAMED(
+         "ros2_cuda_ipc_core.backend.vmm_fd",
+@@ -172,15 +198,12 @@
+         "ros2_cuda_ipc_core.backend.vmm_fd",
+         "cuMemGetAllocationGranularity failed: %s",
+         ros2_cuda_ipc_core::detail::cu_result_to_string(cu_res).c_str());
+-    cuMemRelease(imported.vmm_allocation);
+     return std::nullopt;
+   }
+ 
+   imported.allocation_size =
+       align_up_size(static_cast<std::size_t>(msg.byte_size), granularity);
+-  if (imported.allocation_size == 0) {
+-    imported.allocation_size = granularity;
+-  }
++  if (imported.allocation_size == 0) return std::nullopt;
+ 
+   cu_res = cuMemAddressReserve(&imported.vmm_address, imported.allocation_size,
+                                0, 0, 0);
+@@ -188,7 +211,6 @@
+     RCUTILS_LOG_WARN_NAMED(
+         "ros2_cuda_ipc_core.backend.vmm_fd", "cuMemAddressReserve failed: %s",
+         ros2_cuda_ipc_core::detail::cu_result_to_string(cu_res).c_str());
+-    cuMemRelease(imported.vmm_allocation);
+     return std::nullopt;
+   }
+ 
+@@ -198,11 +220,10 @@
+     RCUTILS_LOG_WARN_NAMED(
+         "ros2_cuda_ipc_core.backend.vmm_fd", "cuMemMap failed: %s",
+         ros2_cuda_ipc_core::detail::cu_result_to_string(cu_res).c_str());
+-    cuMemAddressFree(imported.vmm_address, imported.allocation_size);
+-    cuMemRelease(imported.vmm_allocation);
+-    return std::nullopt;
+-  }
+-
++    return std::nullopt;
++  }
++
++  imported.vmm_mapped = true;
+   CUmemAccessDesc access_desc{};
+   access_desc.location = prop.location;
+   access_desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+@@ -212,9 +233,6 @@
+     RCUTILS_LOG_WARN_NAMED(
+         "ros2_cuda_ipc_core.backend.vmm_fd", "cuMemSetAccess failed: %s",
+         ros2_cuda_ipc_core::detail::cu_result_to_string(cu_res).c_str());
+-    cuMemUnmap(imported.vmm_address, imported.allocation_size);
+-    cuMemAddressFree(imported.vmm_address, imported.allocation_size);
+-    cuMemRelease(imported.vmm_allocation);
+     return std::nullopt;
+   }
+ 
+@@ -225,14 +243,12 @@
+                            ros2_cuda_ipc_core::detail::CudaDriverError(cu_res)
+                                .to_string()
+                                .c_str());
+-    cuMemUnmap(imported.vmm_address, imported.allocation_size);
+-    cuMemAddressFree(imported.vmm_address, imported.allocation_size);
+-    cuMemRelease(imported.vmm_allocation);
+     return std::nullopt;
+   }
+ 
+   imported.dev_ptr = reinterpret_cast<void*>(imported.vmm_address);
+-  return imported;
++  partial.armed = false;
++  return std::move(imported);
+ }
+ 
+ bool release_imported_resources(const ImportedResources& imported) noexcept {
+@@ -249,34 +265,18 @@
+     return false;
+   }
+   auto guard = std::move(guard_result).value();
+-  bool success = true;
+-  const auto report_cleanup_failure = [&success](const char* operation,
+-                                                 CUresult result) {
+-    if (result == CUDA_SUCCESS) {
+-      return;
+-    }
+-    success = false;
+-    RCUTILS_LOG_ERROR_NAMED(
+-        "ros2_cuda_ipc_core.backend.vmm_fd",
+-        "%s failed during imported resource cleanup: %s", operation,
+-        detail::CudaDriverError(result).to_string().c_str());
+-  };
+-
+-  if (imported.vmm_address != 0 && imported.allocation_size != 0) {
+-    report_cleanup_failure("cuMemUnmap", cuMemUnmap(imported.vmm_address,
+-                                                    imported.allocation_size));
+-    report_cleanup_failure(
+-        "cuMemAddressFree",
+-        cuMemAddressFree(imported.vmm_address, imported.allocation_size));
+-  }
+-  if (imported.vmm_allocation != 0) {
+-    report_cleanup_failure("cuMemRelease",
+-                           cuMemRelease(imported.vmm_allocation));
+-  }
+-  if (imported.event != nullptr) {
+-    report_cleanup_failure("cuEventDestroy", cuEventDestroy(imported.event));
+-  }
+-  return success;
++  // Stop at the first failure: subsequent operations might invalidate a
++  // still-live mapping. The strict mapper retains admission on any failure.
++  if (imported.vmm_mapped &&
++      cuMemUnmap(imported.vmm_address, imported.allocation_size) != CUDA_SUCCESS)
++    return false;
++  if (imported.vmm_address != 0 && imported.allocation_size != 0 &&
++      cuMemAddressFree(imported.vmm_address, imported.allocation_size) != CUDA_SUCCESS)
++    return false;
++  if (imported.vmm_allocation != 0 &&
++      cuMemRelease(imported.vmm_allocation) != CUDA_SUCCESS) return false;
++  if (imported.event && cuEventDestroy(imported.event) != CUDA_SUCCESS) return false;
++  return true;
+ }
+ 
+ }  // namespace ros2_cuda_ipc_core::backend
+--- a/ros2_cuda_ipc_core/src/buffer_metadata/buffer_metadata.cpp
++++ b/ros2_cuda_ipc_core/src/buffer_metadata/buffer_metadata.cpp
+@@ -36,17 +36,24 @@
+ 
+ std::string shm_name_for_block(uint32_t publisher_pid, uint32_t block_id) {
+   std::ostringstream name;
+-  name << "/ros2_cuda_ipc_" << publisher_pid << "_" << block_id;
++  name << "/rclpy_zc_gpu_v1_" << publisher_pid << "_" << block_id;
+   return name.str();
+ }
+ 
+ std::shared_ptr<BufferMetadata> BufferMetadata::make_mapping(
+     const std::string& shm_name, void* addr, std::size_t mapped_size) {
+-  auto mapping = std::shared_ptr<BufferMetadata>(new BufferMetadata);
+-  mapping->shm_name_ = shm_name;
++  std::shared_ptr<BufferMetadata> mapping;
++  try {
++    mapping.reset(new BufferMetadata);
++  } catch (...) {
++    munmap(addr, mapped_size);
++    throw;
++  }
+   mapping->mapped_size_ = mapped_size;
+   mapping->addr_ = addr;
+   mapping->metadata_ = static_cast<BlockMetadata*>(addr);
++  // The wrapper owns mmap before its name string can allocate.
++  mapping->shm_name_ = shm_name;
+   return mapping;
+ }
+ 
+@@ -89,7 +96,12 @@
+   close(fd);
+   auto* metadata = ::new (addr) BlockMetadata{};
+   metadata->uid.store(initial_uid(), std::memory_order_relaxed);
+-  return BufferMetadata::make_mapping(shm_name, addr, kMetadataSize);
++  try {
++    return BufferMetadata::make_mapping(shm_name, addr, kMetadataSize);
++  } catch (...) {
++    shm_unlink(shm_name.c_str());
++    throw;
++  }
+ }
+ 
+ std::shared_ptr<BufferMetadata> BufferMetadata::attach(
+--- a/ros2_cuda_ipc_core/src/buffer_metadata/buffer_ref.cpp
++++ b/ros2_cuda_ipc_core/src/buffer_metadata/buffer_ref.cpp
+@@ -13,6 +13,7 @@
+ namespace ros2_cuda_ipc_core::buffer_metadata {
+ namespace {
+ 
++constexpr uint32_t kWriter = std::numeric_limits<uint32_t>::max();
+ constexpr uint64_t kGracePeriodUs = 100000;
+ 
+ uint64_t now_us() {
+@@ -41,12 +42,9 @@
+   if (published) {
+     metadata->publish_timestamp_us.store(now_us(), std::memory_order_release);
+   }
+-  const uint32_t previous =
+-      metadata->refcount.fetch_sub(1, std::memory_order_acq_rel);
+-  if (previous == 0) {
+-    RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.buffer_ref",
+-                            "buffer_ref:refcount_underflow");
+-    metadata->refcount.store(0, std::memory_order_release);
++  uint32_t expected = kWriter;
++  if (!metadata->refcount.compare_exchange_strong(
++          expected, 0, std::memory_order_release, std::memory_order_relaxed)) {
+     return false;
+   }
+   return true;
+@@ -124,7 +122,7 @@
+   }
+   uint32_t expected = 0;
+   if (!metadata->refcount.compare_exchange_strong(
+-          expected, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
++          expected, kWriter, std::memory_order_acq_rel, std::memory_order_acquire)) {
+     return std::nullopt;
+   }
+   const uint64_t current_uid = metadata->uid.load(std::memory_order_relaxed);
+@@ -154,13 +152,14 @@
+                              uint64_t uid) {
+   auto* metadata = block(mapping);
+   if (metadata == nullptr ||
+-      metadata->uid.load(std::memory_order_acquire) != uid) {
++      metadata->uid.load(std::memory_order_acquire) != uid ||
++      metadata->publish_timestamp_us.load(std::memory_order_acquire) == 0) {
+     return BufferRef{};
+   }
+ 
+   uint32_t observed_ref = metadata->refcount.load(std::memory_order_acquire);
+   while (true) {
+-    if (observed_ref == std::numeric_limits<uint32_t>::max()) {
++    if (observed_ref >= kWriter - 1) {
+       RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.buffer_ref",
+                               "buffer_ref:refcount_overflow");
+       return BufferRef{};
+--- a/ros2_cuda_ipc_core/src/detail/cuda_driver_context.cpp
++++ b/ros2_cuda_ipc_core/src/detail/cuda_driver_context.cpp
+@@ -6,9 +6,15 @@
+ #include <rcutils/logging_macros.h>
+ 
+ #include <mutex>
++#include <atomic>
+ #include <string>
+ 
+ namespace ros2_cuda_ipc_core::detail {
++namespace {
++// A failed release has ambiguous driver ownership. Never retry it or admit
++// another retained owner; only process teardown can resolve that CUDA state.
++std::atomic<CUresult> primary_release_failure{CUDA_SUCCESS};
++}  // namespace
+ 
+ std::string CudaDriverError::name() const {
+   const char* value = nullptr;
+@@ -129,30 +135,43 @@
+   }
+ }
+ 
++bool CudaDeviceContext::owns_stream(CUstream stream) const noexcept {
++  if (stream == CU_STREAM_PER_THREAD) return false;
++  CUcontext stream_context = nullptr;
++  const CUresult result = (stream == nullptr || stream == CU_STREAM_LEGACY)
++      ? cuCtxGetCurrent(&stream_context)
++      : cuStreamGetCtx(stream, &stream_context);
++  return result == CUDA_SUCCESS && stream_context == context_;
++}
++
++bool CudaDeviceContext::primary_release_failed() noexcept {
++  return primary_release_failure.load(std::memory_order_acquire) != CUDA_SUCCESS;
++}
++
+ CudaDeviceContext::~CudaDeviceContext() noexcept {
++  if (!context_) return;
+   const CUresult result = cuDevicePrimaryCtxRelease(device_);
+   if (result != CUDA_SUCCESS) {
+-    try {
+-      RCUTILS_LOG_ERROR_NAMED(
+-          "ros2_cuda_ipc_core.cuda_context",
+-          "cuDevicePrimaryCtxRelease(device_id=%d) failed: %s", device_id_,
+-          CudaDriverError(result).to_string().c_str());
+-    } catch (...) {
+-      try {
+-        RCUTILS_LOG_ERROR_NAMED(
+-            "ros2_cuda_ipc_core.cuda_context",
+-            "cuDevicePrimaryCtxRelease(device_id=%d) failed with an "
+-            "unformattable CUDA Driver API error",
+-            device_id_);
+-      } catch (...) {
+-        // A noexcept destructor must not throw while reporting cleanup.
+-      }
+-    }
++    CUresult expected = CUDA_SUCCESS;
++    primary_release_failure.compare_exchange_strong(
++        expected, result, std::memory_order_acq_rel, std::memory_order_acquire);
++    // Keep the ambiguous retain in the driver. No allocating error formatter,
++    // cleanup retry, or context reset is safe on this destructor path.
++    RCUTILS_LOG_ERROR_NAMED(
++        "ros2_cuda_ipc_core.cuda_context",
++        "cuDevicePrimaryCtxRelease failed device=%d context=%p code=%d; "
++        "new GPU admission is disabled until process restart",
++        device_id_, static_cast<void*>(context_), static_cast<int>(result));
+   }
+ }
+ 
+ CudaResult<std::shared_ptr<CudaDeviceContext>>
+ CudaDeviceContext::retain_primary(int device_id) {
++  auto failure = primary_release_failure.load(std::memory_order_acquire);
++  if (failure != CUDA_SUCCESS) {
++    return CudaResult<std::shared_ptr<CudaDeviceContext>>::failure(
++        CudaDriverError(failure));
++  }
+   auto init_result = CudaDriver::initialize();
+   if (!init_result) {
+     return CudaResult<std::shared_ptr<CudaDeviceContext>>::failure(
+@@ -177,22 +196,28 @@
+         CudaDriverError(result));
+   }
+ 
+-  CUcontext context = nullptr;
+-  result = cuDevicePrimaryCtxRetain(&context, device);
+-  if (result != CUDA_SUCCESS) {
++  // Allocate wrapper and control block before retaining the CUDA reference.
++  // Otherwise shared_ptr control-block failure destroys the wrapper and an
++  // outer catch can release the same retain twice.
++  auto owner = std::shared_ptr<CudaDeviceContext>(
++      new CudaDeviceContext(device_id, device, nullptr));
++  failure = primary_release_failure.load(std::memory_order_acquire);
++  if (failure != CUDA_SUCCESS) {
++    return CudaResult<std::shared_ptr<CudaDeviceContext>>::failure(
++        CudaDriverError(failure));
++  }
++  result = cuDevicePrimaryCtxRetain(&owner->context_, device);
++  if (result != CUDA_SUCCESS) {
++    owner->context_ = nullptr;
+     return CudaResult<std::shared_ptr<CudaDeviceContext>>::failure(
+         CudaDriverError(result));
+   }
+-
+-  try {
+-    return CudaResult<std::shared_ptr<CudaDeviceContext>>::success(
+-        std::shared_ptr<CudaDeviceContext>(
+-            new CudaDeviceContext(device_id, device, context)));
+-  } catch (...) {
+-    // The retain succeeded, so balance it if allocating the wrapper fails.
+-    (void)cuDevicePrimaryCtxRelease(device);
+-    throw;
+-  }
++  failure = primary_release_failure.load(std::memory_order_acquire);
++  if (failure != CUDA_SUCCESS) {
++    return CudaResult<std::shared_ptr<CudaDeviceContext>>::failure(
++        CudaDriverError(failure));
++  }
++  return CudaResult<std::shared_ptr<CudaDeviceContext>>::success(std::move(owner));
+ }
+ 
+ CudaResult<CudaContextGuard> CudaDeviceContext::push_current() const {
+--- a/ros2_cuda_ipc_core/src/detail/interprocess_event.cpp
++++ b/ros2_cuda_ipc_core/src/detail/interprocess_event.cpp
+@@ -19,54 +19,32 @@
+ 
+ InterprocessEvent::~InterprocessEvent() noexcept { reset_noexcept(); }
+ 
+-CudaResult<std::unique_ptr<InterprocessEvent>> InterprocessEvent::create(
+-    std::shared_ptr<CudaDeviceContext> context) {
+-  if (!context) {
+-    return CudaResult<std::unique_ptr<InterprocessEvent>>::failure(
+-        CudaDriverError(CUDA_ERROR_INVALID_CONTEXT));
++CudaResult<void> InterprocessEvent::create(
++    std::shared_ptr<CudaDeviceContext> context,
++    std::unique_ptr<InterprocessEvent>& owner) {
++  if (!context || owner) {
++    return CudaResult<void>::failure(CudaDriverError(CUDA_ERROR_INVALID_CONTEXT));
+   }
++  owner.reset(new InterprocessEvent(context, nullptr, {}));
+   auto guard_result = context->push_current();
+-  if (!guard_result) {
+-    return CudaResult<std::unique_ptr<InterprocessEvent>>::failure(
+-        guard_result.error());
+-  }
++  if (!guard_result) return CudaResult<void>::failure(guard_result.error());
+   auto guard = std::move(guard_result).value();
+-
+-  CUevent event = nullptr;
+-  CUresult result =
+-      cuEventCreate(&event, CU_EVENT_DISABLE_TIMING | CU_EVENT_INTERPROCESS);
+-  if (result != CUDA_SUCCESS) {
+-    return CudaResult<std::unique_ptr<InterprocessEvent>>::failure(
+-        CudaDriverError(result));
+-  }
+-
++  CUresult result = cuEventCreate(
++      &owner->event_, CU_EVENT_DISABLE_TIMING | CU_EVENT_INTERPROCESS);
++  if (result != CUDA_SUCCESS)
++    return CudaResult<void>::failure(CudaDriverError(result));
+   CUipcEventHandle event_handle{};
+-  result = cuIpcGetEventHandle(&event_handle, event);
+-  if (result != CUDA_SUCCESS) {
+-    (void)cuEventDestroy(event);
+-    return CudaResult<std::unique_ptr<InterprocessEvent>>::failure(
+-        CudaDriverError(result));
+-  }
+-
+-  transport::EventHandlePayload payload{};
+-  static_assert(sizeof(event_handle) == sizeof(payload),
++  result = cuIpcGetEventHandle(&event_handle, owner->event_);
++  if (result != CUDA_SUCCESS)
++    return CudaResult<void>::failure(CudaDriverError(result));
++  static_assert(sizeof(event_handle) == sizeof(owner->ipc_handle_),
+                 "CUDA IPC event handle payload size changed");
+-  std::memcpy(payload.data(), &event_handle, sizeof(event_handle));
+-
+-  try {
+-    return CudaResult<std::unique_ptr<InterprocessEvent>>::success(
+-        std::unique_ptr<InterprocessEvent>(
+-            new InterprocessEvent(std::move(context), event, payload)));
+-  } catch (...) {
+-    // The context guard is still active here, so the event can be cleaned up
+-    // if allocation of the owning object fails.
+-    (void)cuEventDestroy(event);
+-    throw;
+-  }
++  std::memcpy(owner->ipc_handle_.data(), &event_handle, sizeof(event_handle));
++  return CudaResult<void>::success();
+ }
+ 
+ CudaResult<void> InterprocessEvent::record(CUstream stream) const noexcept {
+-  if (!context_ || event_ == nullptr) {
++  if (!context_ || event_ == nullptr || !context_->owns_stream(stream)) {
+     return CudaResult<void>::failure(
+         CudaDriverError(CUDA_ERROR_INVALID_HANDLE));
+   }
+@@ -82,39 +60,26 @@
+   return CudaResult<void>::success();
+ }
+ 
+-void InterprocessEvent::reset_noexcept() noexcept {
+-  if (event_ == nullptr) {
+-    return;
+-  }
+-  try {
+-    if (!context_) {
+-      RCUTILS_LOG_ERROR_NAMED(
+-          "ros2_cuda_ipc_core.interprocess_event",
+-          "Cannot destroy interprocess event without its CUDA context");
+-      event_ = nullptr;
+-      return;
+-    }
+-    auto guard_result = context_->push_current();
+-    if (!guard_result) {
+-      RCUTILS_LOG_ERROR_NAMED(
+-          "ros2_cuda_ipc_core.interprocess_event",
+-          "Failed to activate CUDA context for event cleanup: %s",
+-          guard_result.error().to_string().c_str());
+-      event_ = nullptr;
+-      return;
+-    }
+-    auto guard = std::move(guard_result).value();
+-    const CUresult result = cuEventDestroy(event_);
+-    if (result != CUDA_SUCCESS) {
+-      RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.interprocess_event",
+-                              "cuEventDestroy failed: %s",
+-                              CudaDriverError(result).to_string().c_str());
+-    }
+-  } catch (...) {
+-    // Destruction and error reporting must not escape a noexcept boundary.
+-  }
++CUresult InterprocessEvent::query() const noexcept {
++  if (!context_ || !event_) return CUDA_ERROR_INVALID_HANDLE;
++  auto result = context_->push_current();
++  if (!result) return result.error().code();
++  auto guard = std::move(result).value();
++  return cuEventQuery(event_);
++}
++
++bool InterprocessEvent::try_close() noexcept {
++  if (!event_) return true;
++  if (!context_) return false;
++  auto result = context_->push_current();
++  if (!result) return false;
++  auto guard = std::move(result).value();
++  if (cuEventDestroy(event_) != CUDA_SUCCESS) return false;
+   event_ = nullptr;
+   ipc_handle_.fill(0);
++  return true;
+ }
+ 
++void InterprocessEvent::reset_noexcept() noexcept { (void)try_close(); }
++
+ }  // namespace ros2_cuda_ipc_core::detail
+--- a/ros2_cuda_ipc_core/src/publisher/gpu_buffer_manager.cpp
++++ b/ros2_cuda_ipc_core/src/publisher/gpu_buffer_manager.cpp
+@@ -9,9 +9,9 @@
+ 
+ namespace ros2_cuda_ipc_core::publisher {
+ 
+-PublishBlock::PublishBlock(GpuBufferManager* owner,
++PublishBlock::PublishBlock(std::shared_ptr<GpuBufferPool> owner,
+                            GpuBufferPool::BlockReservation reservation) noexcept
+-    : owner_(owner), reservation_(std::move(reservation)) {}
++    : owner_(std::move(owner)), reservation_(std::move(reservation)) {}
+ 
+ PublishBlock::PublishBlock(PublishBlock&& other) noexcept {
+   move_from(std::move(other));
+@@ -28,7 +28,7 @@
+ PublishBlock::~PublishBlock() noexcept { cancel(); }
+ 
+ void PublishBlock::move_from(PublishBlock&& other) noexcept {
+-  owner_ = other.owner_;
++  owner_ = std::move(other.owner_);
+   reservation_ = std::move(other.reservation_);
+   other.owner_ = nullptr;
+ }
+@@ -41,7 +41,7 @@
+ 
+ detail::CudaResult<transport::BufferDescriptor> PublishBlock::prepare_publish(
+     CUstream stream) noexcept {
+-  if (owner_ == nullptr) {
++  if (owner_ == nullptr || stream != reservation_.producer_stream) {
+     return detail::CudaResult<transport::BufferDescriptor>::failure(
+         detail::CudaDriverError(CUDA_ERROR_INVALID_HANDLE));
+   }
+@@ -72,24 +72,25 @@
+ 
+ void PublishBlock::quarantine(const char* step,
+                               const detail::CudaDriverError* error) noexcept {
++  if (owner_) owner_->mark_failed();
+   owner_ = nullptr;
+   if (error != nullptr) {
+     RCUTILS_LOG_ERROR_NAMED(
+         "ros2_cuda_ipc_core.publisher.gpu_buffer_manager",
+         "Failed to safely release or publish block %u uid %llu "
+         "publisher=%s during %s. The block will not be reused until "
+-        "GpuBufferManager is reset. CUDA error: %s",
++        "all involved GPU processes restart. CUDA error code=%d",
+         reservation_.block_id,
+         static_cast<unsigned long long>(reservation_.uid),
+         reservation_.mapping ? reservation_.mapping->shm_name().c_str() : "",
+-        step, error->to_string().c_str());
++        step, static_cast<int>(error->code()));
+     return;
+   }
+   RCUTILS_LOG_ERROR_NAMED(
+       "ros2_cuda_ipc_core.publisher.gpu_buffer_manager",
+       "Failed to safely release or publish block %u uid %llu "
+       "publisher=%s during %s. The block will not be reused until "
+-      "GpuBufferManager is reset.",
++      "all involved GPU processes restart.",
+       reservation_.block_id, static_cast<unsigned long long>(reservation_.uid),
+       reservation_.mapping ? reservation_.mapping->shm_name().c_str() : "",
+       step);
+@@ -106,61 +107,64 @@
+ }
+ 
+ GpuBufferManager::GpuBufferManager(Config config)
+-    : config_(std::move(config)), buffer_pool_(config_.block_count) {}
++    : config_(std::move(config)), buffer_pool_(std::make_shared<GpuBufferPool>(config_.block_count)) {}
+ 
+ GpuBufferManager::~GpuBufferManager() { reset(); }
+ 
+ bool GpuBufferManager::initialise() {
+-  reset();
+-  return buffer_pool_.initialise(config_.byte_size, config_.device_index);
++  return buffer_pool_->initialise(config_.byte_size, config_.device_index);
+ }
+ 
+-void GpuBufferManager::reset() noexcept { buffer_pool_.reset(); }
++void GpuBufferManager::reset() noexcept { buffer_pool_->reset(); }
++
++bool GpuBufferManager::try_close() noexcept { return buffer_pool_->try_close(); }
++
++bool GpuBufferManager::poisoned() const noexcept { return buffer_pool_->poisoned(); }
+ 
+ bool GpuBufferManager::is_initialised() const noexcept {
+-  return buffer_pool_.is_initialised();
++  return buffer_pool_->is_initialised();
+ }
+ 
+ uint32_t GpuBufferManager::publisher_pid() const noexcept {
+-  return buffer_pool_.publisher_pid();
++  return buffer_pool_->publisher_pid();
+ }
+ 
+-std::optional<PublishBlock> GpuBufferManager::acquire_for_publish() {
++std::optional<PublishBlock> GpuBufferManager::acquire_for_publish(CUstream producer_stream) {
+   if (!is_initialised()) {
+     return std::nullopt;
+   }
+-  auto reservation = buffer_pool_.reserve_for_publish();
++  auto reservation = buffer_pool_->reserve_for_publish(producer_stream);
+   if (!reservation) {
+     return std::nullopt;
+   }
+-  return PublishBlock(this, std::move(*reservation));
++  return PublishBlock(buffer_pool_, std::move(*reservation));
+ }
+ 
+ void* GpuBufferManager::device_ptr(
+     const GpuBufferPool::BlockReservation& reservation) const noexcept {
+-  return buffer_pool_.device_ptr(reservation);
++  return buffer_pool_->device_ptr(reservation);
+ }
+ 
+ detail::CudaResult<void> GpuBufferManager::record_ready(
+     const GpuBufferPool::BlockReservation& reservation,
+     CUstream stream) noexcept {
+-  return buffer_pool_.record_ready(reservation, stream);
++  return buffer_pool_->record_ready(reservation, stream);
+ }
+ 
+ std::optional<transport::BufferDescriptor>
+ GpuBufferManager::try_build_descriptor(
+     const GpuBufferPool::BlockReservation& reservation) const noexcept {
+-  return buffer_pool_.try_build_descriptor(reservation);
++  return buffer_pool_->try_build_descriptor(reservation);
+ }
+ 
+ bool GpuBufferManager::commit(
+     const GpuBufferPool::BlockReservation& reservation) noexcept {
+-  return buffer_pool_.commit(reservation);
++  return buffer_pool_->commit(reservation);
+ }
+ 
+ bool GpuBufferManager::cancel(
+     const GpuBufferPool::BlockReservation& reservation) noexcept {
+-  return buffer_pool_.cancel(reservation);
++  return buffer_pool_->cancel(reservation);
+ }
+ 
+ }  // namespace ros2_cuda_ipc_core::publisher
+--- a/ros2_cuda_ipc_core/src/publisher/gpu_buffer_pool.cpp
++++ b/ros2_cuda_ipc_core/src/publisher/gpu_buffer_pool.cpp
+@@ -20,6 +20,22 @@
+ namespace {
+ 
+ std::atomic<uint32_t> next_process_block_id{0};
++
++// One active or retained pool bounds process resources. Healthy busy pools
++// drain on the next initialise attempt; known CUDA failures are terminal.
++struct PoolEpoch {
++  std::mutex mutex;
++  std::atomic<GpuBufferPool*> owner{nullptr};
++  bool reaping = false;
++  std::atomic<bool> poisoned{false};
++  std::vector<backend::GpuBufferBlock> retained;
++  std::shared_ptr<detail::CudaDeviceContext> context;
++};
++PoolEpoch& pool_epoch() {
++  static auto* state = new PoolEpoch;
++  return *state;
++}
++
+ 
+ /// Lock the pool mutex without allowing a failed lock operation to escape a
+ /// noexcept resource API. std::lock_guard would call std::terminate() if
+@@ -77,7 +93,7 @@
+     uint32_t pid = 0;
+     uint32_t block_id = 0;
+     char suffix = '\0';
+-    if (std::sscanf(entry->d_name, "ros2_cuda_ipc_%u_%u%c", &pid, &block_id,
++    if (std::sscanf(entry->d_name, "rclpy_zc_gpu_v1_%u_%u%c", &pid, &block_id,
+                     &suffix) != 2 ||
+         pid == 0) {
+       continue;
+@@ -100,11 +116,18 @@
+ 
+ GpuBufferPool::GpuBufferPool(std::size_t block_count)
+     : block_count_(block_count),
+-      publisher_pid_(static_cast<uint32_t>(::getpid())) {}
+-
+-GpuBufferPool::~GpuBufferPool() { destroy_blocks(); }
++      publisher_pid_(static_cast<uint32_t>(::getpid())) { (void)pool_epoch(); }
++
++GpuBufferPool::~GpuBufferPool() {
++  if (!try_close()) retire_blocks();
++}
+ 
+ bool GpuBufferPool::initialise(uint64_t byte_size, int device_index) {
++  if (poisoned()) {
++    RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.publisher.gpu_buffer_pool",
++                            "Pool initialise rejected: terminal GPU epoch failure");
++    return false;
++  }
+   if (block_count_ == 0 ||
+       block_count_ > std::numeric_limits<uint32_t>::max() || byte_size == 0) {
+     RCUTILS_LOG_ERROR_NAMED(
+@@ -112,8 +135,14 @@
+         "GpuBufferPool requires a valid block_count and byte_size");
+     return false;
+   }
+-  if (initialised_ || !blocks_.empty()) {
+-    destroy_blocks();
++  if (!try_close() || !drain_retired_epoch()) return false;
++  {
++    auto& epoch = pool_epoch();
++    PoolMutexLock lock(epoch.mutex);
++    if (!lock.locked() || epoch.poisoned || epoch.reaping ||
++        epoch.owner.load() != nullptr || !epoch.retained.empty() || epoch.context)
++      return false;
++    epoch.owner = this;
+   }
+   cleanup_orphaned_metadata_objects();
+ 
+@@ -122,6 +151,7 @@
+     RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.publisher.gpu_buffer_pool",
+                             "Failed to retain CUDA primary context: %s",
+                             context_result.error().to_string().c_str());
++    destroy_blocks();
+     return false;
+   }
+   context_ = std::move(context_result).value();
+@@ -177,7 +207,107 @@
+   return true;
+ }
+ 
+-void GpuBufferPool::reset() noexcept { destroy_blocks(); }
++void GpuBufferPool::reset() noexcept { (void)try_close(); }
++
++bool GpuBufferPool::try_close() noexcept {
++  PoolMutexLock lock(mutex_);
++  if (!lock.locked() || poisoned_) return false;
++  std::size_t claimed = 0;
++  for (; claimed < blocks_.size(); ++claimed) {
++    auto& block = blocks_[claimed];
++    if (block.ready_event) {
++      const CUresult completed = block.ready_event->query();
++      if (completed != CUDA_SUCCESS) {
++        if (completed != CUDA_ERROR_NOT_READY) {
++          RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.publisher.gpu_buffer_pool",
++                                  "Producer completion query failed code=%d", completed);
++          mark_failed();
++        }
++        break;
++      }
++    }
++    auto* metadata = block.shared_metadata ? block.shared_metadata->metadata() : nullptr;
++    uint32_t expected = 0;
++    if (metadata && !metadata->refcount.compare_exchange_strong(
++            expected, buffer_metadata::BufferRef::kWriter,
++            std::memory_order_acq_rel, std::memory_order_acquire)) break;
++  }
++  if (claimed != blocks_.size()) {
++    for (std::size_t i = 0; i < claimed; ++i) {
++      if (blocks_[i].shared_metadata)
++        blocks_[i].shared_metadata->metadata()->refcount.store(0, std::memory_order_release);
++    }
++    return false;
++  }
++  return destroy_blocks_locked();
++}
++
++bool GpuBufferPool::poisoned() const noexcept {
++  return poisoned_.load() || pool_epoch().poisoned.load() ||
++         detail::CudaDeviceContext::primary_release_failed();
++}
++
++void GpuBufferPool::mark_failed() noexcept {
++  if (!poisoned_.exchange(true)) {
++    RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.publisher.gpu_buffer_pool",
++                            "GPU pool poisoned; process restart is required");
++  }
++}
++
++void GpuBufferPool::retire_blocks() noexcept {
++  auto& epoch = pool_epoch();
++  if (blocks_.empty() && !context_) {
++    if (poisoned()) epoch.poisoned.store(true);
++    auto* expected = this;
++    epoch.owner.compare_exchange_strong(expected, nullptr);
++    poisoned_.store(false);
++    return;
++  }
++  // The final owner exclusively owns these resources. While owner is non-null,
++  // initialise never reads retained storage. Publish the transfer only after
++  // the bundle is complete; no allocation or CUDA wait occurs here.
++  const bool terminal = poisoned();
++  epoch.retained.swap(blocks_);
++  epoch.context = std::move(context_);
++  initialised_ = false;
++  poisoned_.store(false);  // A temporary reaper must destruct as an empty pool.
++  if (terminal) {
++    if (!epoch.poisoned.exchange(true)) {
++      RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.publisher.gpu_buffer_pool",
++                              "GPU pool epoch quarantined after terminal failure");
++    }
++  } else if (!epoch.reaping) {
++    RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.publisher.gpu_buffer_pool",
++                           "GPU pool draining; retry initialise after GPU/read completion");
++  }
++  epoch.owner.store(nullptr, std::memory_order_release);
++}
++
++bool GpuBufferPool::drain_retired_epoch() noexcept {
++  GpuBufferPool pending(0);
++  auto& epoch = pool_epoch();
++  {
++    PoolMutexLock lock(epoch.mutex);
++    if (!lock.locked() || epoch.poisoned || epoch.reaping ||
++        epoch.owner.load(std::memory_order_acquire) != nullptr) return false;
++    if (epoch.retained.empty() && !epoch.context) return true;
++    epoch.reaping = true;
++    pending.blocks_.swap(epoch.retained);
++    pending.context_ = std::move(epoch.context);
++    pending.initialised_ = true;
++    epoch.owner.store(&pending, std::memory_order_release);
++  }
++  // try_close takes the pool mutex, then the epoch mutex only on successful
++  // cleanup. Never hold epoch.mutex across it or the temporary destructor.
++  const bool closed = pending.try_close();
++  if (!closed) pending.retire_blocks();
++  {
++    PoolMutexLock lock(epoch.mutex);
++    if (!lock.locked()) return false;
++    epoch.reaping = false;
++  }
++  return closed;
++}
+ 
+ bool GpuBufferPool::matches(uint64_t byte_size,
+                             int device_index) const noexcept {
+@@ -186,24 +316,34 @@
+ }
+ 
+ std::optional<GpuBufferPool::BlockReservation>
+-GpuBufferPool::reserve_for_publish() {
++GpuBufferPool::reserve_for_publish(CUstream producer_stream) {
+   PoolMutexLock lock(mutex_);
+   if (!lock.locked()) {
+     log_mutex_lock_failure("reservation");
+     return std::nullopt;
+   }
+-  if (!initialised_ || blocks_.empty()) return std::nullopt;
++  if (!initialised_ || poisoned_ || blocks_.empty() || !context_ ||
++      detail::CudaDeviceContext::primary_release_failed() ||
++      !context_->owns_stream(producer_stream)) return std::nullopt;
+   for (std::size_t offset = 0; offset < blocks_.size(); ++offset) {
+     const std::size_t index = (next_block_ + offset) % blocks_.size();
+     auto& block = blocks_[index];
+-    if (!block.shared_metadata) continue;
++    if (!block.shared_metadata || !block.ready_event) continue;
++    const CUresult completed = block.ready_event->query();
++    if (completed == CUDA_ERROR_NOT_READY) continue;
++    if (completed != CUDA_SUCCESS) {
++      RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.publisher.gpu_buffer_pool",
++                              "Producer reuse query failed code=%d", completed);
++      mark_failed();
++      return std::nullopt;
++    }
+     auto reservation =
+         buffer_metadata::BufferRef::reserve_for_publish(block.shared_metadata);
+     if (!reservation) continue;
+     next_block_ = (index + 1) % blocks_.size();
+     return BlockReservation{reservation->mapping, block.block_id,
+                             reservation->uid, publisher_pid_,
+-                            static_cast<uint32_t>(index)};
++                            static_cast<uint32_t>(index), producer_stream};
+   }
+   return std::nullopt;
+ }
+@@ -243,7 +383,8 @@
+   }
+   const auto* block =
+       owns(reservation) ? resources(reservation.pool_index) : nullptr;
+-  return block ? block->device_ptr : nullptr;
++  return block && context_ && context_->owns_stream(reservation.producer_stream)
++             ? block->device_ptr : nullptr;
+ }
+ 
+ detail::CudaResult<void> GpuBufferPool::record_ready(
+@@ -256,7 +397,15 @@
+   }
+   const auto* block =
+       owns(reservation) ? resources(reservation.pool_index) : nullptr;
+-  if (block == nullptr || !block->ready_event) {
++  if (block == nullptr || !block->ready_event ||
++      stream != reservation.producer_stream || !context_) {
++    return detail::CudaResult<void>::failure(
++        detail::CudaDriverError(CUDA_ERROR_INVALID_HANDLE));
++  }
++  auto guard_result = context_->push_current();
++  if (!guard_result) return detail::CudaResult<void>::failure(guard_result.error());
++  auto guard = std::move(guard_result).value();
++  if (!context_->owns_stream(stream)) {
+     return detail::CudaResult<void>::failure(
+         detail::CudaDriverError(CUDA_ERROR_INVALID_HANDLE));
+   }
+@@ -303,9 +452,14 @@
+ }
+ 
+ bool GpuBufferPool::cancel(const BlockReservation& reservation) noexcept {
+-  // Keep cancellation valid after reset. The reservation owns the mapping
+-  // until its PublishBlock is destroyed, matching the previous lifecycle.
+-  return reservation.publisher_pid == publisher_pid_ && reservation.mapping &&
++  // Recording before releasing the writer sentinel protects abandoned writes.
++  auto recorded = record_ready(reservation, reservation.producer_stream);
++  if (!recorded) {
++    mark_failed();
++    return false;
++  }
++  PoolMutexLock lock(mutex_);
++  return lock.locked() && owns(reservation) &&
+          buffer_metadata::BufferRef::cancel_publish(reservation.mapping,
+                                                     reservation.uid);
+ }
+@@ -323,7 +477,10 @@
+   }
+   const auto* block = resources(reservation.pool_index);
+   return block != nullptr && block->block_id == reservation.block_id &&
+-         block->shared_metadata.get() == reservation.mapping.get();
++         block->shared_metadata.get() == reservation.mapping.get() &&
++         buffer_metadata::BufferRef::current_uid(reservation.mapping) == reservation.uid &&
++         buffer_metadata::BufferRef::current_refcount(reservation.mapping) ==
++             buffer_metadata::BufferRef::kWriter;
+ }
+ 
+ bool GpuBufferPool::allocate_blocks() {
+@@ -346,14 +503,14 @@
+     }
+   }
+   for (auto& block : blocks_) {
+-    auto event_result = detail::InterprocessEvent::create(context_);
++    auto event_result = detail::InterprocessEvent::create(context_, block.ready_event);
+     if (!event_result) {
+       RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.publisher.gpu_buffer_pool",
+                               "Failed to create interprocess event: %s",
+                               event_result.error().to_string().c_str());
+-      return false;
+-    }
+-    block.ready_event = std::move(event_result).value();
++      if (block.ready_event && !block.ready_event->try_close()) mark_failed();
++      return false;
++    }
+   }
+   return true;
+ }
+@@ -364,7 +521,18 @@
+     log_mutex_lock_failure("block destruction");
+     return;
+   }
+-  for (auto& block : blocks_) block.ready_event.reset();
++  destroy_blocks_locked();
++}
++
++bool GpuBufferPool::destroy_blocks_locked() noexcept {
++  if (poisoned_) return false;
++  for (auto& block : blocks_) {
++    if (block.ready_event && !block.ready_event->try_close()) {
++      mark_failed();
++      return false;
++    }
++    block.ready_event.reset();
++  }
+ 
+   std::optional<detail::CudaContextGuard> guard;
+   if (context_) {
+@@ -372,13 +540,18 @@
+     if (!guard_result) {
+       RCUTILS_LOG_ERROR_NAMED(
+           "ros2_cuda_ipc_core.publisher.gpu_buffer_pool",
+-          "Failed to activate CUDA context for resource cleanup: %s",
+-          guard_result.error().to_string().c_str());
++          "Failed to activate CUDA context for resource cleanup code=%d",
++          static_cast<int>(guard_result.error().code()));
++      mark_failed();
++      return false;
+     } else {
+       guard.emplace(std::move(guard_result).value());
+     }
+   }
+-  backend::destroy_vmm_fd_memory(blocks_);
++  if (!backend::try_destroy_vmm_fd_memory(blocks_)) {
++    mark_failed();
++    return false;
++  }
+ 
+   for (auto& block : blocks_) {
+     if (block.shared_metadata) {
+@@ -398,7 +571,17 @@
+   byte_size_ = 0;
+   device_index_ = -1;
+   initialised_ = false;
++  guard.reset();
++  const bool released_context = static_cast<bool>(context_);
+   context_.reset();
++  if (released_context && detail::CudaDeviceContext::primary_release_failed()) {
++    mark_failed();
++    return false;
++  }
++  auto& epoch = pool_epoch();
++  PoolMutexLock epoch_lock(epoch.mutex);
++  if (epoch_lock.locked() && epoch.owner == this) epoch.owner = nullptr;
++  return true;
+ }
+ 
+ }  // namespace ros2_cuda_ipc_core::publisher
+--- a/ros2_cuda_ipc_core/src/subscriber/admission.hpp
++++ b/ros2_cuda_ipc_core/src/subscriber/admission.hpp
+@@ -0,0 +1,93 @@
++// Copyright (c) 2026 Daisuke Kato
++// SPDX-License-Identifier: MIT
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <stdexcept>
++#include <rcutils/logging_macros.h>
++
++#include "ros2_cuda_ipc_core/buffer_metadata/buffer_ref.hpp"
++
++namespace ros2_cuda_ipc_core::subscriber::detail {
++
++// One process epoch shares admission across mapper recreation and aliases.
++// A failed permit retains itself, its charge, and the poisoned epoch forever.
++struct ReadEpoch {
++  const std::size_t max_reads;
++  const uint64_t max_bytes;
++  std::atomic<std::size_t> reads{0};
++  std::atomic<bool> poisoned{false};
++  ReadEpoch(std::size_t count, uint64_t bytes) : max_reads(count), max_bytes(bytes) {}
++};
++
++struct ReadAdmission {
++  std::shared_ptr<ReadEpoch> epoch;
++  std::shared_ptr<ReadAdmission> failed;
++  std::unique_ptr<buffer_metadata::BufferRef> failed_ref;
++  bool charged = false;
++  explicit ReadAdmission(std::shared_ptr<ReadEpoch> value) : epoch(std::move(value)) {}
++  ~ReadAdmission() { if (charged) epoch->reads.fetch_sub(1); }
++  void retain_failed(const std::shared_ptr<ReadAdmission>& self) noexcept {
++    if (!epoch->poisoned.exchange(true)) {
++      RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.subscriber.read_handle",
++                              "GPU read epoch poisoned; retained_reads=%zu limit=%zu",
++                              epoch->reads.load(), epoch->max_reads);
++    }
++    failed = self;
++  }
++};
++
++inline void release_read_ref(
++    std::unique_ptr<buffer_metadata::BufferRef>& ref,
++    const std::shared_ptr<void>& admission) noexcept {
++  auto permit = std::static_pointer_cast<ReadAdmission>(admission);
++  if (permit && permit->failed && ref) {
++    permit->failed_ref = std::move(ref);
++  } else {
++    ref.reset();
++  }
++}
++
++// Keeps exceptional import/allocation paths in the same resource-before-ref order.
++struct ReadRefGuard {
++  std::unique_ptr<buffer_metadata::BufferRef>& ref;
++  std::shared_ptr<ReadAdmission> admission;
++  ~ReadRefGuard() noexcept { release_read_ref(ref, admission); }
++};
++
++inline std::shared_ptr<ReadEpoch> read_epoch(std::size_t count, uint64_t bytes) {
++  if (count == 0 || bytes == 0) throw std::invalid_argument("GPU read limits must be nonzero");
++  struct Registry {
++    std::mutex mutex;
++    std::weak_ptr<ReadEpoch> current;
++  };
++  static auto* registry = new Registry;
++  std::lock_guard<std::mutex> lock(registry->mutex);
++  auto epoch = registry->current.lock();
++  if (epoch) {
++    if (epoch->max_reads != count || epoch->max_bytes != bytes)
++      throw std::logic_error("A live GPU mapper epoch has different limits");
++    return epoch;
++  }
++  epoch = std::make_shared<ReadEpoch>(count, bytes);
++  registry->current = epoch;
++  return epoch;
++}
++
++inline std::shared_ptr<ReadAdmission> admit(const std::shared_ptr<ReadEpoch>& epoch) {
++  auto permit = std::make_shared<ReadAdmission>(epoch);
++  std::size_t count = epoch->reads.load();
++  while (!epoch->poisoned.load() && count < epoch->max_reads) {
++    if (epoch->reads.compare_exchange_weak(count, count + 1)) {
++      permit->charged = true;
++      if (!epoch->poisoned.load()) return permit;
++      return {};
++    }
++  }
++  return {};
++}
++
++}  // namespace ros2_cuda_ipc_core::subscriber::detail
+--- a/ros2_cuda_ipc_core/src/subscriber/buffer_mapper.cpp
++++ b/ros2_cuda_ipc_core/src/subscriber/buffer_mapper.cpp
+@@ -6,13 +6,15 @@
+ #include <rcutils/logging_macros.h>
+ 
+ #include <cstring>
++#include <limits>
++#include <new>
+ #include <utility>
+ 
+ #include "ros2_cuda_ipc_core/backend/memory_importer.hpp"
+ #include "ros2_cuda_ipc_core/buffer_metadata/buffer_ref.hpp"
+-#include "ros2_cuda_ipc_core/detail/buffer_metadata_cache.hpp"
++#include "admission.hpp"
+ #include "ros2_cuda_ipc_core/detail/read_handle_factory.hpp"
+-#include "ros2_cuda_ipc_core/subscriber/ipc_handle_cache.hpp"
++
+ #include "ros2_cuda_ipc_core/transport/memory_types.hpp"
+ 
+ namespace ros2_cuda_ipc_core::subscriber {
+@@ -28,16 +30,20 @@
+ }
+ 
+ std::unique_ptr<detail::MappedPublication> map_descriptor(
+-    const std::shared_ptr<detail::BufferMetadataCache>& mapping_cache,
++    const std::shared_ptr<detail::ReadEpoch>& epoch,
+     const ros2_cuda_ipc_msgs::msg::BufferCore& msg) {
+-  if (msg.publisher_pid == 0) {
++  if (msg.publisher_pid == 0 || msg.byte_size == 0 ||
++      msg.byte_size > epoch->max_bytes ||
++      msg.byte_size > std::numeric_limits<std::size_t>::max()) {
+     RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.subscriber.buffer_mapper",
+                            "BufferCore publisher_pid is zero");
+     return nullptr;
+   }
+ 
+-  auto mapping =
+-      mapping_cache->get_or_attach(msg.publisher_pid, msg.block_id, msg.uid);
++  auto admission = detail::admit(epoch);
++  if (!admission) return nullptr;
++  auto mapping = buffer_metadata::BufferMetadata::attach(
++      buffer_metadata::shm_name_for_block(msg.publisher_pid, msg.block_id));
+   auto buffer_ref = buffer_metadata::BufferRef::acquire(mapping, msg.uid);
+   if (!buffer_ref.valid()) {
+     RCUTILS_LOG_WARN_NAMED(
+@@ -49,34 +55,42 @@
+   }
+   auto buffer_ref_ptr =
+       std::make_unique<buffer_metadata::BufferRef>(std::move(buffer_ref));
++  detail::ReadRefGuard ref_guard{buffer_ref_ptr, admission};
+ 
+   const CUipcEventHandle event_handle = to_cuda_event_handle(msg);
+-  IpcHandleKey key{};
+-  key.publisher_pid = msg.publisher_pid;
+-  key.block_id = msg.block_id;
+-  key.device_id = msg.device_id;
+-  key.vmm_socket_path = msg.vmm_socket_path;
+-  std::memcpy(key.event.data(), msg.event_handle.data(), key.event.size());
+-
+-  auto imported = IpcHandleCache::instance().find(key);
+-  if (!imported) {
+-    static const backend::VmmFdMemoryImporter importer;
+-    auto opened = importer.import(msg, event_handle);
+-    if (!opened.has_value()) {
+-      RCUTILS_LOG_WARN_NAMED(
+-          "ros2_cuda_ipc_core.subscriber.buffer_mapper",
+-          "Failed to import GPU resource pid=%u block=%u uid=%llu",
+-          msg.publisher_pid, msg.block_id,
+-          static_cast<unsigned long long>(msg.uid));
+-      return nullptr;
++  // Strict mapping has no idle import cache: each admission owns one import.
++  static const backend::VmmFdMemoryImporter importer;
++  auto storage = std::make_unique<backend::ImportedResources>();
++  bool cleanup_failed = false;
++  auto opened = [&]() {
++    try {
++      return importer.import(msg, event_handle, &cleanup_failed);
++    } catch (...) {
++      if (cleanup_failed) admission->retain_failed(admission);
++      throw;
+     }
+-    imported = IpcHandleCache::instance().insert_or_discard_duplicate(
+-        key, std::move(*opened));
++  }();
++  if (!opened) {
++    if (cleanup_failed) admission->retain_failed(admission);
++    return nullptr;
+   }
++  storage->~ImportedResources();
++  new (storage.get()) backend::ImportedResources(std::move(*opened));
++  auto* raw = storage.release();
++  std::shared_ptr<const backend::ImportedResources> imported(
++      raw, [admission](const backend::ImportedResources* resource) noexcept {
++        if (backend::release_imported_resources(*resource)) {
++          delete resource;
++        } else {
++          admission->retain_failed(admission);
++          // CUDA resource identity stays allocated; retrying partial cleanup is unsafe.
++        }
++      });
+ 
+   auto publication = detail::ReadHandleFactory::make_publication(
+       std::move(imported), std::move(buffer_ref_ptr),
+-      static_cast<std::size_t>(msg.byte_size), static_cast<int>(msg.device_id));
++      static_cast<std::size_t>(msg.byte_size), static_cast<int>(msg.device_id),
++      admission);
+   if (!publication) {
+     RCUTILS_LOG_WARN_NAMED(
+         "ros2_cuda_ipc_core.subscriber.buffer_mapper",
+@@ -91,11 +105,12 @@
+ 
+ class BufferMapper::Impl {
+  public:
+-  std::shared_ptr<detail::BufferMetadataCache> mapping_cache =
+-      std::make_shared<detail::BufferMetadataCache>();
++  std::shared_ptr<detail::ReadEpoch> epoch;
++  explicit Impl(Config config)
++      : epoch(detail::read_epoch(config.max_inflight_reads, config.max_message_bytes)) {}
+ };
+ 
+-BufferMapper::BufferMapper() : impl_(std::make_unique<Impl>()) {}
++BufferMapper::BufferMapper(Config config) : impl_(std::make_unique<Impl>(config)) {}
+ BufferMapper::~BufferMapper() = default;
+ BufferMapper::BufferMapper(BufferMapper&&) noexcept = default;
+ BufferMapper& BufferMapper::operator=(BufferMapper&&) noexcept = default;
+@@ -123,7 +138,14 @@
+ std::unique_ptr<detail::MappedPublication>
+ BufferMapper::acquire_publication_impl(
+     const ros2_cuda_ipc_msgs::msg::BufferCore& msg) const {
+-  return map_descriptor(impl_->mapping_cache, msg);
++  if (ros2_cuda_ipc_core::detail::CudaDeviceContext::primary_release_failed())
++    return nullptr;
++  return impl_ ? map_descriptor(impl_->epoch, msg) : nullptr;
++}
++
++bool BufferMapper::poisoned() const noexcept {
++  return ros2_cuda_ipc_core::detail::CudaDeviceContext::primary_release_failed() ||
++         (impl_ && impl_->epoch->poisoned.load());
+ }
+ 
+ namespace detail {
+--- a/ros2_cuda_ipc_core/src/subscriber/read_handle.cpp
++++ b/ros2_cuda_ipc_core/src/subscriber/read_handle.cpp
+@@ -6,6 +6,7 @@
+ #include <rcutils/logging_macros.h>
+ 
+ #include <condition_variable>
++#include <chrono>
+ #include <deque>
+ #include <memory>
+ #include <mutex>
+@@ -14,6 +15,7 @@
+ #include <utility>
+ 
+ #include "ros2_cuda_ipc_core/backend/memory_importer.hpp"
++#include "admission.hpp"
+ #include "ros2_cuda_ipc_core/buffer_metadata/buffer_ref.hpp"
+ #include "ros2_cuda_ipc_core/detail/cuda_driver_context.hpp"
+ #include "ros2_cuda_ipc_core/detail/read_handle_factory.hpp"
+@@ -25,41 +27,26 @@
+   std::shared_ptr<ros2_cuda_ipc_core::detail::CudaDeviceContext> context;
+   CUevent event = nullptr;
+ 
+-  ~CompletionEvent() noexcept {
+-    if (event == nullptr || !context) {
+-      return;
+-    }
+-    try {
+-      auto guard_result = context->push_current();
+-      if (!guard_result) {
+-        RCUTILS_LOG_ERROR_NAMED(
+-            "ros2_cuda_ipc_core.subscriber.read_handle",
+-            "Failed to activate CUDA context while destroying completion "
+-            "event: %s",
+-            guard_result.error().to_string().c_str());
+-        return;
+-      }
+-      auto guard = std::move(guard_result).value();
+-      const CUresult result = cuEventDestroy(event);
+-      if (result != CUDA_SUCCESS) {
+-        RCUTILS_LOG_ERROR_NAMED(
+-            "ros2_cuda_ipc_core.subscriber.read_handle",
+-            "cuEventDestroy failed for completion event: %s",
+-            ros2_cuda_ipc_core::detail::CudaDriverError(result)
+-                .to_string()
+-                .c_str());
+-      }
+-    } catch (...) {
+-      // Cleanup must not escape a noexcept boundary.
+-    }
++  bool try_close() noexcept {
++    if (!event) return true;
++    if (!context) return false;
++    auto result = context->push_current();
++    if (!result) return false;
++    auto guard = std::move(result).value();
++    if (cuEventDestroy(event) != CUDA_SUCCESS) return false;
+     event = nullptr;
+-  }
++    return true;
++  }
++
++  ~CompletionEvent() noexcept { (void)try_close(); }
++
+ };
+ 
+ struct DeferredItem {
+   std::shared_ptr<CompletionEvent> completion;
+   std::shared_ptr<const backend::ImportedResources> resource;
+   std::unique_ptr<buffer_metadata::BufferRef> buffer_ref;
++  std::shared_ptr<void> admission;
+ };
+ 
+ class DeferredReleaseQueue {
+@@ -83,6 +70,10 @@
+       // before the consumer stream has completed.  The item is intentionally
+       // leaked so its resource, completion event, and buffer reference are all
+       // retained.
++      if (item->admission) {
++        auto permit = std::static_pointer_cast<detail::ReadAdmission>(item->admission);
++        permit->retain_failed(permit);
++      }
+       RCUTILS_LOG_ERROR_NAMED(
+           "ros2_cuda_ipc_core.subscriber.read_handle",
+           "Failed to enqueue deferred GPU read release; retaining buffer "
+@@ -91,6 +82,10 @@
+   }
+ 
+   void retain_failed(DeferredItem* item) noexcept {
++    if (item->admission) {
++      auto permit = std::static_pointer_cast<detail::ReadAdmission>(item->admission);
++      permit->retain_failed(permit);
++    }
+     try {
+       std::lock_guard<std::mutex> lock(mutex_);
+       failed_.emplace_back(item);
+@@ -109,51 +104,54 @@
+ 
+   void run() noexcept {
+     while (true) {
+-      DeferredItem* item = nullptr;
++      std::deque<DeferredItem*> pass;
+       {
+         std::unique_lock<std::mutex> lock(mutex_);
+         condition_.wait(lock, [this]() { return !items_.empty(); });
+-        item = items_.front();
+-        items_.pop_front();
+-      }
+-
+-      if (!item->completion || !item->completion->context ||
+-          item->completion->event == nullptr) {
++        pass.swap(items_);
++      }
++      for (auto* item : pass) {
++        if (!item->completion || !item->completion->context ||
++            item->completion->event == nullptr) {
++          RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.subscriber.read_handle",
++                                  "Deferred GPU completion state is missing");
++          retain_failed(item);
++          continue;
++        }
++        auto guard_result = item->completion->context->push_current();
++        if (!guard_result) {
++          RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.subscriber.read_handle",
++                                  "Completion context activation failed code=%d",
++                                  guard_result.error().code());
++          retain_failed(item);
++          continue;
++        }
++        auto guard = std::move(guard_result).value();
++        const CUresult result = cuEventQuery(item->completion->event);
++        if (result == CUDA_ERROR_NOT_READY) {
++          enqueue(item);
++          continue;
++        }
++        if (result != CUDA_SUCCESS) {
++          RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.subscriber.read_handle",
++                                  "Consumer completion query failed code=%d", result);
++          retain_failed(item);
++          continue;
++        }
++        if (!item->completion->try_close()) {
++          RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.subscriber.read_handle",
++                                  "Consumer completion event cleanup failed");
++          retain_failed(item);
++          continue;
++        }
++        item->completion.reset();
++        item->resource.reset();
++        detail::release_read_ref(item->buffer_ref, item->admission);
++        item->admission.reset();
+         delete item;
+-        continue;
+-      }
+-
+-      auto guard_result = item->completion->context->push_current();
+-      if (!guard_result) {
+-        RCUTILS_LOG_ERROR_NAMED(
+-            "ros2_cuda_ipc_core.subscriber.read_handle",
+-            "Failed to activate CUDA context while waiting for completion "
+-            "event: %s",
+-            guard_result.error().to_string().c_str());
+-        retain_failed(item);
+-        continue;
+-      }
+-      auto guard = std::move(guard_result).value();
+-      const CUresult result = cuEventSynchronize(item->completion->event);
+-      if (result != CUDA_SUCCESS) {
+-        RCUTILS_LOG_ERROR_NAMED(
+-            "ros2_cuda_ipc_core.subscriber.read_handle",
+-            "cuEventSynchronize failed; retaining publication buffer "
+-            "reference: %s",
+-            ros2_cuda_ipc_core::detail::CudaDriverError(result)
+-                .to_string()
+-                .c_str());
+-        retain_failed(item);
+-        continue;
+-      }
+-
+-      // The item is destroyed only after the event has completed.  Its
+-      // completion event is destroyed first, then the resource deleter and
+-      // the buffer reference releases its handle-specific ownership.
+-      item->completion.reset();
+-      item->resource.reset();
+-      item->buffer_ref.reset();
+-      delete item;
++      }
++      // Poll every pending event fairly; no blocked stream stalls another read.
++      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+     }
+   }
+ 
+@@ -175,21 +173,13 @@
+     return {};
+   }
+   auto guard = std::move(guard_result).value();
+-  CUevent event = nullptr;
+-  if (cuEventCreate(&event, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) {
++  auto result = std::make_shared<CompletionEvent>();
++  result->context = context;
++  if (cuEventCreate(&result->event, CU_EVENT_DISABLE_TIMING) != CUDA_SUCCESS) {
++    result->event = nullptr;
+     return {};
+   }
+-  try {
+-    auto result = std::make_shared<CompletionEvent>();
+-    result->context = context;
+-    result->event = event;
+-    return result;
+-  } catch (...) {
+-    // The event was created before allocating its owning state.  Preserve
+-    // the no-leak guarantee even on an exceptional allocation path.
+-    (void)cuEventDestroy(event);
+-    throw;
+-  }
++  return result;
+ }
+ 
+ bool validate_stream(
+@@ -199,33 +189,7 @@
+   if (!context) {
+     return true;
+   }
+-  const int expected_device = context->device_id();
+-  if (stream == CU_STREAM_LEGACY || stream == CU_STREAM_PER_THREAD) {
+-    auto guard_result = context->push_current();
+-    if (!guard_result) {
+-      return false;
+-    }
+-    auto guard = std::move(guard_result).value();
+-    CUdevice current_device = 0;
+-    return cuCtxGetDevice(&current_device) == CUDA_SUCCESS &&
+-           static_cast<int>(current_device) == expected_device;
+-  }
+-
+-  CUcontext stream_context = nullptr;
+-  CUresult result = cuStreamGetCtx(stream, &stream_context);
+-  if (result != CUDA_SUCCESS) {
+-    return false;
+-  }
+-  auto guard_result =
+-      ros2_cuda_ipc_core::detail::CudaContextGuard::push(stream_context);
+-  if (!guard_result) {
+-    return false;
+-  }
+-  auto guard = std::move(guard_result).value();
+-  CUdevice stream_device = 0;
+-  result = cuCtxGetDevice(&stream_device);
+-  return result == CUDA_SUCCESS &&
+-         static_cast<int>(stream_device) == expected_device;
++  return context->owns_stream(stream);
+ }
+ 
+ bool enqueue_ready_event(
+@@ -239,12 +203,11 @@
+     return true;
+   }
+   const auto context = resource->context;
++  std::optional<ros2_cuda_ipc_core::detail::CudaContextGuard> guard;
+   if (context) {
+     auto guard_result = context->push_current();
+-    if (!guard_result) {
+-      return false;
+-    }
+-    auto guard = std::move(guard_result).value();
++    if (!guard_result) return false;
++    guard.emplace(std::move(guard_result).value());
+   }
+   return cuStreamWaitEvent(stream, event, 0) == CUDA_SUCCESS;
+ }
+@@ -256,19 +219,36 @@
+ MappedPublication::MappedPublication(
+     std::shared_ptr<const backend::ImportedResources> resource,
+     std::unique_ptr<buffer_metadata::BufferRef> buffer_ref,
+-    std::size_t byte_size, int device_id) noexcept
++    std::size_t byte_size, int device_id, std::shared_ptr<void> admission) noexcept
+     : resource_(std::move(resource)),
+       buffer_ref_(std::move(buffer_ref)),
++      admission_(std::move(admission)),
+       byte_size_(byte_size),
+       device_id_(device_id) {}
+ 
+-MappedPublication::~MappedPublication() noexcept = default;
++MappedPublication::~MappedPublication() noexcept {
++  resource_.reset();
++  release_read_ref(buffer_ref_, admission_);
++  admission_.reset();
++}
+ 
+ MappedPublication::MappedPublication(MappedPublication&& other) noexcept =
+     default;
+ 
+ MappedPublication& MappedPublication::operator=(
+-    MappedPublication&& other) noexcept = default;
++    MappedPublication&& other) noexcept {
++  if (this != &other) {
++    resource_.reset();
++    release_read_ref(buffer_ref_, admission_);
++    admission_.reset();
++    resource_ = std::move(other.resource_);
++    buffer_ref_ = std::move(other.buffer_ref_);
++    admission_ = std::move(other.admission_);
++    byte_size_ = other.byte_size_;
++    device_id_ = other.device_id_;
++  }
++  return *this;
++}
+ 
+ bool MappedPublication::valid() const noexcept {
+   return resource_ && resource_->dev_ptr != nullptr && buffer_ref_ != nullptr;
+@@ -288,6 +268,7 @@
+   std::shared_ptr<const backend::ImportedResources> resource;
+   std::unique_ptr<buffer_metadata::BufferRef> buffer_ref;
+   std::unique_ptr<DeferredItem> deferred_item;
++  std::shared_ptr<void> admission;
+   std::size_t byte_size = 0;
+   int device_id = -1;
+   CUstream consumer_stream = nullptr;
+@@ -303,7 +284,8 @@
+     if (!completion || completion->event == nullptr || !completion->context) {
+       completion.reset();
+       resource.reset();
+-      buffer_ref.reset();
++      detail::release_read_ref(buffer_ref, admission);
++      admission.reset();
+       deferred_item.reset();
+       return;
+     }
+@@ -313,6 +295,7 @@
+       item->completion = std::move(completion);
+       item->resource = std::move(resource);
+       item->buffer_ref = std::move(buffer_ref);
++      item->admission = std::move(admission);
+       try {
+         auto& queue = DeferredReleaseQueue::instance();
+         if (failed) {
+@@ -321,6 +304,10 @@
+           queue.enqueue(item);
+         }
+       } catch (...) {
++        if (item->admission) {
++          auto permit = std::static_pointer_cast<detail::ReadAdmission>(item->admission);
++          permit->retain_failed(permit);
++        }
+         // No destructor may run here: retaining the raw item keeps the
+         // resource, completion event, and buffer reference alive if queue
+         // initialization or worker creation fails.
+@@ -334,6 +321,13 @@
+     auto guard_result = completion->context->push_current();
+     if (guard_result) {
+       auto guard = std::move(guard_result).value();
++      if (!validate_stream(resource, consumer_stream)) {
++        RCUTILS_LOG_ERROR_NAMED("ros2_cuda_ipc_core.subscriber.read_handle",
++                                "Bound consumer stream is no longer valid");
++        submit(true);
++        consumer_stream = nullptr;
++        return;
++      }
+       const CUresult result = cuEventRecord(completion->event, consumer_stream);
+       if (result == CUDA_SUCCESS) {
+         submit(false);
+@@ -342,15 +336,14 @@
+       }
+       RCUTILS_LOG_ERROR_NAMED(
+           "ros2_cuda_ipc_core.subscriber.read_handle",
+-          "cuEventRecord failed; retaining publication buffer reference: %s",
+-          ros2_cuda_ipc_core::detail::CudaDriverError(result)
+-              .to_string()
+-              .c_str());
++          "cuEventRecord failed; retaining publication buffer reference code=%d",
++          static_cast<int>(result));
+     } else {
+       RCUTILS_LOG_ERROR_NAMED(
+           "ros2_cuda_ipc_core.subscriber.read_handle",
+           "Failed to activate CUDA context while recording completion event; "
+-          "retaining publication buffer reference");
++          "retaining publication buffer reference code=%d",
++          static_cast<int>(guard_result.error().code()));
+     }
+ 
+     submit(true);
+@@ -397,13 +390,21 @@
+ std::unique_ptr<MappedPublication> ReadHandleFactory::make_publication(
+     std::shared_ptr<const backend::ImportedResources> resource,
+     std::unique_ptr<buffer_metadata::BufferRef> buffer_ref,
+-    std::size_t byte_size, int device_id) {
++    std::size_t byte_size, int device_id, std::shared_ptr<void> admission) {
+   if (!resource || !buffer_ref || resource->dev_ptr == nullptr) {
++    resource.reset();
++    release_read_ref(buffer_ref, admission);
+     return nullptr;
+   }
+-
+-  return std::unique_ptr<MappedPublication>(new MappedPublication(
+-      std::move(resource), std::move(buffer_ref), byte_size, device_id));
++  try {
++    return std::unique_ptr<MappedPublication>(new MappedPublication(
++        std::move(resource), std::move(buffer_ref), byte_size, device_id,
++        std::move(admission)));
++  } catch (...) {
++    resource.reset();
++    release_read_ref(buffer_ref, admission);
++    throw;
++  }
+ }
+ 
+ std::optional<ReadHandle> ReadHandleFactory::make_bound(
+@@ -436,6 +437,7 @@
+   // This is the ownership commit.  No fallible operation follows it.
+   impl->resource = std::move(publication.resource_);
+   impl->buffer_ref = std::move(publication.buffer_ref_);
++  impl->admission = std::move(publication.admission_);
+   return ReadHandle(std::move(impl));
+ }
+ 
