@@ -256,7 +256,8 @@ int subscriber(const std::string & topic, std::size_t limit)
       } else if (command == "fault_stats") {
         const auto counts = g3_import_failure::stats();
         std::cout << "FAULT_STATS " << counts.failures << " " << counts.cleanup_calls << " " <<
-          counts.imports << " " << counts.retains << " " << mapper->poisoned() << std::endl;
+          counts.imports << " " << counts.retains << " " << counts.connections << " " <<
+          counts.receives << " " << mapper->poisoned() << std::endl;
 #endif
       } else if (command == "quit") {
         break;

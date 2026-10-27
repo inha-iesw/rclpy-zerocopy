@@ -99,7 +99,8 @@ endforeach()
 target_compile_definitions(g3_cleanup_peer PRIVATE G3_CLEANUP_INJECTION)
 target_link_libraries(g3_cleanup_peer ${CMAKE_DL_LIBS})
 foreach(_symbol cuIpcOpenEventHandle cuMemUnmap cuMemAddressFree cuMemRelease
-    cuEventDestroy_v2 cuCtxPopCurrent_v2 cuMemImportFromShareableHandle cuDevicePrimaryCtxRetain)
+    cuEventDestroy_v2 cuCtxPopCurrent_v2 cuMemImportFromShareableHandle cuDevicePrimaryCtxRetain
+    connect recvmsg)
   target_link_options(g3_cleanup_peer PRIVATE "-Wl,--export-dynamic-symbol=${_symbol}")
 endforeach()
 

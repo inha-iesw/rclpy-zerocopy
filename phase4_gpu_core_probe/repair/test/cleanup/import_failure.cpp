@@ -2,8 +2,11 @@
 
 #include <cuda.h>
 #include <dlfcn.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -12,7 +15,8 @@ namespace
 {
 enum class Failure
 {
-  None, Unmap, AddressFree, Release, EventDestroy, ImportPop, PartialUnmap, PartialPop
+  None, Unmap, AddressFree, Release, EventDestroy, ImportPop, PartialUnmap, PartialPop,
+  ReceiveError, ReceiveEof
 };
 
 Failure selected_failure()
@@ -27,6 +31,8 @@ Failure selected_failure()
       if (std::strcmp(value, "import_pop") == 0) {return Failure::ImportPop;}
       if (std::strcmp(value, "partial_unmap") == 0) {return Failure::PartialUnmap;}
       if (std::strcmp(value, "partial_pop") == 0) {return Failure::PartialPop;}
+      if (std::strcmp(value, "recv_error") == 0) {return Failure::ReceiveError;}
+      if (std::strcmp(value, "recv_eof") == 0) {return Failure::ReceiveEof;}
       return Failure::None;
     }();
   return selected;
@@ -39,6 +45,9 @@ std::atomic<unsigned> failure_count{0};
 std::atomic<unsigned> cleanup_calls{0};
 std::atomic<unsigned> import_calls{0};
 std::atomic<unsigned> retain_calls{0};
+std::atomic<unsigned> connection_calls{0};
+std::atomic<unsigned> receive_calls{0};
+std::atomic<int> request_socket{-1};
 
 template<typename Function>
 Function original(const char * symbol)
@@ -62,9 +71,44 @@ namespace g3_import_failure
 {
 Stats stats()
 {
-  return {failure_count.load(), cleanup_calls.load(), import_calls.load(), retain_calls.load()};
+  return {failure_count.load(), cleanup_calls.load(), import_calls.load(), retain_calls.load(),
+    connection_calls.load(), receive_calls.load()};
 }
 }  // namespace g3_import_failure
+
+extern "C" int connect(int socket, const sockaddr * address, socklen_t length)
+{
+  static const auto real = original<decltype(&connect)>("connect");
+  if (!real) {errno = ENOSYS; return -1;}
+  const int result = real(socket, address, length);
+  const auto selected = selected_failure();
+  constexpr char prefix[] = "/tmp/cuda_memory_pool_";
+  if (result == 0 && (selected == Failure::ReceiveError || selected == Failure::ReceiveEof) &&
+    address->sa_family == AF_UNIX && length >= sizeof(sockaddr_un) &&
+    std::strncmp(reinterpret_cast<const sockaddr_un *>(address)->sun_path,
+    prefix, sizeof(prefix) - 1) == 0)
+  {
+    connection_calls.fetch_add(1);
+    request_socket.store(socket);
+  }
+  return result;
+}
+
+extern "C" ssize_t recvmsg(int socket, msghdr * message, int flags)
+{
+  // Inject before receiving SCM_RIGHTS; closing this connected socket must
+  // return all request FDs without charging an imported CUDA resource.
+  int expected = socket;
+  if (request_socket.compare_exchange_strong(expected, -1) && receive_calls.fetch_add(1) < 3) {
+    failure_count.fetch_add(1);
+    if (selected_failure() == Failure::ReceiveEof) {return 0;}
+    errno = EIO;
+    return -1;
+  }
+  static const auto real = original<decltype(&recvmsg)>("recvmsg");
+  if (!real) {errno = ENOSYS; return -1;}
+  return real(socket, message, flags);
+}
 
 // These calls operate on actual peer-imported VMM and IPC-event resources.
 // Normal driver calls pass through, including every call when the environment

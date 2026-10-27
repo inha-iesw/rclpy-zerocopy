@@ -258,6 +258,28 @@ def test_import_failures_do_not_accumulate_fds_or_metadata_maps(peers):
     close(publisher, subscriber)
 
 
+@pytest.mark.parametrize('fault', ['recv_error', 'recv_eof'])
+def test_connected_fd_request_failure_releases_admission_and_allows_import(peers, fault):
+    publisher, subscriber = peers(fault=fault)
+    publish(publisher, 47)
+    assert subscriber.ask('stash')[0] == 'STASHED'
+    before = subscriber.ask('resources')
+    for attempt in range(1, 4):
+        assert subscriber.ask('map_only') == ['REJECTED']
+        stats = subscriber.ask('fault_stats')
+        assert list(map(int, stats[1:4])) == [attempt, 0, 0]
+        assert list(map(int, stats[5:])) == [attempt, attempt, 0]
+        assert subscriber.ask('resources') == before
+    # H=1: three real connected requests and this successful import prove that
+    # failed requests return admission. Normal peer close also checks read refs.
+    assert subscriber.ask('map')[0] == 'MAPPED'
+    assert subscriber.ask('finish') == ['DONE', str(47 * 64)]
+    stats = subscriber.ask('fault_stats')
+    assert list(map(int, stats[1:4])) == [3, 0, 1]
+    assert list(map(int, stats[5:])) == [4, 4, 0]
+    close(publisher, subscriber)
+
+
 @pytest.mark.parametrize('fault', [
     'unmap', 'address_free', 'release', 'event_destroy', 'import_pop',
     'partial_unmap', 'partial_pop'])

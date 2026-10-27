@@ -157,7 +157,7 @@ bridge/discovery and preload that hook. Before loading a module, check
 vermagic and the running kernel. The old module inside the nested fork is x86_64.
 This run temporarily loaded only the matching `agnocast_rclpy` module and unloaded
 it afterward; the pre-existing `agnocast` module was preserved. Absent opt-in,
-the 18 transport cases skip; this is not an equivalent safety result.
+the 20 transport cases skip; this is not an equivalent safety result.
 The nested Agnocast fork is still uncommitted; an outer checkout alone does not
 reconstruct those device artifacts.
 
