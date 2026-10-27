@@ -201,6 +201,8 @@ preserved in [EVIDENCE.md](EVIDENCE.md). Those records are not new executions.
 ### Upstream test migration
 
 `test/upstream/` adapts the pinned MIT test sources to the repaired contracts.
+Its [LICENSE](test/upstream/LICENSE) preserves the pinned upstream permission
+notice verbatim; the individual source copyright/SPDX notices are retained.
 The canonical core patch and production APIs are unchanged. All ten upstream
 core test groups are now connected to the repaired-core probe; the old Python
 bindings and examples remain outside this build.
