@@ -25,6 +25,7 @@ EVENTS = {'READY', 'PUB', 'FULL', 'AVAILABLE', 'CONNECTIONS', 'CLOSED', 'STASHED
 class Peer:
     def __init__(self, binary, role, topic, limit, directory, fault=None):
         self.role = role
+        self.stopped = False
         self.descriptors = set()
         env = os.environ.copy()
         env.update(AGNOCAST_DEVICE_PATH='/dev/agnocast_rclpy', AGNOCAST_BRIDGE_MODE='off',
@@ -70,6 +71,8 @@ class Peer:
         return self.receive()
 
     def stop(self):
+        if self.stopped:
+            return
         if self.process.poll() is None:
             self.process.terminate()
         try:
@@ -86,6 +89,7 @@ class Peer:
         self.process.stdout.close()
         self.stdout.close()
         self.stderr.close()
+        self.stopped = True
 
 
 @pytest.fixture
@@ -322,6 +326,31 @@ def test_gpu_consumer_crash_strands_fixed_slot_until_peer_restart(peers):
     assert subscriber.ask('take')[0] == 'MAPPED'
     assert subscriber.ask('finish') == ['DONE', str(59 * 64)]
     close(publisher, subscriber)
+
+
+def test_repeated_peer_restart_cleans_only_recorded_names_and_preserves_other_pair(peers):
+    healthy_publisher, healthy_subscriber = peers()
+    for cycle in range(3):
+        publisher, subscriber = peers()
+        packet = publish(publisher, 67 + cycle)
+        assert subscriber.ask('take')[0] == 'MAPPED'
+        subscriber.process.kill()
+        assert subscriber.process.wait(timeout=5) == -signal.SIGKILL
+        assert publisher.ask('close') == ['CLOSED', '0']
+        assert publisher.ask('probe') == ['FULL']
+        # An unrelated pair remains usable while this pair requires restart.
+        publish(healthy_publisher, 71 + cycle)
+        assert healthy_subscriber.ask('take')[0] == 'MAPPED'
+        assert healthy_subscriber.ask('finish') == ['DONE', str((71 + cycle) * 64)]
+        publisher.process.kill()
+        assert publisher.process.wait(timeout=5) == -signal.SIGKILL
+        metadata = Path(f'/dev/shm/rclpy_zc_gpu_v1_{publisher.process.pid}_{packet[2]}')
+        address = Path(packet[4])
+        assert metadata.exists() and address.exists()
+        subscriber.stop()
+        publisher.stop()
+        assert not metadata.exists() and not address.exists()
+    close(healthy_publisher, healthy_subscriber)
 
 
 def settled_resources(peer):

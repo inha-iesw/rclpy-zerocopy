@@ -36,6 +36,22 @@ target_compile_features(test_legacy_release PRIVATE cxx_std_17)
 target_link_libraries(test_legacy_release
   ros2_cuda_ipc_core::ros2_cuda_ipc_core CUDA::cudart CUDA::cuda_driver)
 
+ament_add_gtest_executable(test_metadata_collision test/lifetime/test_metadata_collision.cpp
+  test/cleanup/isolated_main.cpp SKIP_LINKING_MAIN_LIBRARIES)
+target_compile_features(test_metadata_collision PRIVATE cxx_std_17)
+target_link_libraries(test_metadata_collision
+  ros2_cuda_ipc_core::ros2_cuda_ipc_core CUDA::cudart)
+foreach(_case First Second)
+  set(_test "metadata_collision_${_case}")
+  set(_xml "${AMENT_TEST_RESULTS_DIR}/${PROJECT_NAME}/${_test}.gtest.xml")
+  ament_add_test(${_test}
+    COMMAND $<TARGET_FILE:test_metadata_collision>
+      "--gtest_filter=Collision/RepairedMetadataCollision.ExistingNameSurvivesFailedInitialisation/${_case}"
+      "--gtest_output=xml:${_xml}"
+    RESULT_FILE "${_xml}"
+    OUTPUT_FILE "${CMAKE_BINARY_DIR}/ament_cmake_gtest/${_test}.txt" TIMEOUT 20)
+endforeach()
+
 ament_add_gtest(test_mapper_shutdown test/lifetime/test_mapper_shutdown.cpp TIMEOUT 20)
 target_compile_features(test_mapper_shutdown PRIVATE cxx_std_17)
 target_include_directories(test_mapper_shutdown PRIVATE

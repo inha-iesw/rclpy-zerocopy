@@ -1,8 +1,8 @@
 # Bounded GPU core repair and native Agnocast integration
 
-The pre-cleanup native experiment passed **73 cases, with three multi-GPU skips,
-across 15 CTest targets** on the observed Thor configuration. Its own safety and
-integration suite has 43 passes; reused upstream tests add 30 passes and three
+The reviewed native experiment passed **109 cases, with three multi-GPU skips,
+across 38 CTest targets** on the observed Thor configuration. Its own safety and
+integration suite has 79 passes; reused upstream tests add 30 passes and three
 skips. This establishes the tested safety boundaries;
 the full G3 adoption gate remains open. Python GPU Tensor ownership (G4),
 Orin validation and performance/copy profiling (G5) remain unfinished.
@@ -15,7 +15,7 @@ The original rejection diagnostics and upstream baseline are preserved in
 `0e8933c8e58ffa7f1240a4c9efda3a2b84e5398c` with GNU patch, zero fuzz, and verifies
 every resulting source file. It neither modifies the pristine tree nor invokes
 Git. The MIT core patch is `patches/core-lifecycle.patch`, SHA256
-`63b386b77d541a4ee3dc110339281ff16f9e2d1d6b47b28f5d3f29c537c5050c`
+`76400ff87477f1048ac1a4adb41229b14c34c4ddb2b76865c55376bcbf5845c0`
 (23 core files).
 
 The existing CUDA VMM allocation/import, SCM_RIGHTS FD transfer and IPC event
@@ -69,10 +69,14 @@ CPU adapter ABI 3 and the Python CPU API are unchanged.
 - A dead consumer's reference is not reclaimed. Its fixed slot remains unavailable.
   A dead reader can therefore prevent the draining pool from ever closing.
   Recovery then requires restarting all involved GPU peers. There is no live-pool
-  transparent crash recovery or holder ledger. The inherited dead-PID metadata
-  scavenger removes names, not GPU references. SIGKILL can also leave socket names;
-  operational orphan cleanup remains a separate requirement. Tests explicitly
-  remove their known dead peers' IPC names after those peers exit.
+  transparent crash recovery or holder ledger. The inherited global dead-PID
+  metadata scavenger has been removed: a PID invisible in this namespace does
+  not establish ownership of its IPC names. Existing-name collisions also fail
+  initialization without unlinking that object, even when the PID matches.
+  Earlier names created by the failed pool are rolled back. This preserves peer
+  ownership; it does not establish full cross-PID-namespace deployment support.
+  SIGKILL leaves metadata/socket names.
+  Tests remove only recorded names after their known GPU peers have exited.
 
 For manager/mapper callers the import mapping bound is at most H mappings of
 `align(M, CUDA allocation granularity)` bytes each, including retained failures.
@@ -101,6 +105,13 @@ requires every old mapper and owner to disappear. Mapper destruction alone does
 not seal other aliases.
 
 After subscriber drain, close the producer pool before CUDA/runtime teardown.
+On poison or a dead reader, stop all involved GPU peers and restart them together;
+a live producer cannot reclaim the stranded reference. Clean only metadata and
+socket names recorded by the supervisor for those confirmed-dead peers. Do not
+glob-delete names or infer ownership from `kill(pid, 0)` in another PID namespace.
+This is an explicit restart/ownership policy, not an implemented production
+supervisor, crash collector or transparent reset. Three controlled crash/restart
+cycles preserve an unrelated pair's progress and remove only recorded test names.
 
 ## Reproduce
 
@@ -139,28 +150,38 @@ bridge/discovery and preload that hook. Before loading a module, check
 vermagic and the running kernel. The old module inside the nested fork is x86_64.
 This run temporarily loaded only the matching `agnocast_rclpy` module and unloaded
 it afterward; the pre-existing `agnocast` module was preserved. Absent opt-in,
-the transport cases skip; this is not an equivalent safety result.
+the 18 transport cases skip; this is not an equivalent safety result.
 The nested Agnocast fork is still uncommitted; an outer checkout alone does not
 reconstruct those device artifacts.
 
-## Pre-cleanup results and remaining work
+The isolated cleanup and collision executables require exactly one selected case
+per process and return an error for an empty filter. CTest registers each filter
+explicitly; the runner regression also checks an empty XML cannot mask exit failure.
+
+## Observed results and remaining work
 
 | Test group | Cases | Evidence |
 |---|---:|---|
 | Metadata reservations | 7 | Exclusive generation, stale reader, overflow, dead reader and 1,000 concurrent admission races |
 | Producer lifetime | 4 | Pending cancel/prepare, active close refusal, single live pool |
 | Producer stream mismatch | 1 | Rejected preparation preserves a cancellable block without poison |
-| Pool retirement | 5 | Pending prepare/cancel, last block after manager, retained reader and competing replacements |
+| Pool retirement and orphan ownership | 6 | Pending prepare/cancel, last block after manager, retained reader, competing replacements and preservation of foreign metadata names |
+| Existing metadata name collision | 2 | First/second block collisions preserve the reopened inode, link count and bytes; owned earlier blocks roll back |
+| Mapper shutdown state | 3 | Shared seal visibility, moved-from close refusal and fresh epoch only after the final alias disappears |
 | Bound default/legacy lifetime | 6 | Prepare/cancel/read completion on a CUDA-unused thread, with context restoration |
 | Quarantine | 1 | Injected `cuEventRecord` failure invalidates the block and blocks 20 replacement pools after synchronization |
 | Producer context validation | 3 | Primary default allowed; per-thread/foreign contexts rejected |
 | Primary release failure | 1 | Injected driver failure blocks 20 replacements; one unresolved release attempt |
 | Dense descriptor | 6 | dtype, span, allocation, layout and overflow validation |
-| Actual Agnocast processes | 9 | Pending producer/consumer, stale generation, H limit, fair completion, ordinary import errors, FD disconnect, SIGKILL/restart and checkpoint |
+| Producer cleanup faults | 11 | Event/query/context/VMM cleanup, partial allocation rollback, context pop failure/mismatch; no cleanup retry or replacement allocation |
+| Subscriber completion faults | 4 | Record, query, destroy, failed wait plus failed event cleanup; charged reference retention |
+| Subscriber context restoration | 4 | Releaser/worker pop gates and faults; no drain before restoration |
+| Isolated runner | 2 | Missing producer/subscriber case filters return failure despite valid zero-test XML |
+| Actual Agnocast processes | 18 | Existing nine cases, shared-epoch drain, three restart cycles with an independent pair, and seven actual imported-resource/context cleanup faults |
 | Reused upstream core | 30 PASS + 3 SKIP | Context, pool, publisher message, metadata cache, IPC cache and read-handle oracles |
 
-The custom suite is **43 PASS, zero failures/errors/skips**. Together with the
-upstream oracles this is **76 collected = 73 PASS + 3 SKIP**, with all 15 CTest
+The custom suite is **79 PASS, zero failures/errors/skips**. Together with the
+upstream oracles this is **112 collected = 109 PASS + 3 SKIP**, with all 38 CTest
 targets passing. All three skips require multiple GPUs. The checkpoint
 used 32 fixed blocks: 64 warmup deliveries followed by 1,000 measured deliveries,
 checking every checksum and increasing per-block UIDs. Settled before/after
@@ -199,18 +220,44 @@ ready wait, before any consumer gate/kernel. The consumer lifetime cases use a
 bounded host callback gate. Kernel initialization is warmed before that gate and
 the checksum sample is reset so warmup cannot satisfy the completion assertion.
 
-The prior CPU regression was 12 packages, 39 CTest targets,
-**466 PASS + 118 opt-in SKIP**; it was not rerun for these core/probe changes.
-The repaired build includes core/messages/envelope, not the old upstream
-Python/Torch binding. Pre-cleanup RED/GREEN evidence, source and static-library hashes,
-frozen XML/logs and module cleanup are under `log/g3/repair-review/assessment.json`
-and `log/g3/repair-review/verification/`. The original baseline/rejection and
-`log/g3/repair-assessment.json` remain historical records. Nine inactive sockets
-created by this review's RED runs were removed; the 13 pre-existing sockets were
-preserved. This test cleanup is not a production orphan collector.
+The latest CPU regression reran `CMAKE_BUILD_PARALLEL_LEVEL=2 bash scripts/verify`:
+12 packages, 39 CTest targets, **466 PASS + 118 opt-in SKIP**, zero failures/errors.
+This is a verifier execution, not a new finalize result. The repaired build covers
+core/messages/envelope and native probes, not the old Python/Torch binding.
 
-Remaining G3 work includes the broader cleanup-failure matrix and production
-crash/orphan/reset policy. Poison transitions now emit diagnostics, but the full
-operation-specific cleanup logging audit remains open. G4 still needs the Python GPU provider, Tensor alias
-ownership and framework-stream lifetime tests. No Orin/CUDA 12 build, native
-Ubuntu 24.04/Jazzy test, production performance, copy trace or G5 result is claimed.
+The cleanup/drain change reproduced **10 failing cases** against the preceding
+`0fe547b3...` patch/static core: three VMM rollback faults, two final producer
+context restoration faults, failed-bind event cleanup, and four subscriber pop
+ordering/failure cases. All pass on the current core. The old core lacks mapper
+close, so its subscriber RED build observes the same charged-read/ref completion
+condition directly; the current build uses public `try_close()`. These synthetic
+completion fixtures never dereference their pointer. Seven separate actual IPC
+import cases exercise Unmap/AddressFree/Release/imported EventDestroy, successful
+import context pop, and partial-import Unmap/pop failures. Each verifies the
+initial cleanup-call count and no additional imports/retains through 20 mapper
+recreations. The legacy orphan scan is suppressed in producer RED tests to avoid
+removing unrelated names.
+
+The follow-up review fixes reproduced **four failing cases** against the preceding
+`850d9d6a...` patch/build: two name collisions and two missing test filters. Collision
+tests disable the metadata logger because its error output can change `errno` and
+hide the old EEXIST branch. The original inode loses its link and the published
+name resolves to a replacement in both RED cases. All four pass on this patch;
+three new mapper-state contracts and actual transport drain also pass.
+
+Latest evidence, previous source/static library, RED logs/XML, frozen final XML,
+source/binary hashes and device cleanup are under `log/g3/review-fixes/`.
+The preceding cleanup/drain evidence remains under `log/g3/cleanup-drain/`.
+The verified `agnocast_rclpy` module was loaded temporarily, then unloaded after
+all peers exited and module refcount reached zero. The pre-existing `agnocast`
+module and 13 sockets were preserved; no new socket names remain. Earlier
+`log/g3/repair-review/` and baseline records remain historical evidence.
+
+G3 remains open. This matrix covers the listed cleanup paths, not every allocation,
+event-creation, FD/system-call or asynchronous CUDA failure. Remaining work includes
+upstream manager/mapper/BufferRef/VMM oracle/API migration, the production supervisor
+and recorded-name recovery procedure, remaining failure combinations, and a complete
+operation-specific diagnostic audit. Current FD/metadata counts do not establish
+physical VRAM/event/VMM accounting or copy profiling. G4 still needs the Python GPU
+provider, Tensor aliases and framework-stream lifetime tests. Orin/CUDA 12,
+native Ubuntu 24.04/Jazzy, performance/copy trace and G5 remain unverified.

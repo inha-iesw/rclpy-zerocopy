@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include <filesystem>
 #include <atomic>
+#include <cerrno>
 #include <memory>
 
 #include "ros2_cuda_ipc_core/publisher/gpu_buffer_manager.hpp"
@@ -14,6 +16,28 @@ namespace
 using Manager = ros2_cuda_ipc_core::publisher::GpuBufferManager;
 using Ref = ros2_cuda_ipc_core::buffer_metadata::BufferRef;
 using Metadata = ros2_cuda_ipc_core::buffer_metadata::BufferMetadata;
+
+TEST(PoolRetirement, InitialisationPreservesOtherProcessMetadataNames)
+{
+  ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+  constexpr pid_t foreign_pid = 2147483647;
+  ASSERT_EQ(kill(foreign_pid, 0), -1);
+  ASSERT_EQ(errno, ESRCH);
+  const auto name = ros2_cuda_ipc_core::buffer_metadata::shm_name_for_block(
+    foreign_pid, static_cast<uint32_t>(getpid()));
+  auto foreign = Metadata::create(name);
+  ASSERT_TRUE(foreign);
+  struct UnlinkOwnedName
+  {
+    const std::string & name;
+    ~UnlinkOwnedName() {(void)shm_unlink(name.c_str());}
+  } cleanup{name};
+  Manager manager({1, 64, 0});
+  ASSERT_TRUE(manager.initialise());
+  // A PID invisible in this namespace does not establish ownership of its names.
+  EXPECT_TRUE(std::filesystem::exists("/dev/shm" + name));
+  EXPECT_TRUE(manager.try_close());
+}
 
 bool initialise_when_drained(Manager & manager)
 {
