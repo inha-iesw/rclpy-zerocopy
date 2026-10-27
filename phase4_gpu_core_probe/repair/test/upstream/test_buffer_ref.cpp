@@ -1,0 +1,167 @@
+// Copyright (c) 2026 Daisuke Kato
+// SPDX-License-Identifier: MIT
+
+#include <fcntl.h>
+#include <gtest/gtest.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <sstream>
+#include <thread>
+
+#include "ros2_cuda_ipc_core/buffer_metadata/buffer_ref.hpp"
+
+namespace {
+std::atomic<int64_t> clock_us{0};
+}
+
+// Freeze only this executable's steady clock for the protocol's grace oracle.
+extern "C" std::chrono::steady_clock::time_point __real__ZNSt6chrono3_V212steady_clock3nowEv();
+extern "C" std::chrono::steady_clock::time_point __wrap__ZNSt6chrono3_V212steady_clock3nowEv() {
+  const auto value = clock_us.load();
+  return value == 0 ? __real__ZNSt6chrono3_V212steady_clock3nowEv() :
+         std::chrono::steady_clock::time_point(std::chrono::microseconds(value));
+}
+
+namespace {
+
+std::string make_unique_shm_name(const char* suffix) {
+  static std::atomic<uint32_t> counter{0};
+  std::ostringstream name;
+  name << "/buffer_ref_" << ::getpid() << "_" << suffix << "_"
+       << counter.fetch_add(1);
+  return name.str();
+}
+
+class ShmGuard {
+ public:
+  explicit ShmGuard(std::string name) : name_(std::move(name)) {}
+  ~ShmGuard() { (void)::shm_unlink(name_.c_str()); }
+
+ private:
+  std::string name_;
+};
+
+}  // namespace
+
+namespace ros2_cuda_ipc_core {
+
+TEST(BufferRefTest, MappingContainsExactlyOneBlockMetadata) {
+  const auto name = make_unique_shm_name("one");
+  auto mapping = buffer_metadata::BufferMetadata::create(name);
+  ASSERT_TRUE(mapping);
+  ShmGuard guard(name);
+  EXPECT_NE(mapping->metadata(), nullptr);
+
+  const int fd = ::shm_open(name.c_str(), O_RDONLY, 0);
+  ASSERT_NE(fd, -1);
+  struct stat st{};
+  ASSERT_EQ(::fstat(fd, &st), 0);
+  EXPECT_EQ(st.st_size,
+            static_cast<off_t>(sizeof(buffer_metadata::BlockMetadata)));
+  ::close(fd);
+}
+
+TEST(BufferRefTest, AcquireReleaseAndRepeatedPublication) {
+  const auto name = make_unique_shm_name("lifecycle");
+  auto mapping = buffer_metadata::BufferMetadata::create(name);
+  ASSERT_TRUE(mapping);
+  ShmGuard guard(name);
+
+  const auto first = buffer_metadata::BufferRef::reserve_for_publish(mapping);
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(buffer_metadata::BufferRef::commit_publish(mapping, first->uid));
+  {
+    auto reference = buffer_metadata::BufferRef::acquire(mapping, first->uid);
+    ASSERT_TRUE(reference.valid());
+    EXPECT_EQ(buffer_metadata::BufferRef::current_refcount(mapping), 1u);
+  }
+  EXPECT_EQ(buffer_metadata::BufferRef::current_refcount(mapping), 0u);
+
+  // Expire only this owned CPU fixture; no GPU completion is implied.
+  mapping->metadata()->publish_timestamp_us.store(1);
+  const auto second = buffer_metadata::BufferRef::reserve_for_publish(mapping);
+  ASSERT_TRUE(second);
+  EXPECT_NE(second->uid, first->uid);
+  ASSERT_TRUE(buffer_metadata::BufferRef::cancel_publish(mapping, second->uid));
+}
+
+TEST(BufferRefTest, StaleUidIsRejected) {
+  const auto name = make_unique_shm_name("stale");
+  auto mapping = buffer_metadata::BufferMetadata::create(name);
+  ASSERT_TRUE(mapping);
+  ShmGuard guard(name);
+  const auto reservation =
+      buffer_metadata::BufferRef::reserve_for_publish(mapping);
+  ASSERT_TRUE(reservation);
+  ASSERT_TRUE(buffer_metadata::BufferRef::commit_publish(mapping, reservation->uid));
+  ASSERT_TRUE(buffer_metadata::BufferRef::acquire(mapping, reservation->uid).valid());
+  EXPECT_FALSE(
+      buffer_metadata::BufferRef::acquire(mapping, reservation->uid + 1)
+          .valid());
+  EXPECT_EQ(buffer_metadata::BufferRef::current_refcount(mapping), 0u);
+}
+
+TEST(BufferRefTest, CommittedPublicationCannotBeReservedBeforeGraceExpires) {
+  const auto name = make_unique_shm_name("grace");
+  auto mapping = buffer_metadata::BufferMetadata::create(name);
+  ASSERT_TRUE(mapping);
+  ShmGuard guard(name);
+  struct FrozenClock {
+    FrozenClock() { clock_us = 1000000; }
+    ~FrozenClock() { clock_us = 0; }
+  } clock;
+  const auto writer = buffer_metadata::BufferRef::reserve_for_publish(mapping);
+  ASSERT_TRUE(writer);
+  ASSERT_TRUE(buffer_metadata::BufferRef::commit_publish(mapping, writer->uid));
+  ASSERT_EQ(buffer_metadata::BufferRef::current_refcount(mapping), 0u);
+  ASSERT_EQ(buffer_metadata::BufferRef::current_publish_timestamp_us(mapping), 1000000u);
+  EXPECT_FALSE(buffer_metadata::BufferRef::reserve_for_publish(mapping));
+  clock_us = 1099999;
+  EXPECT_FALSE(buffer_metadata::BufferRef::reserve_for_publish(mapping));
+  clock_us = 1100000;
+  const auto next = buffer_metadata::BufferRef::reserve_for_publish(mapping);
+  ASSERT_TRUE(next);
+  EXPECT_NE(next->uid, writer->uid);
+  EXPECT_TRUE(buffer_metadata::BufferRef::cancel_publish(mapping, next->uid));
+}
+
+TEST(BufferRefTest, PublisherAndSubscriberRaceIsUidSafe) {
+  const auto name = make_unique_shm_name("race");
+  auto mapping = buffer_metadata::BufferMetadata::create(name);
+  ASSERT_TRUE(mapping);
+  ShmGuard guard(name);
+  for (int iteration = 0; iteration < 100; ++iteration) {
+    const auto initial = buffer_metadata::BufferRef::reserve_for_publish(mapping);
+    ASSERT_TRUE(initial);
+    ASSERT_TRUE(buffer_metadata::BufferRef::commit_publish(mapping, initial->uid));
+    // Each race uses a live publication, never a UID invalidated by an earlier race.
+    mapping->metadata()->publish_timestamp_us.store(1);
+    std::atomic<bool> start{false};
+    std::optional<buffer_metadata::BufferRef::PublisherReservation> publisher;
+    std::optional<buffer_metadata::BufferRef> subscriber;
+    std::thread publisher_thread([&] {
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      publisher = buffer_metadata::BufferRef::reserve_for_publish(mapping);
+    });
+    std::thread subscriber_thread([&] {
+      while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+      subscriber.emplace(
+          buffer_metadata::BufferRef::acquire(mapping, initial->uid));
+    });
+    start.store(true, std::memory_order_release);
+    publisher_thread.join();
+    subscriber_thread.join();
+    EXPECT_FALSE(publisher.has_value() && subscriber->valid());
+    if (publisher) {
+      ASSERT_TRUE(
+          buffer_metadata::BufferRef::cancel_publish(mapping, publisher->uid));
+    }
+    subscriber.reset();
+  }
+}
+
+}  // namespace ros2_cuda_ipc_core

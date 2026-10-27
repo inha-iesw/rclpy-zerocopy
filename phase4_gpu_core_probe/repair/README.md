@@ -1,8 +1,8 @@
 # Bounded GPU core repair and native Agnocast integration
 
-The reviewed native experiment passed **109 cases, with three multi-GPU skips,
-across 38 CTest targets** on the observed Thor configuration. Its own safety and
-integration suite has 79 passes; reused upstream tests add 30 passes and three
+The native experiment passed **127 cases, with three multi-GPU skips,
+across 42 CTest targets** on the observed Thor configuration. Its own safety and
+integration suite has 79 passes; reused and migrated upstream tests add 48 passes and three
 skips. This establishes the tested safety boundaries;
 the full G3 adoption gate remains open. Python GPU Tensor ownership (G4),
 Orin validation and performance/copy profiling (G5) remain unfinished.
@@ -178,10 +178,10 @@ explicitly; the runner regression also checks an empty XML cannot mask exit fail
 | Subscriber context restoration | 4 | Releaser/worker pop gates and faults; no drain before restoration |
 | Isolated runner | 2 | Missing producer/subscriber case filters return failure despite valid zero-test XML |
 | Actual Agnocast processes | 18 | Existing nine cases, shared-epoch drain, three restart cycles with an independent pair, and seven actual imported-resource/context cleanup faults |
-| Reused upstream core | 30 PASS + 3 SKIP | Context, pool, publisher message, metadata cache, IPC cache and read-handle oracles |
+| Reused and migrated upstream core | 48 PASS + 3 SKIP | Context, pool, publisher message, caches, manager, BufferRef, mapper, read handle and cross-process VMM |
 
 The custom suite is **79 PASS, zero failures/errors/skips**. Together with the
-upstream oracles this is **112 collected = 109 PASS + 3 SKIP**, with all 38 CTest
+upstream oracles this is **130 collected = 127 PASS + 3 SKIP**, with all 42 CTest
 targets passing. All three skips require multiple GPUs. The checkpoint
 used 32 fixed blocks: 64 warmup deliveries followed by 1,000 measured deliveries,
 checking every checksum and increasing per-block UIDs. Settled before/after
@@ -201,14 +201,6 @@ test used a mismatched stream, so it did **not** establish failed-preparation
 quarantine: the busy-destruction defect made it pass. The replacement test injects
 an actual recording failure, verifies invalidation and poison, and synchronizes
 before destroying the manager to exclude transient event timing.
-
-Six upstream test sources now build directly against the repaired core. This
-exposed two metadata-cache failures caused by a hardcoded legacy namespace; its
-default attachment now uses `shm_name_for_block()`. The manager, mapper, BufferRef
-and VMM helper tests still require API/protocol migration. The skipped upstream
-`AcceptsSpecialStreamsWhenCallerContextIsOnAnotherDevice` case also needs a new
-oracle for strict initial binding before multi-GPU validation. These results do
-not establish compatibility with the full upstream test suite or sibling packages.
 
 The primary-release test first failed against the earlier `fc52e218...` patch:
 20 replacement pools succeeded and the injected failure was called 21 times.
@@ -245,7 +237,7 @@ hide the old EEXIST branch. The original inode loses its link and the published
 name resolves to a replacement in both RED cases. All four pass on this patch;
 three new mapper-state contracts and actual transport drain also pass.
 
-Latest evidence, previous source/static library, RED logs/XML, frozen final XML,
+The preceding review evidence, previous source/static library, RED logs/XML, frozen XML,
 source/binary hashes and device cleanup are under `log/g3/review-fixes/`.
 The preceding cleanup/drain evidence remains under `log/g3/cleanup-drain/`.
 The verified `agnocast_rclpy` module was loaded temporarily, then unloaded after
@@ -253,10 +245,47 @@ all peers exited and module refcount reached zero. The pre-existing `agnocast`
 module and 13 sockets were preserved; no new socket names remain. Earlier
 `log/g3/repair-review/` and baseline records remain historical evidence.
 
+### Upstream test migration
+
+`test/upstream/` adapts the pinned MIT test sources to the repaired contracts.
+The canonical core patch and production APIs are unchanged. All ten upstream
+core test groups are now connected to the repaired-core probe; the old Python
+bindings and examples remain outside this build.
+
+| Migrated group | Result | Contract exercised |
+|---|---:|---|
+| Manager | 6 PASS | Explicit producer stream, completion before close/cancel reuse, successive single-pool epochs and reader-protected reuse |
+| BufferRef | 5 PASS | Owned metadata size, committed/stale UID, fresh generation per race and the 100 ms grace boundary |
+| Mapper | 4 PASS | Mandatory H/M, missing/stale/unpublished rejection before import, reference and admission return after a real failed FD request |
+| Read handle | 4 PASS + 2 SKIP | Retained primary context for runtime/driver streams, default/legacy acceptance, per-thread rejection; two multi-GPU oracles remain skipped |
+| VMM | 1 PASS | A spawned child imports, checks all 4,096 bytes and releases; parent and child report final context cleanup |
+
+These five targets contain **22 cases = 20 PASS + 2 SKIP**. The five unchanged
+upstream targets add **28 PASS + 1 SKIP**. Read-handle fixtures use synthetic
+pointers without dereferencing them; actual import/data coverage comes from the
+VMM child and Agnocast transport. VMM's CPU readback is a functional oracle, not
+copy-free evidence, and its direct importer does not establish the mapper H bound.
+
+The BufferRef target wraps libstdc++'s steady-clock entry point at link time in
+this static-core test build. Only its grace case freezes the clock, verifies the
+committed timestamp, rejects at 0/99,999 microseconds and admits at 100,000; other
+cases use the real clock. No production clock or grace policy changes.
+Metadata fixtures unlink only successfully created names. Rejection tests report
+fixture setup failures separately, and the mapper counts actual `connect` calls
+so early protocol rejection cannot masquerade as import-failure cleanup.
+
+The first VMM run exposed an oracle migration error: ready recording happened
+after leaving the primary context. Recording inside that context passes strict
+default-stream binding. This was a test adaptation, not a core defect or a new
+core RED/GREEN claim. The final five executables passed direct GTest execution,
+then all 42 CTest targets and the CPU verifier passed. Evidence and frozen XML,
+sources, binaries and peer logs are under `log/g3/upstream-migration/`.
+The verified module was unloaded at refcount zero; the existing module and 13
+sockets were preserved, with no new metadata or socket names remaining.
+
 G3 remains open. This matrix covers the listed cleanup paths, not every allocation,
 event-creation, FD/system-call or asynchronous CUDA failure. Remaining work includes
-upstream manager/mapper/BufferRef/VMM oracle/API migration, the production supervisor
-and recorded-name recovery procedure, remaining failure combinations, and a complete
+the production supervisor and recorded-name recovery procedure, remaining failure combinations, and a complete
 operation-specific diagnostic audit. Current FD/metadata counts do not establish
 physical VRAM/event/VMM accounting or copy profiling. G4 still needs the Python GPU
 provider, Tensor aliases and framework-stream lifetime tests. Orin/CUDA 12,
