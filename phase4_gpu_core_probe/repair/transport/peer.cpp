@@ -20,6 +20,9 @@
 #include "descriptor.hpp"
 #include "checksum.hpp"
 #include "../test/support.hpp"
+#ifdef G3_CLEANUP_INJECTION
+#include "../test/cleanup/import_failure.hpp"
+#endif
 
 namespace
 {
@@ -48,6 +51,17 @@ void resources()
     if (line.find("/rclpy_zc_gpu_v1_") != std::string::npos) {++metadata;}
   }
   std::cout << "RESOURCES " << count << " " << metadata << std::endl;
+}
+
+void drain(Mapper & mapper)
+{
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (!mapper.try_close()) {
+    if (mapper.poisoned() || std::chrono::steady_clock::now() >= deadline) {
+      throw std::runtime_error("GPU subscriber did not drain; peer restart required");
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
 }
 
 int publisher(const std::string & topic, std::size_t blocks)
@@ -172,7 +186,8 @@ int subscriber(const std::string & topic, std::size_t limit)
         if (!cached_valid) {throw std::runtime_error("no descriptor cached");}
         auto read = mapper->map(cached.core, stream->driver());
         if (!read) {
-          std::cout << (mapper->poisoned() ? "POISONED" : "REJECTED") << std::endl;
+          std::cout << (mapper->poisoned() ? "POISONED" :
+            mapper->closing() ? "CLOSING" : "REJECTED") << std::endl;
           continue;
         }
         if (!gated && command != "map_only") {
@@ -193,6 +208,8 @@ int subscriber(const std::string & topic, std::size_t limit)
       } else if (command == "drop") {
         reads.clear();
         std::cout << "DROPPED" << std::endl;
+      } else if (command == "close_read") {
+        std::cout << "READ_CLOSED " << mapper->try_close() << std::endl;
       } else if (command == "pending") {
         const auto status = cudaStreamQuery(stream->value);
         if (status != cudaErrorNotReady) {g3_test::check(status);}
@@ -235,6 +252,12 @@ int subscriber(const std::string & topic, std::size_t limit)
         std::cout << (read ? "UNEXPECTED_MAP" : "REJECTED") << std::endl;
       } else if (command == "resources") {
         resources();
+#ifdef G3_CLEANUP_INJECTION
+      } else if (command == "fault_stats") {
+        const auto counts = g3_import_failure::stats();
+        std::cout << "FAULT_STATS " << counts.failures << " " << counts.cleanup_calls << " " <<
+          counts.imports << " " << counts.retains << " " << mapper->poisoned() << std::endl;
+#endif
       } else if (command == "quit") {
         break;
       } else if (command != "stash") {
@@ -252,6 +275,8 @@ int subscriber(const std::string & topic, std::size_t limit)
   stream->release();
   reads.clear();
   g3_test::check(cudaStreamSynchronize(stream->value));
+  // Keep CUDA/runtime and Agnocast alive until deferred read cleanup completes.
+  drain(*mapper);
   g3_test::check(cudaFreeHost(sample));
   g3_test::check(cudaFree(device_sum));
   return 0;

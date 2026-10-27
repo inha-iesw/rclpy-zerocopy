@@ -19,16 +19,18 @@ pytestmark = pytest.mark.skipif(
 EVENTS = {'READY', 'PUB', 'FULL', 'AVAILABLE', 'CONNECTIONS', 'CLOSED', 'STASHED',
           'MAPPED', 'REJECTED', 'DROPPED', 'DONE', 'REMAPPED', 'LIMITS_REJECTED',
           'LIMITS_ACCEPTED', 'FAST_DONE', 'RESOURCES', 'MISSING', 'UNEXPECTED_MAP',
-          'PENDING', 'COMPLETE', 'PRODUCED', 'POISONED'}
+          'PENDING', 'COMPLETE', 'PRODUCED', 'POISONED', 'CLOSING', 'READ_CLOSED', 'FAULT_STATS'}
 
 
 class Peer:
-    def __init__(self, binary, role, topic, limit, directory):
+    def __init__(self, binary, role, topic, limit, directory, fault=None):
         self.role = role
         self.descriptors = set()
         env = os.environ.copy()
         env.update(AGNOCAST_DEVICE_PATH='/dev/agnocast_rclpy', AGNOCAST_BRIDGE_MODE='off',
                    AGNOCAST_NO_DISCOVERY_AGENT='1')
+        if fault is not None:
+            env['G3_IMPORT_FAILURE'] = fault
         hook = Path(__file__).resolve().parents[3] / 'build/g2-device-arm64/lib'
         env['LD_PRELOAD'] = str(hook / 'libagnocast_heaphook.so')
         env['LD_LIBRARY_PATH'] = str(hook) + ':' + env.get('LD_LIBRARY_PATH', '')
@@ -91,13 +93,14 @@ def peers(tmp_path):
     binary = Path(os.environ['G3_TRANSPORT_PEER'])
     active = []
 
-    def start(blocks=1, reads=1):
+    def start(blocks=1, reads=1, fault=None):
         topic = f'/g3_repair_{os.getpid()}_{time.monotonic_ns()}'
         directory = tmp_path / str(len(active))
         directory.mkdir()
         publisher = Peer(binary, 'publisher', topic, blocks, directory)
         active.append(publisher)
-        subscriber = Peer(binary, 'subscriber', topic, reads, directory)
+        subscriber_binary = Path(os.environ['G3_CLEANUP_PEER']) if fault else binary
+        subscriber = Peer(subscriber_binary, 'subscriber', topic, reads, directory, fault)
         active.append(subscriber)
         deadline = time.monotonic() + 3
         while publisher.ask('connections') != ['CONNECTIONS', '1']:
@@ -190,6 +193,32 @@ def test_mapper_recreation_cannot_bypass_live_admission(peers):
     close(publisher, subscriber)
 
 
+def test_subscriber_close_seals_recreated_mappers_until_gpu_read_drains(peers):
+    publisher, subscriber = peers()
+    publish(publisher, 37)
+    assert subscriber.ask('take')[0] == 'MAPPED'
+    assert subscriber.ask('close_read') == ['READ_CLOSED', '0']
+    assert subscriber.ask('drop') == ['DROPPED']
+    assert subscriber.ask('pending') == ['PENDING']
+    assert subscriber.ask('remap') == ['REMAPPED']
+    assert subscriber.ask('map_only') == ['CLOSING']
+    assert subscriber.ask('close_read') == ['READ_CLOSED', '0']
+    assert publisher.ask('close') == ['CLOSED', '0']
+    assert subscriber.ask('finish') == ['DONE', str(37 * 64)]
+    deadline = time.monotonic() + 3
+    while subscriber.ask('close_read') != ['READ_CLOSED', '1']:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    assert subscriber.ask('close_read') == ['READ_CLOSED', '1']
+    assert subscriber.ask('map_only') == ['CLOSING']
+    # Only after every old mapper/owner is gone may a new epoch admit reads.
+    assert subscriber.ask('remap') == ['REMAPPED']
+    publish(publisher, 41)
+    assert subscriber.ask('take')[0] == 'MAPPED'
+    assert subscriber.ask('finish') == ['DONE', str(41 * 64)]
+    close(publisher, subscriber)
+
+
 def test_completed_read_is_released_behind_stalled_read(peers):
     publisher, subscriber = peers(reads=2)
     publish(publisher, 13)
@@ -223,6 +252,41 @@ def test_import_failures_do_not_accumulate_fds_or_metadata_maps(peers):
     assert subscriber.ask('map')[0] == 'MAPPED'
     assert subscriber.ask('finish') == ['DONE', str(19 * 64)]
     close(publisher, subscriber)
+
+
+@pytest.mark.parametrize('fault', [
+    'unmap', 'address_free', 'release', 'event_destroy', 'import_pop',
+    'partial_unmap', 'partial_pop'])
+def test_import_cleanup_failure_retains_reference_and_blocks_new_imports(peers, fault):
+    publisher, subscriber = peers(fault=fault)
+    publish(publisher, 43)
+    assert subscriber.ask('stash')[0] == 'STASHED'
+    mapped = subscriber.ask('map_only')
+    if fault.startswith('partial_') or fault == 'import_pop':
+        assert mapped == ['POISONED']
+    else:
+        assert mapped[0] == 'MAPPED'
+        assert subscriber.ask('drop') == ['DROPPED']
+    deadline = time.monotonic() + 3
+    while True:
+        before = subscriber.ask('fault_stats')
+        if before[-1] == '1':
+            break
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    assert before[1] == '1'  # One actual injected cleanup failure.
+    assert int(before[2]) == (2 if fault == 'partial_pop' else 1)
+    assert int(before[3]) == 1  # A real VMM import preceded cleanup.
+    assert int(before[4]) >= 1
+    assert subscriber.ask('close_read') == ['READ_CLOSED', '0']
+    assert publisher.ask('close') == ['CLOSED', '0']
+    for _ in range(20):
+        assert subscriber.ask('remap') == ['REMAPPED']
+        assert subscriber.ask('map_only') == ['POISONED']
+        assert subscriber.ask('close_read') == ['READ_CLOSED', '0']
+        assert publisher.ask('probe') == ['FULL']
+    assert subscriber.ask('fault_stats') == before
+    # These poisoned peers require exit; fixture cleanup records their own names.
 
 
 def test_fd_request_disconnect_does_not_terminate_publisher(peers):

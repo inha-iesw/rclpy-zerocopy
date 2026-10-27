@@ -36,6 +36,12 @@ target_compile_features(test_legacy_release PRIVATE cxx_std_17)
 target_link_libraries(test_legacy_release
   ros2_cuda_ipc_core::ros2_cuda_ipc_core CUDA::cudart CUDA::cuda_driver)
 
+ament_add_gtest(test_mapper_shutdown test/lifetime/test_mapper_shutdown.cpp TIMEOUT 20)
+target_compile_features(test_mapper_shutdown PRIVATE cxx_std_17)
+target_include_directories(test_mapper_shutdown PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../build/g3/repaired/ros2_cuda_ipc/ros2_cuda_ipc_core/src")
+target_link_libraries(test_mapper_shutdown ros2_cuda_ipc_core::ros2_cuda_ipc_core)
+
 # Reuse compatible upstream oracles against this repaired core. API/protocol
 # migrations of manager/mapper/ref tests remain separate from these sources.
 set(_upstream_tests
@@ -58,13 +64,75 @@ target_link_libraries(test_gpu_descriptor ${rclpy_agnocast_gpu_msgs_TARGETS})
 
 enable_language(CUDA)
 add_executable(g3_transport_peer transport/peer.cpp transport/checksum.cu)
-target_compile_features(g3_transport_peer PRIVATE cxx_std_17)
-set_target_properties(g3_transport_peer PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
-target_link_libraries(g3_transport_peer
-  ros2_cuda_ipc_core::ros2_cuda_ipc_core CUDA::cudart
-  ${rclpy_agnocast_gpu_msgs_TARGETS})
-ament_target_dependencies(g3_transport_peer agnocastlib rclcpp)
+add_executable(g3_cleanup_peer transport/peer.cpp transport/checksum.cu
+  test/cleanup/import_failure.cpp)
+foreach(_peer g3_transport_peer g3_cleanup_peer)
+  target_compile_features(${_peer} PRIVATE cxx_std_17)
+  set_target_properties(${_peer} PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+  target_link_libraries(${_peer}
+    ros2_cuda_ipc_core::ros2_cuda_ipc_core CUDA::cudart
+    ${rclpy_agnocast_gpu_msgs_TARGETS})
+  ament_target_dependencies(${_peer} agnocastlib rclcpp)
+endforeach()
+target_compile_definitions(g3_cleanup_peer PRIVATE G3_CLEANUP_INJECTION)
+target_link_libraries(g3_cleanup_peer ${CMAKE_DL_LIBS})
+foreach(_symbol cuIpcOpenEventHandle cuMemUnmap cuMemAddressFree cuMemRelease
+    cuEventDestroy_v2 cuCtxPopCurrent_v2 cuMemImportFromShareableHandle cuDevicePrimaryCtxRetain)
+  target_link_options(g3_cleanup_peer PRIVATE "-Wl,--export-dynamic-symbol=${_symbol}")
+endforeach()
 
 ament_add_pytest_test(test_repaired_transport test/test_transport.py TIMEOUT 120
-  ENV G3_TRANSPORT_PEER=$<TARGET_FILE:g3_transport_peer>)
+  ENV G3_TRANSPORT_PEER=$<TARGET_FILE:g3_transport_peer>
+    G3_CLEANUP_PEER=$<TARGET_FILE:g3_cleanup_peer>)
 set_tests_properties(test_repaired_transport PROPERTIES LABELS "requires_kernel_module;cuda")
+
+# Sticky cleanup failures must each run in a fresh process.
+ament_add_gtest_executable(test_producer_cleanup
+  test/cleanup/producer_cleanup.cpp test/cleanup/producer_failure.cpp)
+target_compile_features(test_producer_cleanup PRIVATE cxx_std_17)
+target_link_libraries(test_producer_cleanup
+  ros2_cuda_ipc_core::ros2_cuda_ipc_core CUDA::cudart ${CMAKE_DL_LIBS})
+foreach(_symbol cuEventDestroy_v2 cuMemUnmap cuMemAddressFree cuMemRelease
+    cuEventQuery cuCtxPushCurrent_v2 cuCtxPopCurrent_v2 cuMemSetAccess
+    cuMemCreate cuDevicePrimaryCtxRetain shm_open bind opendir)
+  target_link_options(test_producer_cleanup PRIVATE "-Wl,--export-dynamic-symbol=${_symbol}")
+endforeach()
+foreach(_case EventDestroy MemUnmap MemAddressFree MemRelease EventQuery ContextPush
+    RollbackMemUnmap RollbackMemAddressFree RollbackMemRelease
+    FinalContextPop FinalContextPopMismatch)
+  set(_test "producer_cleanup_${_case}")
+  set(_xml "${AMENT_TEST_RESULTS_DIR}/${PROJECT_NAME}/${_test}.gtest.xml")
+  ament_add_test(${_test}
+    COMMAND $<TARGET_FILE:test_producer_cleanup>
+      "--gtest_filter=Cleanup/RepairedProducerCleanup.FailurePoisonsEpoch/${_case}"
+      "--gtest_output=xml:${_xml}"
+    RESULT_FILE "${_xml}"
+    OUTPUT_FILE "${CMAKE_BINARY_DIR}/ament_cmake_gtest/${_test}.txt" TIMEOUT 20)
+endforeach()
+
+ament_add_gtest_executable(test_subscriber_cleanup
+  test/cleanup/subscriber_cleanup.cpp test/cleanup/subscriber_failure.cpp)
+target_compile_features(test_subscriber_cleanup PRIVATE cxx_std_17)
+target_include_directories(test_subscriber_cleanup PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../build/g3/repaired/ros2_cuda_ipc/ros2_cuda_ipc_core/src")
+target_link_libraries(test_subscriber_cleanup
+  ros2_cuda_ipc_core::ros2_cuda_ipc_core CUDA::cudart ${CMAKE_DL_LIBS})
+foreach(_symbol cuEventRecord cuEventQuery cuEventDestroy_v2 cuStreamWaitEvent
+    cuCtxPushCurrent_v2 cuCtxPopCurrent_v2)
+  target_link_options(test_subscriber_cleanup PRIVATE "-Wl,--export-dynamic-symbol=${_symbol}")
+endforeach()
+foreach(_case Record Query CompletionDestroy BindWaitAndDestroy
+    ReleaserSuccess WorkerSuccess ReleaserFailure WorkerFailure)
+  set(_test "subscriber_cleanup_${_case}")
+  set(_xml "${AMENT_TEST_RESULTS_DIR}/${PROJECT_NAME}/${_test}.gtest.xml")
+  if(_case MATCHES "^(Releaser|Worker)")
+    set(_filter "PopOrigins/SubscriberContextPop.DrainWaitsForContextRestoration/${_case}")
+  else()
+    set(_filter "Failures/SubscriberCleanupFailure.RetainsReadAndRejectsReplacementMappers/${_case}")
+  endif()
+  ament_add_test(${_test}
+    COMMAND $<TARGET_FILE:test_subscriber_cleanup>
+      "--gtest_filter=${_filter}" "--gtest_output=xml:${_xml}"
+    RESULT_FILE "${_xml}"
+    OUTPUT_FILE "${CMAKE_BINARY_DIR}/ament_cmake_gtest/${_test}.txt" TIMEOUT 20)
+endforeach()

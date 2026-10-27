@@ -1,6 +1,6 @@
 # Bounded GPU core repair and native Agnocast integration
 
-The reviewed native experiment passed **73 cases, with three multi-GPU skips,
+The pre-cleanup native experiment passed **73 cases, with three multi-GPU skips,
 across 15 CTest targets** on the observed Thor configuration. Its own safety and
 integration suite has 43 passes; reused upstream tests add 30 passes and three
 skips. This establishes the tested safety boundaries;
@@ -15,15 +15,19 @@ The original rejection diagnostics and upstream baseline are preserved in
 `0e8933c8e58ffa7f1240a4c9efda3a2b84e5398c` with GNU patch, zero fuzz, and verifies
 every resulting source file. It neither modifies the pristine tree nor invokes
 Git. The MIT core patch is `patches/core-lifecycle.patch`, SHA256
-`0fe547b39e369fbcf0a66f71c79e61e503f8f847bca195a86e9854e83aaed366`
+`63b386b77d541a4ee3dc110339281ff16f9e2d1d6b47b28f5d3f29c537c5050c`
 (23 core files).
 
 The existing CUDA VMM allocation/import, SCM_RIGHTS FD transfer and IPC event
 engine remain in use. C++ API changes require rebuilding native consumers:
 `acquire_for_publish(CUstream)` binds the producer stream, `BufferMapper(Config)`
-requires limits, and `try_close()` reports a busy/failed pool. Manager, pool and
-mapper `poisoned()` queries distinguish terminal failure from retryable activity.
-False is not a promise that the next operation will succeed. The metadata layout
+requires limits, and producer `try_close()` reports a busy/failed pool. Mapper `try_close()` seals
+the shared read epoch and polls full read cleanup; `closing()` observes that seal
+on every alias, including after successful drain. `CudaDeviceContext::cleanup_failed()`
+replaces the earlier primary-release-only query and includes context restoration failures. Manager, pool and
+mapper `poisoned()` queries report terminal failure. An unpoisoned mapper may still
+be sealed; callers check `closing()` separately. False is not a promise that the
+next operation will succeed. The metadata layout
 remains 24 bytes, but the writer protocol changes; its private namespace is
 `/rclpy_zc_gpu_v1_<pid>_<block>`. Legacy and repaired peers must not be mixed.
 The original Python bindings/examples have not been ported to these APIs, and
@@ -51,7 +55,7 @@ CPU adapter ABI 3 and the Python CPU API are unchanged.
   another host thread, restoring that thread's previous context afterward.
 - All mapper aliases share mandatory `H` read slots and maximum message size `M`.
   A permit precedes import and remains charged through active, deferred and failed
-  cleanup. Recreating a mapper cannot bypass a live epoch's limits. Strict mapping
+  cleanup. Recreating a mapper cannot bypass a live epoch's limits or its shutdown seal. Strict mapping
   keeps no idle metadata/import cache; this has an unmeasured performance cost.
 - Completion polling can release a finished read behind a stalled read. Pool close
   claims idle blocks exclusively and refuses pending writes or retained readers.
@@ -59,7 +63,9 @@ CPU adapter ABI 3 and the Python CPU API are unchanged.
   A later `initialise()` retries its close before allocating a replacement; callers
   retry while old work/readers remain. There is no background publisher reaper.
   Failed mapping/event cleanup retains resources/references; primary-context release failure
-  permanently blocks new GPU admission and retains in the process.
+  permanently blocks new GPU admission and retains in the process. Context pop
+  failure or a mismatched popped context also disables admission. Ambiguous
+  cleanup is never retried to make a failed epoch appear healthy.
 - A dead consumer's reference is not reclaimed. Its fixed slot remains unavailable.
   A dead reader can therefore prevent the draining pool from ever closing.
   Recovery then requires restarting all involved GPU peers. There is no live-pool
@@ -75,9 +81,26 @@ allows only already admitted owners to finish, bounded by H mapper admissions
 plus the producer pool. Arbitrary use of low-level core helpers is outside this
 experiment's contract.
 The installed legacy `BufferMetadataCache`, `IpcHandleCache` and direct VMM importer
-are unused by strict mapping and do not enforce its H bound. Subscriber deferred
-release still lacks a public shutdown/drain API; production exit ordering remains
-part of the open G3 work.
+are unused by strict mapping and do not enforce its H bound. Subscriber shutdown follows the explicit contract below.
+
+## Shutdown and restart contract
+
+The process GPU runtime owner stops dispatching new reads, then calls mapper
+`try_close()` to seal admission across every mapper alias. Individual endpoint
+close only releases that endpoint's owners; it must not seal the process epoch.
+Unlike producer close, even a busy false mapper result changes admission state.
+`closing()` is true for all existing and newly joined aliases, including after
+drain. A false result with `closing() && !poisoned()` means active/importing/deferred
+reads still exist. Moved-from mappers return false from both close and closing.
+Release read owners while their
+streams remain valid, let GPU work complete, and retry without resetting CUDA.
+Success means context restoration, completion event cleanup, imported-resource
+cleanup and reference/permit release are complete. The process worker remains
+idle; its queue being empty alone is not a drain condition. A fresh read epoch
+requires every old mapper and owner to disappear. Mapper destruction alone does
+not seal other aliases.
+
+After subscriber drain, close the producer pool before CUDA/runtime teardown.
 
 ## Reproduce
 
@@ -116,11 +139,11 @@ bridge/discovery and preload that hook. Before loading a module, check
 vermagic and the running kernel. The old module inside the nested fork is x86_64.
 This run temporarily loaded only the matching `agnocast_rclpy` module and unloaded
 it afterward; the pre-existing `agnocast` module was preserved. Absent opt-in,
-the nine transport cases skip; this is not an equivalent safety result.
+the transport cases skip; this is not an equivalent safety result.
 The nested Agnocast fork is still uncommitted; an outer checkout alone does not
 reconstruct those device artifacts.
 
-## Observed results and remaining work
+## Pre-cleanup results and remaining work
 
 | Test group | Cases | Evidence |
 |---|---:|---|
@@ -179,7 +202,7 @@ the checksum sample is reset so warmup cannot satisfy the completion assertion.
 The prior CPU regression was 12 packages, 39 CTest targets,
 **466 PASS + 118 opt-in SKIP**; it was not rerun for these core/probe changes.
 The repaired build includes core/messages/envelope, not the old upstream
-Python/Torch binding. Current RED/GREEN evidence, source and static-library hashes,
+Python/Torch binding. Pre-cleanup RED/GREEN evidence, source and static-library hashes,
 frozen XML/logs and module cleanup are under `log/g3/repair-review/assessment.json`
 and `log/g3/repair-review/verification/`. The original baseline/rejection and
 `log/g3/repair-assessment.json` remain historical records. Nine inactive sockets
