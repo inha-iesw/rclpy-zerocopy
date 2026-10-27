@@ -87,8 +87,13 @@ ament_add_pytest_test(test_repaired_transport test/test_transport.py TIMEOUT 120
 set_tests_properties(test_repaired_transport PROPERTIES LABELS "requires_kernel_module;cuda")
 
 # Sticky cleanup failures must each run in a fresh process.
+ament_add_pytest_test(test_isolated_runner test/cleanup/test_isolated_runner.py TIMEOUT 30
+  ENV G3_PRODUCER_CLEANUP=$<TARGET_FILE:test_producer_cleanup>
+    G3_SUBSCRIBER_CLEANUP=$<TARGET_FILE:test_subscriber_cleanup>)
+
 ament_add_gtest_executable(test_producer_cleanup
-  test/cleanup/producer_cleanup.cpp test/cleanup/producer_failure.cpp)
+  test/cleanup/producer_cleanup.cpp test/cleanup/producer_failure.cpp
+  test/cleanup/isolated_main.cpp SKIP_LINKING_MAIN_LIBRARIES)
 target_compile_features(test_producer_cleanup PRIVATE cxx_std_17)
 target_link_libraries(test_producer_cleanup
   ros2_cuda_ipc_core::ros2_cuda_ipc_core CUDA::cudart ${CMAKE_DL_LIBS})
@@ -111,7 +116,8 @@ foreach(_case EventDestroy MemUnmap MemAddressFree MemRelease EventQuery Context
 endforeach()
 
 ament_add_gtest_executable(test_subscriber_cleanup
-  test/cleanup/subscriber_cleanup.cpp test/cleanup/subscriber_failure.cpp)
+  test/cleanup/subscriber_cleanup.cpp test/cleanup/subscriber_failure.cpp
+  test/cleanup/isolated_main.cpp SKIP_LINKING_MAIN_LIBRARIES)
 target_compile_features(test_subscriber_cleanup PRIVATE cxx_std_17)
 target_include_directories(test_subscriber_cleanup PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../../build/g3/repaired/ros2_cuda_ipc/ros2_cuda_ipc_core/src")
