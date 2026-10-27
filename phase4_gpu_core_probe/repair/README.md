@@ -191,62 +191,12 @@ checking every checksum and increasing per-block UIDs. Settled before/after
 FD/metadata-map counts were publisher **123/32**, subscriber **59/0**. These
 measurements do not count CUDA VMM mappings, events or physical memory.
 
-Review corrected two lifetime defects: ordinary busy destruction previously
-poisoned the process, and bound default/legacy owners revalidated against the
-destruction thread before activating their retained context. Eleven isolated
-regression scenarios failed against the previous `351b8cd7...` static core and
-pass against this patch. The read-completion thread fixture exercises real CUDA
-events and metadata references with a synthetic, undereferenced pointer; payload
-and IPC import coverage belongs to the separate transport tests.
+The CPU verifier covers 12 packages and 39 CTest targets:
+**466 PASS + 118 device opt-in SKIP**, with zero failures/errors. This verifier
+execution is separate from finalize and does not rerun the GPU suite.
 
-The previous seven-target/31-case execution result is historical. Its quarantine
-test used a mismatched stream, so it did **not** establish failed-preparation
-quarantine: the busy-destruction defect made it pass. The replacement test injects
-an actual recording failure, verifies invalidation and poison, and synchronizes
-before destroying the manager to exclude transient event timing.
-
-The primary-release test first failed against the earlier `fc52e218...` patch:
-20 replacement pools succeeded and the injected failure was called 21 times.
-The `351b8cd7...` repair fixed that defect; the current patch still passes the same
-failure scenario with one call. The shim interposes only that
-test executable; this is a controlled failure, not an observed real driver fault.
-The pending-producer ordering case queries a stream containing only the core
-ready wait, before any consumer gate/kernel. The consumer lifetime cases use a
-bounded host callback gate. Kernel initialization is warmed before that gate and
-the checksum sample is reset so warmup cannot satisfy the completion assertion.
-
-The latest CPU regression reran `CMAKE_BUILD_PARALLEL_LEVEL=2 bash scripts/verify`:
-12 packages, 39 CTest targets, **466 PASS + 118 opt-in SKIP**, zero failures/errors.
-This is a verifier execution, not a new finalize result. The repaired build covers
-core/messages/envelope and native probes, not the old Python/Torch binding.
-
-The cleanup/drain change reproduced **10 failing cases** against the preceding
-`0fe547b3...` patch/static core: three VMM rollback faults, two final producer
-context restoration faults, failed-bind event cleanup, and four subscriber pop
-ordering/failure cases. All pass on the current core. The old core lacks mapper
-close, so its subscriber RED build observes the same charged-read/ref completion
-condition directly; the current build uses public `try_close()`. These synthetic
-completion fixtures never dereference their pointer. Seven separate actual IPC
-import cases exercise Unmap/AddressFree/Release/imported EventDestroy, successful
-import context pop, and partial-import Unmap/pop failures. Each verifies the
-initial cleanup-call count and no additional imports/retains through 20 mapper
-recreations. The legacy orphan scan is suppressed in producer RED tests to avoid
-removing unrelated names.
-
-The follow-up review fixes reproduced **four failing cases** against the preceding
-`850d9d6a...` patch/build: two name collisions and two missing test filters. Collision
-tests disable the metadata logger because its error output can change `errno` and
-hide the old EEXIST branch. The original inode loses its link and the published
-name resolves to a replacement in both RED cases. All four pass on this patch;
-three new mapper-state contracts and actual transport drain also pass.
-
-The preceding review evidence, previous source/static library, RED logs/XML, frozen XML,
-source/binary hashes and device cleanup are under `log/g3/review-fixes/`.
-The preceding cleanup/drain evidence remains under `log/g3/cleanup-drain/`.
-The verified `agnocast_rclpy` module was loaded temporarily, then unloaded after
-all peers exited and module refcount reached zero. The pre-existing `agnocast`
-module and 13 sockets were preserved; no new socket names remain. Earlier
-`log/g3/repair-review/` and baseline records remain historical evidence.
+Historical patch identities, RED/GREEN comparisons and superseded results are
+preserved in [EVIDENCE.md](EVIDENCE.md). Those records are not new executions.
 
 ### Upstream test migration
 
@@ -276,15 +226,6 @@ cases use the real clock. No production clock or grace policy changes.
 Metadata fixtures unlink only successfully created names. Rejection tests report
 fixture setup failures separately, and the mapper counts actual `connect` calls
 so early protocol rejection cannot masquerade as import-failure cleanup.
-
-The first VMM run exposed an oracle migration error: ready recording happened
-after leaving the primary context. Recording inside that context passes strict
-default-stream binding. This was a test adaptation, not a core defect or a new
-core RED/GREEN claim. The final five executables passed direct GTest execution,
-then all 42 CTest targets and the CPU verifier passed. Evidence and frozen XML,
-sources, binaries and peer logs are under `log/g3/upstream-migration/`.
-The verified module was unloaded at refcount zero; the existing module and 13
-sockets were preserved, with no new metadata or socket names remaining.
 
 The tracked [test-lineage lock](lineage/upstream-tests.lock.json) records the
 base upstream revision, original hashes and dispositions for all 13 core test
