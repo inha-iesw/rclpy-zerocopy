@@ -15,6 +15,7 @@ Dates follow the design log's KST stage dates.
 | Collision/closing/filter (§25) | 2026-10-27 | `76400ff8` | 38 targets, 109 PASS + 3 SKIP |
 | Upstream test migration (§26) | 2026-10-27 | `76400ff8`, unchanged | 42 targets, 127 PASS + 3 SKIP |
 | Lineage and documentation (§27) | 2026-10-27 | `76400ff8`, unchanged | 43 targets, 142 PASS + 3 SKIP, including 15 host-only lineage cases |
+| Initialisation and request failures (§28) | 2026-10-27 | `76400ff8`, unchanged | 52 targets, 154 PASS + 3 SKIP, including 15 host-only lineage cases |
 
 ## Initial bounded repair and primary-release comparison
 
@@ -154,6 +155,41 @@ and moving the experiment peer were not part of this stage.
 
 Evidence: `log/g3/lineage-integration/`, including `assessment.json`,
 `build-contract-comparison.json`, RED/GREEN XML, `device-session.json` and `verification/`.
+
+## Initialisation and request failures
+
+The production patch and repaired static core remained unchanged. The upstream
+MIT permission notice was copied verbatim beside the six adapted test sources.
+Manager coverage now checks GPU-complete, reader-free rejection at 0/99,999 us,
+same-block reuse at 100,000 us, a fresh UID and publication after cancellation.
+
+Seven isolated producer cases fail the second block's address reserve, allocation,
+map, access, FD export, event creation or IPC event handle creation. They check a
+single injected failure, allocation/release call balance, actual recorded names,
+stable FD counts, and both replacement-manager and same-manager restart.
+Subscriber event-create and ready-wait failures preserve publication ownership
+for a successful retry, then return the reference and H=1 permit on drain.
+The latter fixture uses a synthetic pointer and establishes no payload coverage.
+
+Two real Agnocast transport cases inject receive error/EOF after successful Unix
+connect. Three rejected requests preserve FD/metadata-map counts; the fourth
+imports the original descriptor, verifies the GPU checksum, and closes normally.
+Failure occurs before SCM_RIGHTS receipt, so this is not malformed ancillary-data
+or already-received FD cleanup coverage. These are coverage additions against
+the existing repaired core, not a new production-defect RED/GREEN comparison.
+
+Results: 52 targets, 157 collected = 154 PASS + 3 multi-GPU SKIP; custom 90 PASS,
+upstream 49 PASS/3 SKIP and host lineage 15 PASS. CPU verification again passed
+466 cases with 118 device opt-in skips. Manager/BufferRef and the new isolated
+initialisation/bind filters also ran directly. After the full GPU run, socket
+creation-count assertions were added and the affected producer/manager targets
+were rebuilt and rerun. Current XML and direct-run evidence include those assertions.
+The matching temporary module was unloaded at refcount zero; the existing module,
+13 sockets and original metadata inventory were preserved.
+
+Evidence: `log/g3/initialisation-faults/{assessment.json,reconstruction.json,
+device-session.json,verification/}`. Full G3 adoption, complete diagnostics and
+production recovery remain open. No finalize or Git mutation ran in this stage.
 
 ## Shared checkpoint and device observations
 

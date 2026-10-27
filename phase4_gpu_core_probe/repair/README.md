@@ -1,8 +1,8 @@
 # Bounded GPU core repair and native Agnocast integration
 
-The repaired-core probe passed **142 cases, with three multi-GPU skips,
-across 43 CTest targets** on the observed Thor configuration. Its safety and
-integration suite has 79 passes; reused and migrated upstream tests add 48 passes
+The repaired-core probe passed **154 cases, with three multi-GPU skips,
+across 52 CTest targets** on the observed Thor configuration. Its safety and
+integration suite has 90 passes; reused and migrated upstream tests add 49 passes
 and three skips; host-only test-lineage validation adds 15 passes.
 This establishes the tested safety boundaries;
 the full G3 adoption gate remains open. Python GPU Tensor ownership (G4),
@@ -181,17 +181,19 @@ explicitly; the runner regression also checks an empty XML cannot mask exit fail
 | Primary release failure | 1 | Injected driver failure blocks 20 replacements; one unresolved release attempt |
 | Dense descriptor | 6 | dtype, span, allocation, layout and overflow validation |
 | Producer cleanup faults | 11 | Event/query/context/VMM cleanup, partial allocation rollback, context pop failure/mismatch; no cleanup retry or replacement allocation |
+| Producer initialisation faults | 7 | Second-block reserve/create/map/access/FD export/event create/IPC handle failures; successful rollback, names/FDs returned, replacement and same-manager retry |
 | Subscriber completion faults | 4 | Record, query, destroy, failed wait plus failed event cleanup; charged reference retention |
+| Recoverable subscriber bind faults | 2 | Completion event creation or ready wait fails; publication/ref/permit retained for successful retry and drain |
 | Subscriber context restoration | 4 | Releaser/worker pop gates and faults; no drain before restoration |
 | Isolated runner | 2 | Missing producer/subscriber case filters return failure despite valid zero-test XML |
-| Actual Agnocast processes | 18 | Existing nine cases, shared-epoch drain, three restart cycles with an independent pair, and seven actual imported-resource/context cleanup faults |
-| Reused and migrated upstream core | 48 PASS + 3 SKIP | Context, pool, publisher message, caches, manager, BufferRef, mapper, read handle and cross-process VMM |
+| Actual Agnocast processes | 20 | Existing 18 cases plus connected FD receive error/EOF, three failures then successful import/checksum with H=1 |
+| Reused and migrated upstream core | 49 PASS + 3 SKIP | Context, pool, publisher message, caches, manager, BufferRef, mapper, read handle and cross-process VMM |
 | Test lineage (host-only) | 15 PASS | Base revision/hash/inventory, adapted-source ownership, required test classification and CMake registration/failure propagation |
 
-The custom suite is **79 PASS, zero failures/errors/skips**. Together with the
-upstream oracles this is **130 collected = 127 PASS + 3 SKIP** across 42 CTest
-targets. Adding host-only lineage validation gives **145 collected = 142 PASS +
-3 SKIP**, with all 43 targets passing. All three skips require multiple GPUs. The checkpoint
+The custom suite is **90 PASS, zero failures/errors/skips**. Together with the
+upstream oracles this is **142 collected = 139 PASS + 3 SKIP** across 51 CTest
+targets. Adding host-only lineage validation gives **157 collected = 154 PASS +
+3 SKIP**, with all 52 targets passing. All three skips require multiple GPUs. The checkpoint
 used 32 fixed blocks: 64 warmup deliveries followed by 1,000 measured deliveries,
 checking every checksum and increasing per-block UIDs. Settled before/after
 FD/metadata-map counts were publisher **123/32**, subscriber **59/0**. These
@@ -215,13 +217,13 @@ bindings and examples remain outside this build.
 
 | Migrated group | Result | Contract exercised |
 |---|---:|---|
-| Manager | 6 PASS | Explicit producer stream, completion before close/cancel reuse, successive single-pool epochs and reader-protected reuse |
+| Manager | 7 PASS | Explicit producer stream, completion and exact grace boundary before reuse, cancel-to-publish, successive single-pool epochs and reader-protected reuse |
 | BufferRef | 5 PASS | Owned metadata size, committed/stale UID, fresh generation per race and the 100 ms grace boundary |
 | Mapper | 4 PASS | Mandatory H/M, missing/stale/unpublished rejection before import, reference and admission return after a real failed FD request |
 | Read handle | 4 PASS + 2 SKIP | Retained primary context for runtime/driver streams, default/legacy acceptance, per-thread rejection; two multi-GPU oracles remain skipped |
 | VMM | 1 PASS | A spawned child imports, checks all 4,096 bytes and releases; parent and child report final context cleanup |
 
-These five targets contain **22 cases = 20 PASS + 2 SKIP**. The five unchanged
+These five targets contain **23 cases = 21 PASS + 2 SKIP**. The five unchanged
 upstream targets add **28 PASS + 1 SKIP**. Read-handle fixtures use synthetic
 pointers without dereferencing them; actual import/data coverage comes from the
 VMM child and Agnocast transport. VMM's CPU readback is a functional oracle, not
@@ -252,12 +254,15 @@ repaired tree's own `BUILD_TESTING=ON` compatible. Continue to build its core wi
 `BUILD_TESTING=OFF` and use this probe. The host-only `test_upstream_lineage` target
 checks rejection paths and actual CMake registration without loading CUDA.
 
-The latest evidence is in `log/g3/lineage-integration/`. The 11 native executable
-source/compile/link contracts and all 42 existing CTest command/timeout/XML
-contracts match the pre-lineage build; only the lineage pytest target was added.
-The production patch, repaired core archive and GpuTensor field declarations are
-unchanged. The full transport suite passed, and the verified module was unloaded
-at refcount zero while preserving the existing module and 13 sockets.
+The latest test run's XML, source snapshots and artifact identities are recorded in
+`log/g3/initialisation-faults/`. Stage-by-stage changes, execution details and
+historical build comparisons are preserved in [EVIDENCE.md](EVIDENCE.md).
+
+Producer allocation/release call counts do not measure physical VRAM or driver
+resource residency. Subscriber bind-failure fixtures use synthetic pointers and
+do not establish payload import coverage. FD receive failures are injected before
+SCM_RIGHTS receipt; malformed ancillary data, already-received FD cleanup and
+producer `sendmsg` failure injection remain outside that coverage.
 
 G3 remains open. This matrix covers the listed cleanup paths, not every allocation,
 event-creation, FD/system-call or asynchronous CUDA failure. Remaining work includes
