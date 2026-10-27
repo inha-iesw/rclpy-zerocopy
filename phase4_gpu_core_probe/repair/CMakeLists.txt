@@ -58,32 +58,16 @@ target_include_directories(test_mapper_shutdown PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../../build/g3/repaired/ros2_cuda_ipc/ros2_cuda_ipc_core/src")
 target_link_libraries(test_mapper_shutdown ros2_cuda_ipc_core::ros2_cuda_ipc_core)
 
-# Reuse unchanged upstream oracles and keep contract migrations in test/upstream.
+# Validate ancestry and register original/adapted sources from one tracked inventory.
 set(_upstream_tests
   "${CMAKE_CURRENT_SOURCE_DIR}/../../build/g3/repaired/ros2_cuda_ipc/ros2_cuda_ipc_core/test")
-foreach(_name cuda_driver_context gpu_buffer_pool publisher_messages
-    buffer_metadata_cache ipc_handle_cache)
-  ament_add_gtest(test_upstream_${_name} "${_upstream_tests}/test_${_name}.cpp" TIMEOUT 30)
-  target_compile_features(test_upstream_${_name} PRIVATE cxx_std_17)
-  target_link_libraries(test_upstream_${_name}
-    ros2_cuda_ipc_core::ros2_cuda_ipc_core CUDA::cudart)
-endforeach()
-
-foreach(_name gpu_buffer_manager buffer_ref buffer_mapper read_handle vmm_fd_memory_driver)
-  ament_add_gtest(test_upstream_${_name} "test/upstream/test_${_name}.cpp" TIMEOUT 30)
-  target_compile_features(test_upstream_${_name} PRIVATE cxx_std_17)
-  target_link_libraries(test_upstream_${_name}
-    ros2_cuda_ipc_core::ros2_cuda_ipc_core CUDA::cudart)
-endforeach()
+include(lineage/register.cmake)
 target_link_libraries(test_upstream_buffer_mapper ${CMAKE_DL_LIBS})
 target_link_options(test_upstream_buffer_mapper PRIVATE "-Wl,--export-dynamic-symbol=connect")
 target_link_options(test_upstream_buffer_ref PRIVATE
   "-Wl,--wrap=_ZNSt6chrono3_V212steady_clock3nowEv")
 
-add_executable(g3_vmm_fd_import_helper test/upstream/vmm_fd_import_helper.cpp)
-target_compile_features(g3_vmm_fd_import_helper PRIVATE cxx_std_17)
 target_include_directories(g3_vmm_fd_import_helper PRIVATE "${_upstream_tests}")
-target_link_libraries(g3_vmm_fd_import_helper ros2_cuda_ipc_core::ros2_cuda_ipc_core)
 target_include_directories(test_upstream_vmm_fd_memory_driver PRIVATE "${_upstream_tests}")
 target_compile_definitions(test_upstream_vmm_fd_memory_driver PRIVATE
   VMM_FD_IMPORT_HELPER_PATH="$<TARGET_FILE:g3_vmm_fd_import_helper>")
@@ -109,6 +93,7 @@ foreach(_peer g3_transport_peer g3_cleanup_peer)
     ${rclpy_agnocast_gpu_msgs_TARGETS})
   ament_target_dependencies(${_peer} agnocastlib rclcpp)
 endforeach()
+
 target_compile_definitions(g3_cleanup_peer PRIVATE G3_CLEANUP_INJECTION)
 target_link_libraries(g3_cleanup_peer ${CMAKE_DL_LIBS})
 foreach(_symbol cuIpcOpenEventHandle cuMemUnmap cuMemAddressFree cuMemRelease
@@ -150,6 +135,7 @@ foreach(_case EventDestroy MemUnmap MemAddressFree MemRelease EventQuery Context
     OUTPUT_FILE "${CMAKE_BINARY_DIR}/ament_cmake_gtest/${_test}.txt" TIMEOUT 20)
 endforeach()
 
+
 ament_add_gtest_executable(test_subscriber_cleanup
   test/cleanup/subscriber_cleanup.cpp test/cleanup/subscriber_failure.cpp
   test/cleanup/isolated_main.cpp SKIP_LINKING_MAIN_LIBRARIES)
@@ -177,3 +163,5 @@ foreach(_case Record Query CompletionDestroy BindWaitAndDestroy
     RESULT_FILE "${_xml}"
     OUTPUT_FILE "${CMAKE_BINARY_DIR}/ament_cmake_gtest/${_test}.txt" TIMEOUT 20)
 endforeach()
+
+ament_add_pytest_test(test_upstream_lineage lineage/test_verify.py TIMEOUT 60)

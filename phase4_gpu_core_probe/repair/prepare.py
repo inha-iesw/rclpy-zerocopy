@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 
+from lineage.verify import validate
+
 
 def inventory(root):
     """Return source bytes only, rejecting silently modified prepared copies."""
@@ -24,6 +26,7 @@ def main():
         [sys.executable, str(scenario.parent / 'scripts/prepare_upstream.py')],
         check=True, capture_output=True, text=True)
     pristine = Path(json.loads(prepared.stdout)['upstream'])
+    validate(scenario, pristine)
     patch = scenario / 'patches/core-lifecycle.patch'
     parent = workspace / 'build/g3/repaired'
     parent.mkdir(parents=True, exist_ok=True)

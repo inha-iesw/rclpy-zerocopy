@@ -1,0 +1,75 @@
+{
+  "base_revision": "0e8933c8e58ffa7f1240a4c9efda3a2b84e5398c",
+  "files": {
+    "ros2_cuda_ipc_core/test/test_cuda_driver_context.cpp": {
+      "disposition": "reused_test",
+      "target": "test_upstream_cuda_driver_context",
+      "sha256": "f07ed106e2de66ab208f182069699f8e3a85635c0949c37e3de1adad7a0510f5"
+    },
+    "ros2_cuda_ipc_core/test/test_gpu_buffer_pool.cpp": {
+      "disposition": "reused_test",
+      "target": "test_upstream_gpu_buffer_pool",
+      "sha256": "a5da258a06d0ae471050ba703e60c51695bed3141b338efecfb89bf7e72b88e3"
+    },
+    "ros2_cuda_ipc_core/test/test_publisher_messages.cpp": {
+      "disposition": "reused_test",
+      "target": "test_upstream_publisher_messages",
+      "sha256": "96688c464aa47e9e6823258d2938a219f709daa18fc99b6654f57f67cf3299a5"
+    },
+    "ros2_cuda_ipc_core/test/test_buffer_metadata_cache.cpp": {
+      "disposition": "reused_test",
+      "target": "test_upstream_buffer_metadata_cache",
+      "sha256": "b01061bf7f0fdeddee668bcc472df8f1e107c587b2df839e2dbb722af056e123"
+    },
+    "ros2_cuda_ipc_core/test/test_ipc_handle_cache.cpp": {
+      "disposition": "reused_test",
+      "target": "test_upstream_ipc_handle_cache",
+      "sha256": "658266eafa6b4ecc788d977f20e010a38f82e93e7fb87ac80e7b481c29a7d0ff"
+    },
+    "ros2_cuda_ipc_core/test/test_gpu_buffer_manager.cpp": {
+      "disposition": "adapted_test",
+      "target": "test_upstream_gpu_buffer_manager",
+      "adapted": "test/upstream/test_gpu_buffer_manager.cpp",
+      "sha256": "a217f7748434ce05877261a9b76b4c136eb3e9086eb9eba033e78abbf504c40e"
+    },
+    "ros2_cuda_ipc_core/test/test_buffer_ref.cpp": {
+      "disposition": "adapted_test",
+      "target": "test_upstream_buffer_ref",
+      "adapted": "test/upstream/test_buffer_ref.cpp",
+      "sha256": "6c6a304463cdbf30ccf00f98fd1da7e56103fd9cdf761e1b007217722f6591e2"
+    },
+    "ros2_cuda_ipc_core/test/mapper/test_buffer_mapper.cpp": {
+      "disposition": "adapted_test",
+      "target": "test_upstream_buffer_mapper",
+      "adapted": "test/upstream/test_buffer_mapper.cpp",
+      "sha256": "8fd8336a8caa998d7ae4faf59fe35b290c7a5eee535bf0056d927587e8cafb94"
+    },
+    "ros2_cuda_ipc_core/test/test_read_handle.cpp": {
+      "disposition": "adapted_test",
+      "target": "test_upstream_read_handle",
+      "adapted": "test/upstream/test_read_handle.cpp",
+      "sha256": "64511d174e547a92af0b74ef7418aa1bc3a194c4215c756e35ebc0ca1bd2a7f9"
+    },
+    "ros2_cuda_ipc_core/test/test_vmm_fd_memory_driver.cpp": {
+      "disposition": "adapted_test",
+      "target": "test_upstream_vmm_fd_memory_driver",
+      "adapted": "test/upstream/test_vmm_fd_memory_driver.cpp",
+      "sha256": "2e31412e3c0bd74944d5ea5559c187de56024afa64d0c60dc5abdb295b20eee1"
+    },
+    "ros2_cuda_ipc_core/test/vmm_fd_import_helper.cpp": {
+      "disposition": "adapted_helper",
+      "target": "g3_vmm_fd_import_helper",
+      "adapted": "test/upstream/vmm_fd_import_helper.cpp",
+      "sha256": "c1ab3ab23757e1b80092ff4a1130ea291a9464b7c18bf4e41d26d985c80e2aa5"
+    },
+    "ros2_cuda_ipc_core/test/vmm_fd_memory_test_protocol.hpp": {
+      "disposition": "support",
+      "sha256": "eaabe3cde7f1e035b387581b4f11ccccf2188336f9a77ec8f20b8dc9cf162c79"
+    },
+    "ros2_cuda_ipc_core/test/test_mapper_utils.hpp": {
+      "disposition": "unused",
+      "reason": "Legacy cache seeding is not used by the strict mapper tests.",
+      "sha256": "25627629f1d7717759d6656bd0f29d00135979f8a8f9d35dbfd3c99d451924f4"
+    }
+  }
+}

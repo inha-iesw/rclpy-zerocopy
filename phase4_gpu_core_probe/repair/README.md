@@ -1,9 +1,10 @@
 # Bounded GPU core repair and native Agnocast integration
 
-The native experiment passed **127 cases, with three multi-GPU skips,
-across 42 CTest targets** on the observed Thor configuration. Its own safety and
-integration suite has 79 passes; reused and migrated upstream tests add 48 passes and three
-skips. This establishes the tested safety boundaries;
+The repaired-core probe passed **142 cases, with three multi-GPU skips,
+across 43 CTest targets** on the observed Thor configuration. Its safety and
+integration suite has 79 passes; reused and migrated upstream tests add 48 passes
+and three skips; host-only test-lineage validation adds 15 passes.
+This establishes the tested safety boundaries;
 the full G3 adoption gate remains open. Python GPU Tensor ownership (G4),
 Orin validation and performance/copy profiling (G5) remain unfinished.
 The original rejection diagnostics and upstream baseline are preserved in
@@ -179,10 +180,12 @@ explicitly; the runner regression also checks an empty XML cannot mask exit fail
 | Isolated runner | 2 | Missing producer/subscriber case filters return failure despite valid zero-test XML |
 | Actual Agnocast processes | 18 | Existing nine cases, shared-epoch drain, three restart cycles with an independent pair, and seven actual imported-resource/context cleanup faults |
 | Reused and migrated upstream core | 48 PASS + 3 SKIP | Context, pool, publisher message, caches, manager, BufferRef, mapper, read handle and cross-process VMM |
+| Test lineage (host-only) | 15 PASS | Base revision/hash/inventory, adapted-source ownership, required test classification and CMake registration/failure propagation |
 
 The custom suite is **79 PASS, zero failures/errors/skips**. Together with the
-upstream oracles this is **130 collected = 127 PASS + 3 SKIP**, with all 42 CTest
-targets passing. All three skips require multiple GPUs. The checkpoint
+upstream oracles this is **130 collected = 127 PASS + 3 SKIP** across 42 CTest
+targets. Adding host-only lineage validation gives **145 collected = 142 PASS +
+3 SKIP**, with all 43 targets passing. All three skips require multiple GPUs. The checkpoint
 used 32 fixed blocks: 64 warmup deliveries followed by 1,000 measured deliveries,
 checking every checksum and increasing per-block UIDs. Settled before/after
 FD/metadata-map counts were publisher **123/32**, subscriber **59/0**. These
@@ -282,6 +285,30 @@ then all 42 CTest targets and the CPU verifier passed. Evidence and frozen XML,
 sources, binaries and peer logs are under `log/g3/upstream-migration/`.
 The verified module was unloaded at refcount zero; the existing module and 13
 sockets were preserved, with no new metadata or socket names remaining.
+
+The tracked [test-lineage lock](lineage/upstream-tests.lock.json) records the
+base upstream revision, original hashes and dispositions for all 13 core test
+files, including the six adapted sources and the reused VMM protocol header.
+`prepare.py` checks it against the verified pristine tree before applying the
+core patch. CMake configure repeats the check and derives its ten GTest source
+registrations and separate VMM helper from the same lock. A changed base pin,
+unclassified/missing original, hash mismatch, duplicate target/adapted path or
+missing adapted source fails validation. An intentionally unused file needs a
+reason; a `test_*.cpp` cannot silently become a support file. Normal edits to an
+adapted source do not require updating its original hash.
+
+The existing archive/whole-tree checks already reject changes to the current pin.
+Lineage adds review of adapted sources when that pin changes; it does not make the
+repaired tree's own `BUILD_TESTING=ON` compatible. Continue to build its core with
+`BUILD_TESTING=OFF` and use this probe. The host-only `test_upstream_lineage` target
+checks rejection paths and actual CMake registration without loading CUDA.
+
+The latest evidence is in `log/g3/lineage-integration/`. The 11 native executable
+source/compile/link contracts and all 42 existing CTest command/timeout/XML
+contracts match the pre-lineage build; only the lineage pytest target was added.
+The production patch, repaired core archive and GpuTensor field declarations are
+unchanged. The full transport suite passed, and the verified module was unloaded
+at refcount zero while preserving the existing module and 13 sockets.
 
 G3 remains open. This matrix covers the listed cleanup paths, not every allocation,
 event-creation, FD/system-call or asynchronous CUDA failure. Remaining work includes
