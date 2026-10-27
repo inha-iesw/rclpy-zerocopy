@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -82,6 +83,20 @@ unsigned count(const Counts & snapshot, Operation operation)
 void record_owned_names() {collect_names = true;}
 std::size_t owned_metadata_count() {return metadata_names.size();}
 std::size_t owned_socket_count() {return socket_names.size();}
+
+bool owned_names_absent()
+{
+  for (const auto & name : metadata_names) {
+    const int fd = shm_open(name.c_str(), O_RDONLY, 0);
+    if (fd >= 0) {close(fd); return false;}
+    if (errno != ENOENT) {return false;}
+  }
+  for (const auto & name : socket_names) {
+    struct stat status{};
+    if (lstat(name.c_str(), &status) == 0 || errno != ENOENT) {return false;}
+  }
+  return true;
+}
 
 bool unlink_owned_names()
 {
@@ -168,9 +183,51 @@ extern "C" CUresult CUDAAPI cuMemCreate(
   CUmemGenericAllocationHandle * handle, std::size_t size,
   const CUmemAllocationProp * properties, unsigned long long flags)
 {
-  (void)fail(Operation::MemCreate);
+  if (fail(Operation::MemCreate)) {return CUDA_ERROR_OUT_OF_MEMORY;}
   static const auto real = original<decltype(&cuMemCreate)>("cuMemCreate");
   return real ? real(handle, size, properties, flags) : CUDA_ERROR_UNKNOWN;
+}
+
+extern "C" CUresult CUDAAPI cuMemAddressReserve(
+  CUdeviceptr * pointer, std::size_t size, std::size_t alignment,
+  CUdeviceptr address, unsigned long long flags)
+{
+  if (fail(Operation::MemAddressReserve)) {return CUDA_ERROR_OUT_OF_MEMORY;}
+  static const auto real = original<decltype(&cuMemAddressReserve)>("cuMemAddressReserve");
+  return real ? real(pointer, size, alignment, address, flags) : CUDA_ERROR_UNKNOWN;
+}
+
+extern "C" CUresult CUDAAPI cuMemMap(
+  CUdeviceptr pointer, std::size_t size, std::size_t offset,
+  CUmemGenericAllocationHandle handle, unsigned long long flags)
+{
+  if (fail(Operation::MemMap)) {return CUDA_ERROR_OUT_OF_MEMORY;}
+  static const auto real = original<decltype(&cuMemMap)>("cuMemMap");
+  return real ? real(pointer, size, offset, handle, flags) : CUDA_ERROR_UNKNOWN;
+}
+
+extern "C" CUresult CUDAAPI cuMemExportToShareableHandle(
+  void * handle, CUmemGenericAllocationHandle allocation,
+  CUmemAllocationHandleType type, unsigned long long flags)
+{
+  if (fail(Operation::MemExport)) {return CUDA_ERROR_UNKNOWN;}
+  static const auto real = original<decltype(&cuMemExportToShareableHandle)>(
+    "cuMemExportToShareableHandle");
+  return real ? real(handle, allocation, type, flags) : CUDA_ERROR_UNKNOWN;
+}
+
+extern "C" CUresult CUDAAPI cuEventCreate(CUevent * event, unsigned flags)
+{
+  if (fail(Operation::EventCreate)) {return CUDA_ERROR_OUT_OF_MEMORY;}
+  static const auto real = original<decltype(&cuEventCreate)>("cuEventCreate");
+  return real ? real(event, flags) : CUDA_ERROR_UNKNOWN;
+}
+
+extern "C" CUresult CUDAAPI cuIpcGetEventHandle(CUipcEventHandle * handle, CUevent event)
+{
+  if (fail(Operation::IpcGetEventHandle)) {return CUDA_ERROR_UNKNOWN;}
+  static const auto real = original<decltype(&cuIpcGetEventHandle)>("cuIpcGetEventHandle");
+  return real ? real(handle, event) : CUDA_ERROR_UNKNOWN;
 }
 
 extern "C" CUresult CUDAAPI cuDevicePrimaryCtxRetain(CUcontext * context, CUdevice device)
