@@ -6,7 +6,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <set>
 #include <string>
 #include <vector>
@@ -14,6 +16,18 @@
 #include "ros2_cuda_ipc_core/buffer_metadata/buffer_ref.hpp"
 #include "ros2_cuda_ipc_core/publisher/gpu_buffer_manager.hpp"
 #include "../support.hpp"
+
+namespace {
+std::atomic<int64_t> clock_us{0};
+}
+
+// Freeze only this executable's clock; GPU completion is observed separately.
+extern "C" std::chrono::steady_clock::time_point __real__ZNSt6chrono3_V212steady_clock3nowEv();
+extern "C" std::chrono::steady_clock::time_point __wrap__ZNSt6chrono3_V212steady_clock3nowEv() {
+  const auto value = clock_us.load();
+  return value == 0 ? __real__ZNSt6chrono3_V212steady_clock3nowEv() :
+         std::chrono::steady_clock::time_point(std::chrono::microseconds(value));
+}
 
 namespace ros2_cuda_ipc_core::publisher {
 namespace {
@@ -132,8 +146,44 @@ TEST_F(GpuBufferManagerTest, CancelReturnsTheSameBlockToThePool) {
   auto reused = manager.acquire_for_publish(stream.driver());
   ASSERT_TRUE(reused);
   EXPECT_EQ(reused->device_ptr(), second_ptr);
-  reused->cancel();
+  ASSERT_TRUE(reused->prepare_publish(stream.driver()));
   first->cancel();
+  ASSERT_EQ(cudaStreamSynchronize(stream.value), cudaSuccess);
+  EXPECT_TRUE(manager.try_close());
+}
+
+TEST_F(GpuBufferManagerTest, CompletedPublicationWaitsForGraceBeforeReuse) {
+  g3_test::Stream stream;
+  GpuBufferManager manager({1, 1024, 0});
+  ASSERT_TRUE(manager.initialise());
+  auto block = manager.acquire_for_publish(stream.driver());
+  ASSERT_TRUE(block);
+  void* pointer = block->device_ptr();
+  struct FrozenClock {
+    FrozenClock() { clock_us = 1000000; }
+    ~FrozenClock() { clock_us = 0; }
+  } clock;
+  const auto descriptor = block->prepare_publish(stream.driver());
+  ASSERT_TRUE(descriptor);
+  ASSERT_EQ(cudaStreamSynchronize(stream.value), cudaSuccess);
+  auto mapping = Metadata::attach(buffer_metadata::shm_name_for_block(
+      descriptor.value().publisher_pid, descriptor.value().block_id));
+  ASSERT_TRUE(mapping);
+  ASSERT_EQ(Ref::current_refcount(mapping), 0u);
+  // This also proves the pool's linked core observes the frozen clock.
+  ASSERT_EQ(Ref::current_publish_timestamp_us(mapping), 1000000u);
+  EXPECT_FALSE(manager.acquire_for_publish(stream.driver()));
+  clock_us = 1099999;
+  EXPECT_FALSE(manager.acquire_for_publish(stream.driver()));
+  EXPECT_FALSE(manager.poisoned());
+  clock_us = 1100000;
+  auto reused = manager.acquire_for_publish(stream.driver());
+  ASSERT_TRUE(reused);
+  EXPECT_EQ(reused->device_ptr(), pointer);
+  const auto next = reused->prepare_publish(stream.driver());
+  ASSERT_TRUE(next);
+  EXPECT_EQ(next.value().block_id, descriptor.value().block_id);
+  EXPECT_NE(next.value().uid, descriptor.value().uid);
   ASSERT_EQ(cudaStreamSynchronize(stream.value), cudaSuccess);
   EXPECT_TRUE(manager.try_close());
 }

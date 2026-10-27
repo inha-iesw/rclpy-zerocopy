@@ -49,6 +49,12 @@ CPU adapter ABI 3 and the Python CPU API are unchanged.
 - One live producer pool epoch per process. Outstanding blocks retain their pool.
   Pending producer events prevent reuse, including cancellation. Writer admission
   excludes readers while the UID changes, and stale/unpublished UIDs are rejected.
+- Committed blocks retain the upstream 100 ms grace before reuse, even after GPU
+  completion and the last reader release. GPU completion and reader release are
+  additional requirements; grace alone never permits reuse. Unpublished cancel
+  waits for recorded GPU completion without a committed-publication grace.
+  `block_count / 100 ms` is an ideal sustained-publication upper bound for one
+  healthy pool epoch, not a throughput guarantee or a sufficient pool-size rule.
 - Streams must belong to the selected device's primary context and remain valid
   through completion recording. Primary-context legacy/default and explicit streams
   are supported; per-thread default and foreign-context streams are rejected.
@@ -221,9 +227,9 @@ pointers without dereferencing them; actual import/data coverage comes from the
 VMM child and Agnocast transport. VMM's CPU readback is a functional oracle, not
 copy-free evidence, and its direct importer does not establish the mapper H bound.
 
-The BufferRef target wraps libstdc++'s steady-clock entry point at link time in
-this static-core test build. Only its grace case freezes the clock, verifies the
-committed timestamp, rejects at 0/99,999 microseconds and admits at 100,000; other
+The BufferRef and manager targets wrap libstdc++'s steady-clock entry point at link time in
+this static-core test build. Only their grace cases freeze the clock, verify the
+committed timestamp, reject at 0/99,999 microseconds and admit at 100,000; other
 cases use the real clock. No production clock or grace policy changes.
 Metadata fixtures unlink only successfully created names. Rejection tests report
 fixture setup failures separately, and the mapper counts actual `connect` calls

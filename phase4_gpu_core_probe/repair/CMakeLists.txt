@@ -66,6 +66,8 @@ target_link_libraries(test_upstream_buffer_mapper ${CMAKE_DL_LIBS})
 target_link_options(test_upstream_buffer_mapper PRIVATE "-Wl,--export-dynamic-symbol=connect")
 target_link_options(test_upstream_buffer_ref PRIVATE
   "-Wl,--wrap=_ZNSt6chrono3_V212steady_clock3nowEv")
+target_link_options(test_upstream_gpu_buffer_manager PRIVATE
+  "-Wl,--wrap=_ZNSt6chrono3_V212steady_clock3nowEv")
 
 target_include_directories(g3_vmm_fd_import_helper PRIVATE "${_upstream_tests}")
 target_include_directories(test_upstream_vmm_fd_memory_driver PRIVATE "${_upstream_tests}")
