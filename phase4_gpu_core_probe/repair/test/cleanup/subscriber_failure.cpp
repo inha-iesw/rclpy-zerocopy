@@ -97,6 +97,15 @@ unsigned pop_calls() {return observed_pops.load();}
 unsigned pop_failures() {return failed_pops.load();}
 }  // namespace subscriber_failure
 
+extern "C" CUresult CUDAAPI cuEventCreate(CUevent * event, unsigned flags)
+{
+  using namespace subscriber_failure;
+  if (inject(Operation::Create)) {return CUDA_ERROR_OUT_OF_MEMORY;}
+  using Function = CUresult (CUDAAPI *)(CUevent *, unsigned);
+  static auto original = reinterpret_cast<Function>(dlsym(RTLD_NEXT, "cuEventCreate"));
+  return original ? original(event, flags) : CUDA_ERROR_UNKNOWN;
+}
+
 extern "C" CUresult CUDAAPI cuEventRecord(CUevent event, CUstream stream)
 {
   using namespace subscriber_failure;

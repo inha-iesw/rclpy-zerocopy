@@ -168,16 +168,18 @@ target_include_directories(test_subscriber_cleanup PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../../build/g3/repaired/ros2_cuda_ipc/ros2_cuda_ipc_core/src")
 target_link_libraries(test_subscriber_cleanup
   ros2_cuda_ipc_core::ros2_cuda_ipc_core CUDA::cudart ${CMAKE_DL_LIBS})
-foreach(_symbol cuEventRecord cuEventQuery cuEventDestroy_v2 cuStreamWaitEvent
+foreach(_symbol cuEventCreate cuEventRecord cuEventQuery cuEventDestroy_v2 cuStreamWaitEvent
     cuCtxPushCurrent_v2 cuCtxPopCurrent_v2)
   target_link_options(test_subscriber_cleanup PRIVATE "-Wl,--export-dynamic-symbol=${_symbol}")
 endforeach()
 foreach(_case Record Query CompletionDestroy BindWaitAndDestroy
-    ReleaserSuccess WorkerSuccess ReleaserFailure WorkerFailure)
+    ReleaserSuccess WorkerSuccess ReleaserFailure WorkerFailure Create Wait)
   set(_test "subscriber_cleanup_${_case}")
   set(_xml "${AMENT_TEST_RESULTS_DIR}/${PROJECT_NAME}/${_test}.gtest.xml")
   if(_case MATCHES "^(Releaser|Worker)")
     set(_filter "PopOrigins/SubscriberContextPop.DrainWaitsForContextRestoration/${_case}")
+  elseif(_case MATCHES "^(Create|Wait)$")
+    set(_filter "Recoverable/SubscriberBindFailure.KeepsPublicationForRetryWhenCleanupSucceeds/${_case}")
   else()
     set(_filter "Failures/SubscriberCleanupFailure.RetainsReadAndRejectsReplacementMappers/${_case}")
   endif()

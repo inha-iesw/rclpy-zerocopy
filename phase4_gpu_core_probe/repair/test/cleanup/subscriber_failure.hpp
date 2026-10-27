@@ -4,7 +4,7 @@
 
 namespace subscriber_failure
 {
-enum class Operation {Record, Query, Destroy, Wait, Count};
+enum class Operation {Record, Query, Destroy, Wait, Create, Count};
 enum class PopOrigin {Releaser, Worker};
 
 // Each CTest filter runs in its own process because poison is process-lifetime.

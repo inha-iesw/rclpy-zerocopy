@@ -117,6 +117,38 @@ protected:
   std::string name;
 };
 
+class SubscriberBindFailure : public SubscriberFixture,
+  public ::testing::WithParamInterface<Operation> {};
+
+TEST_P(SubscriberBindFailure, KeepsPublicationForRetryWhenCleanupSucceeds)
+{
+  failure::arm(GetParam());
+  EXPECT_FALSE(detail::ReadHandleFactory::make_bound(*publication, nullptr));
+  EXPECT_EQ(failure::failures(GetParam()), 1u);
+  EXPECT_EQ(failure::calls(GetParam()), 1u);
+  EXPECT_EQ(epoch->reads.load(), 1u);
+  EXPECT_EQ(Ref::current_refcount(metadata), 1u);
+  EXPECT_FALSE(mapper->poisoned());
+  EXPECT_FALSE(mapper->closing());
+  EXPECT_FALSE(detail::admit(epoch));
+  auto read = detail::ReadHandleFactory::make_bound(*publication, nullptr);
+  ASSERT_TRUE(read);
+  EXPECT_EQ(failure::calls(GetParam()), 2u);
+  EXPECT_EQ(failure::failures(GetParam()), 1u);
+  publication.reset();
+  read.reset();
+  ASSERT_TRUE(wait_until([this] {return drained(*mapper);}));
+  EXPECT_EQ(epoch->reads.load(), 0u);
+  EXPECT_EQ(Ref::current_refcount(metadata), 0u);
+  EXPECT_FALSE(mapper->poisoned());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  Recoverable, SubscriberBindFailure, ::testing::Values(Operation::Create, Operation::Wait),
+  [](const ::testing::TestParamInfo<Operation> & info) {
+    return info.param == Operation::Create ? "Create" : "Wait";
+  });
+
 enum class CleanupFailure {Record, Query, CompletionDestroy, BindWaitAndDestroy};
 
 class SubscriberCleanupFailure : public SubscriberFixture,
