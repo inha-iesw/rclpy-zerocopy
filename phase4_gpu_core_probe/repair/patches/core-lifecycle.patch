@@ -680,7 +680,7 @@
  #include <string>
 
  #include "ros2_cuda_ipc_core/detail/cuda_util.hpp"
-@@ -20,6 +21,20 @@
+@@ -20,6 +21,22 @@
  namespace ros2_cuda_ipc_core::backend {
 
  namespace {
@@ -689,6 +689,8 @@
 +class ScopedFd {
 + public:
 +  explicit ScopedFd(int fd) noexcept : fd_(fd) {}
++  ScopedFd(const ScopedFd&) = delete;
++  ScopedFd& operator=(const ScopedFd&) = delete;
 +  ~ScopedFd() noexcept { reset(); }
 +  int get() const noexcept { return fd_; }
 +  void reset() noexcept {
@@ -701,7 +703,7 @@
 
  std::size_t align_up_size(std::size_t value, std::size_t alignment) {
    if (alignment == 0) {
-@@ -29,7 +44,9 @@
+@@ -29,9 +46,12 @@
    if (remainder == 0) {
      return value;
    }
@@ -711,8 +713,11 @@
 +             ? 0 : value + addition;
  }
 
++// The caller owns the returned FD and must close it after import or failure.
  std::optional<int> request_fd_from_publisher(const std::string& path) {
-@@ -49,12 +66,12 @@
+   int sock = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+   if (sock < 0) {
+@@ -49,12 +69,12 @@
      return std::nullopt;
    }
 
@@ -726,7 +731,7 @@
      return std::nullopt;
    }
    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
-@@ -62,7 +79,6 @@
+@@ -62,7 +82,6 @@
      RCUTILS_LOG_WARN_NAMED(
          "ros2_cuda_ipc_core.backend.vmm_fd", "connect(%s) failed: %s",
          path.c_str(), ros2_cuda_ipc_core::detail::errno_to_string().c_str());
@@ -734,35 +739,79 @@
      return std::nullopt;
    }
 
-@@ -74,12 +90,11 @@
+@@ -74,31 +93,50 @@
    msg.msg_iovlen = 1;
    msg.msg_control = cmsg_buf;
    msg.msg_controllen = sizeof(cmsg_buf);
 -  const ssize_t received = ::recvmsg(sock, &msg, 0);
+-  if (received <= 0) {
 +  const ssize_t received = ::recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
-   if (received <= 0) {
++  if (received < 0) {
      RCUTILS_LOG_WARN_NAMED(
          "ros2_cuda_ipc_core.backend.vmm_fd", "recvmsg on %s failed: %s",
          path.c_str(), ros2_cuda_ipc_core::detail::errno_to_string().c_str());
 -    ::close(sock);
-     return std::nullopt;
-   }
-
-@@ -89,13 +104,11 @@
-     RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.backend.vmm_fd",
-                            "recvmsg on %s missing SCM_RIGHTS payload",
+-    return std::nullopt;
+-  }
+-
+-  cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+-  if (!cmsg || cmsg->cmsg_level != SOL_SOCKET ||
+-      cmsg->cmsg_type != SCM_RIGHTS || cmsg->cmsg_len < CMSG_LEN(sizeof(int))) {
+-    RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.backend.vmm_fd",
+-                           "recvmsg on %s missing SCM_RIGHTS payload",
++    return std::nullopt;
++  }
++  if (received == 0) {
++    RCUTILS_LOG_WARN_NAMED(
++        "ros2_cuda_ipc_core.backend.vmm_fd",
++        "publisher closed FD request without data: %s", path.c_str());
++    return std::nullopt;
++  }
++
++  // CMSG_SPACE(sizeof(int)) can hold more than one FD in its alignment
++  // padding. recvmsg has already installed every returned SCM_RIGHTS FD,
++  // including those returned alongside MSG_CTRUNC; take care of all of them.
++  int fd = -1;
++  bool valid = (msg.msg_flags & MSG_CTRUNC) == 0;
++  for (cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg;
++       cmsg = CMSG_NXTHDR(&msg, cmsg)) {
++    if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS ||
++        cmsg->cmsg_len < CMSG_LEN(sizeof(int))) {
++      valid = false;
++      continue;
++    }
++    if (cmsg->cmsg_len != CMSG_LEN(sizeof(int))) valid = false;
++    const auto count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
++    for (std::size_t index = 0; index < count; ++index) {
++      int next_fd = -1;
++      std::memcpy(&next_fd, CMSG_DATA(cmsg) + index * sizeof(int), sizeof(int));
++      if (fd < 0) {
++        fd = next_fd;
++      } else {
++        ::close(next_fd);
++        valid = false;
++      }
++    }
++  }
++  if (!valid || fd < 0) {
++    if (fd >= 0) ::close(fd);
++    RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.backend.vmm_fd",
++                           "recvmsg on %s expected exactly one FD without control truncation",
                             path.c_str());
 -    ::close(sock);
+-    return std::nullopt;
+-  }
+-
+-  int fd = -1;
+-  std::memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
+-  ::close(sock);
+-  if (fd < 0) {
+-    RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.backend.vmm_fd",
+-                           "recvmsg returned invalid fd for %s", path.c_str());
      return std::nullopt;
    }
-
-   int fd = -1;
-   std::memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
--  ::close(sock);
-   if (fd < 0) {
-     RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.backend.vmm_fd",
-                            "recvmsg returned invalid fd for %s", path.c_str());
-@@ -108,7 +121,8 @@
+   return fd;
+@@ -108,7 +146,8 @@
 
  std::optional<ImportedResources> VmmFdMemoryImporter::import(
      const ros2_cuda_ipc_msgs::msg::BufferCore& msg,
@@ -772,7 +821,7 @@
    const std::string& socket_path = msg.vmm_socket_path;
    if (socket_path.size() >= sizeof(sockaddr_un::sun_path)) {
      RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.backend.vmm_fd",
-@@ -122,13 +136,13 @@
+@@ -122,13 +161,13 @@
      return std::nullopt;
    }
 
@@ -787,7 +836,7 @@
      return std::nullopt;
    }
    auto context = std::move(context_result).value();
-@@ -137,20 +151,32 @@
+@@ -137,20 +176,32 @@
      RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.backend.vmm_fd",
                             "Failed to activate CUDA context: %s",
                             guard_result.error().to_string().c_str());
@@ -824,7 +873,7 @@
    if (cu_res != CUDA_SUCCESS) {
      RCUTILS_LOG_WARN_NAMED(
          "ros2_cuda_ipc_core.backend.vmm_fd",
-@@ -172,15 +198,12 @@
+@@ -172,15 +223,12 @@
          "ros2_cuda_ipc_core.backend.vmm_fd",
          "cuMemGetAllocationGranularity failed: %s",
          ros2_cuda_ipc_core::detail::cu_result_to_string(cu_res).c_str());
@@ -841,7 +890,7 @@
 
    cu_res = cuMemAddressReserve(&imported.vmm_address, imported.allocation_size,
                                 0, 0, 0);
-@@ -188,7 +211,6 @@
+@@ -188,7 +236,6 @@
      RCUTILS_LOG_WARN_NAMED(
          "ros2_cuda_ipc_core.backend.vmm_fd", "cuMemAddressReserve failed: %s",
          ros2_cuda_ipc_core::detail::cu_result_to_string(cu_res).c_str());
@@ -849,7 +898,7 @@
      return std::nullopt;
    }
 
-@@ -198,11 +220,10 @@
+@@ -198,11 +245,10 @@
      RCUTILS_LOG_WARN_NAMED(
          "ros2_cuda_ipc_core.backend.vmm_fd", "cuMemMap failed: %s",
          ros2_cuda_ipc_core::detail::cu_result_to_string(cu_res).c_str());
@@ -865,7 +914,7 @@
    CUmemAccessDesc access_desc{};
    access_desc.location = prop.location;
    access_desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-@@ -212,9 +233,6 @@
+@@ -212,9 +258,6 @@
      RCUTILS_LOG_WARN_NAMED(
          "ros2_cuda_ipc_core.backend.vmm_fd", "cuMemSetAccess failed: %s",
          ros2_cuda_ipc_core::detail::cu_result_to_string(cu_res).c_str());
@@ -875,7 +924,7 @@
      return std::nullopt;
    }
 
-@@ -225,14 +243,18 @@
+@@ -225,14 +268,18 @@
                             ros2_cuda_ipc_core::detail::CudaDriverError(cu_res)
                                 .to_string()
                                 .c_str());
@@ -898,7 +947,7 @@
  }
 
  bool release_imported_resources(const ImportedResources& imported) noexcept {
-@@ -249,34 +271,24 @@
+@@ -249,34 +296,24 @@
      return false;
    }
    auto guard = std::move(guard_result).value();

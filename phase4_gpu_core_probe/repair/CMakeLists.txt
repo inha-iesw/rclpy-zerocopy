@@ -200,3 +200,12 @@ foreach(_case Record Query CompletionDestroy BindWaitAndDestroy
 endforeach()
 
 ament_add_pytest_test(test_upstream_lineage lineage/test_verify.py TIMEOUT 60)
+
+ament_add_gtest(test_fd_receive test/transport/test_fd_receive.cpp TIMEOUT 30)
+target_compile_features(test_fd_receive PRIVATE cxx_std_17)
+target_link_libraries(test_fd_receive
+  ros2_cuda_ipc_core::ros2_cuda_ipc_core CUDA::cudart ${CMAKE_DL_LIBS})
+foreach(_symbol recvmsg cuDevicePrimaryCtxRetain cuMemImportFromShareableHandle
+    cuCtxPushCurrent_v2 cuCtxPopCurrent_v2 cuDevicePrimaryCtxRelease_v2)
+  target_link_options(test_fd_receive PRIVATE "-Wl,--export-dynamic-symbol=${_symbol}")
+endforeach()

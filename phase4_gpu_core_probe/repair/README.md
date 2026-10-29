@@ -1,6 +1,6 @@
 # Bounded GPU core repair and native Agnocast integration
 
-The repaired-core probe registers **58 CTest targets**. Execution results and
+The repaired-core probe registers **59 CTest targets**. Execution results and
 the scope of each complete or targeted run are recorded in [EVIDENCE.md](EVIDENCE.md).
 The full G3 adoption gate remains open. Python GPU Tensor ownership (G4),
 Orin validation and performance/copy profiling (G5) remain unfinished.
@@ -13,7 +13,7 @@ The original rejection diagnostics and upstream baseline are preserved in
 `0e8933c8e58ffa7f1240a4c9efda3a2b84e5398c` with GNU patch, zero fuzz, and verifies
 every resulting source file. It neither modifies the pristine tree nor invokes
 Git. The MIT core patch is `patches/core-lifecycle.patch`, SHA256
-`76400ff87477f1048ac1a4adb41229b14c34c4ddb2b76865c55376bcbf5845c0`
+`cc8185bed6cda674be7db84623dafe6d87867e4ed3a7e243dc1477bf1df0bf89`
 (23 core files).
 
 The existing CUDA VMM allocation/import, SCM_RIGHTS FD transfer and IPC event
@@ -61,6 +61,12 @@ CPU adapter ABI 3 and the Python CPU API are unchanged.
   A permit precedes import and remains charged through active, deferred and failed
   cleanup. Recreating a mapper cannot bypass a live epoch's limits or its shutdown seal. Strict mapping
   keeps no idle metadata/import cache; this has an unmeasured performance cost.
+- FD replies must contain exactly one SCM_RIGHTS descriptor without `MSG_CTRUNC`.
+  Invalid replies return every installed FD before CUDA context acquisition, including
+  descriptors placed in ancillary alignment padding. The accepted single FD
+  remains scoped through context acquisition and is closed after the import call.
+  Scoped FD owners cannot be copied. A publisher EOF is diagnosed separately
+  from a failed `recvmsg`; only the latter reports `errno`.
 - Completion polling can release a finished read behind a stalled read. Pool close
   claims idle blocks exclusively and refuses pending writes or retained readers.
   Healthy busy final destruction retains one draining pool without poisoning it.
@@ -188,6 +194,7 @@ summary; complete and targeted executions are distinguished in [EVIDENCE.md](EVI
 | Recoverable subscriber bind faults | 2 | Completion event creation or ready wait fails; publication/ref/permit retained for successful retry and drain |
 | Subscriber context restoration | 4 | Releaser/worker pop gates and faults; no drain before restoration |
 | Isolated runner | 2 | Missing producer/subscriber case filters return failure despite valid zero-test XML |
+| FD receipt and rollback | 8 | Real Unix ancillary replies, extra/missing/truncated FD rejection, received-FD close/CLOEXEC, retain/push/import failure rollback, reference/admission return and context restoration |
 | Actual Agnocast processes | 20 | Checksum/UID, completion, cleanup, drain, crash/restart and connected FD receive error/EOF recovery with H=1 |
 | Reused and migrated upstream core | 52 | Context, pool, publisher message, caches, manager, BufferRef, mapper, read handle and cross-process VMM; three cases require multiple GPUs |
 | Test lineage (host-only) | 15 | Base revision/hash/inventory, adapted-source ownership, required test classification and CMake registration/failure propagation |
@@ -199,7 +206,7 @@ The device-independent `scripts/verify` gate does not run this GPU probe.
 `test/upstream/` adapts the pinned MIT test sources to the repaired contracts.
 Its [LICENSE](test/upstream/LICENSE) preserves the pinned upstream permission
 notice verbatim; the individual source copyright/SPDX notices are retained.
-The canonical core patch and production APIs are unchanged. All ten upstream
+The test adaptation preserves production APIs. All ten upstream
 core test groups are now connected to the repaired-core probe; the old Python
 bindings and examples remain outside this build.
 
@@ -250,18 +257,15 @@ no competing socket object, and the socket case does not exercise the CLOEXEC
 fallback. Socket selection counts process-wide AF_UNIX stream calls after CUDA
 warm-up; different driver/MPS behaviour in that interval needs separate validation.
 Subscriber bind-failure fixtures use synthetic pointers and
-do not establish payload import coverage. FD receive failures are injected before
-SCM_RIGHTS receipt; malformed ancillary data, already-received FD cleanup and
-producer `sendmsg` failure injection remain outside that coverage.
+do not establish payload import coverage. The native FD-receipt fixture uses
+`/dev/null` and deliberately fails retain/push/import; it does not claim successful
+CUDA import. Its two-header sender may be coalesced into one SCM_RIGHTS array by
+Linux.
 
 G3 remains open. This matrix covers the listed cleanup paths, not every allocation,
 event-creation, FD/system-call or asynchronous CUDA failure. Remaining work includes
 the production supervisor and recorded-name recovery procedure, remaining failure combinations, and a complete
 operation-specific diagnostic audit. Current FD/metadata counts do not establish
-physical VRAM/event/VMM accounting or copy profiling. FD receipt followed by
-retain/push/import failure, extra SCM_RIGHTS descriptors, MSG_CTRUNC and producer
-sendmsg recovery still need tests. Source inspection suggests the first-FD-only
-parser could leave an extra received FD open; this is an unverified reproduction
-target. G4 still needs the Python GPU
+physical VRAM/event/VMM accounting or copy profiling. G4 still needs the Python GPU
 provider, Tensor aliases and framework-stream lifetime tests. Orin/CUDA 12,
 native Ubuntu 24.04/Jazzy, performance/copy trace and G5 remain unverified.

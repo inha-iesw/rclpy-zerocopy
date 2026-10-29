@@ -278,6 +278,13 @@ def test_connected_fd_request_failure_releases_admission_and_allows_import(peers
     assert list(map(int, stats[1:4])) == [3, 0, 1]
     assert list(map(int, stats[5:])) == [4, 4, 0]
     close(publisher, subscriber)
+    diagnostics = Path(subscriber.stderr.name).read_text()
+    if fault == 'recv_eof':
+        assert diagnostics.count('publisher closed FD request without data') == 3
+        assert 'recvmsg on ' not in diagnostics
+    else:
+        assert diagnostics.count('recvmsg on ') == 3
+        assert 'publisher closed FD request without data' not in diagnostics
 
 
 @pytest.mark.parametrize('fault', [
