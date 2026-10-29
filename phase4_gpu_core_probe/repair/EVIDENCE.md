@@ -1,7 +1,7 @@
 # G3 bounded-core evidence history
 
-The [README](README.md) owns the current contract, build procedure, results and
-remaining gates. This file preserves earlier results and the source identity
+The [README](README.md) owns the current contract, build procedure, test inventory
+and remaining gates. This file owns execution results and the source identity
 that each result tested. The raw `log/` evidence is Git-ignored; this tracked
 summary does not replace its XML, binaries or hashes. All stages below left
 the full G3 adoption gate open. Recorded PASS is not a new execution or finalize.
@@ -16,6 +16,8 @@ Dates follow the design log's KST stage dates.
 | Upstream test migration (§26) | 2026-10-27 | `76400ff8`, unchanged | 42 targets, 127 PASS + 3 SKIP |
 | Lineage and documentation (§27) | 2026-10-27 | `76400ff8`, unchanged | 43 targets, 142 PASS + 3 SKIP, including 15 host-only lineage cases |
 | Initialisation and request failures (§28) | 2026-10-27 | `76400ff8`, unchanged | 52 targets, 154 PASS + 3 SKIP, including 15 host-only lineage cases |
+| Producer socket/context failures (§29) | 2026-10-28 | `76400ff8`, unchanged | Targeted 25 targets, 26 PASS; not a full probe |
+| Producer review corrections (§29 follow-up) | 2026-10-28 | `76400ff8`, unchanged | Targeted 25 targets, 26 PASS; existing 13 initialisation filters preserved |
 
 ## Initial bounded repair and primary-release comparison
 
@@ -190,6 +192,76 @@ The matching temporary module was unloaded at refcount zero; the existing module
 Evidence: `log/g3/initialisation-faults/{assessment.json,reconstruction.json,
 device-session.json,verification/}`. Full G3 adoption, complete diagnostics and
 production recovery remain open. No finalize or Git mutation ran in this stage.
+
+## Producer socket and initial context failures
+
+The canonical core patch and repaired static archive remained unchanged. Six
+isolated cases were added: second-block socket/bind/listen, second-event context
+push, initial primary-context retain and allocation-context push. The retain
+interposer previously observed calls only; it now returns the selected failure.
+Bind/listen injection is restricted to pool socket paths; socket injection targets
+AF_UNIX stream creation. The bind error is injected without a competing socket
+object, and the socket error does not exercise the CLOEXEC fallback.
+
+All initialisation cases check rollback without poison, recorded metadata/socket
+removal, FD counts and both replacement-manager and same-manager restart. The
+second-block cases balance successful CUDA allocation/release calls, now also
+including context push/pop and primary retain/release. Early-context failures
+occur before VMM allocation; retain failure creates no metadata either. Calling
+thread top-of-stack context identity is checked after rollback and successful retry;
+the push/pop counts, rather than identity alone, detect same-primary-context push leaks.
+These are coverage additions, not a new production-core defect RED/GREEN result.
+
+The pre-edit seven-case run was observed in the session but its log was not
+separately frozen in this evidence directory. The preserved final verification
+passed **26 cases across 25 CTest targets**: 13 initialisation, 11 existing terminal
+cleanup and two isolated-runner checks. The six new filters also passed directly.
+CMake collected 58 targets, but the remaining probe targets and actual transport
+were not rerun. This result must not be added to the earlier 154 PASS and presented
+as a single full-probe execution. No kernel module was loaded or unloaded.
+
+The CPU verifier was separately rerun: 12 packages, 39 targets, 584 collected =
+466 PASS + 118 device opt-in SKIP, zero failures/errors. The context-identity
+assertion was added after the first targeted run; the final build, CTest and direct
+XML contain that assertion. Evidence: `log/g3/initialisation-system-faults/`, including
+`assessment.json`, `reconstruction.json`, build logs and frozen test XML/source hashes.
+
+Direct-run logs identify socket/bind/listen and primary-retain/allocation-context
+errors. The second-event context-push error is still reported at the event-creation
+boundary. Current diagnostic, FD and recovery gaps are maintained in the README.
+Finalize, commit-plan and Git mutations were not run.
+
+## Producer initialisation review corrections
+
+Review `code-review-20261028-093809.md` identified renewed execution-history
+duplication in README and six new LOW items. README now describes contracts and
+registered coverage; execution totals and stage history live here. The stage
+index includes §29. The unpreserved pre-edit baseline is explicitly distinguished
+from frozen evidence, and current FD/parser gaps are maintained in README.
+
+The primary-release wrapper now observes calls without recording fictitious
+injections. Context cases use their own explicit occurrence/metadata/release
+parameters. A shared fixture owns warm-up, baseline, rollback and restart checks;
+both suites acquire two distinct replacement blocks. The second-event context
+case also confirms one IPC event handle existed before failure. Header/comments
+state the process-wide socket selection and the separate roles of top-of-stack
+identity and push/pop balance.
+
+Rebuilt producer executables passed **26 cases across 25 CTest targets**; all 13
+initialisation filters also passed directly, each selecting exactly one case.
+All 58 CTest registrations remained identical. A standalone driver-call probe
+selected PrimaryRelease against the previous frozen and current interposers:
+both forwarded one successful release, but the former reported one injection
+and failed the observer oracle; the latter reported zero and passed. This is a
+harness correction, not a GPU-core defect result or an additional registered case.
+
+README's inventory totals 96 custom, 52 upstream and 15 lineage cases; it contains
+no PASS/SKIP execution totals. The canonical patch/static core are unchanged.
+CPU verification, the full probe, transport, kernel module operations, finalize
+and Git mutation were not rerun for these review corrections. Earlier CPU results
+remain in `log/g3/initialisation-system-faults/`; current evidence is separately
+preserved in `log/g3/initialisation-review-fixes/`, including `assessment.json`,
+registration comparison, direct/CTest XML and the before/after observer probe.
 
 ## Shared checkpoint and device observations
 

@@ -1,11 +1,8 @@
 # Bounded GPU core repair and native Agnocast integration
 
-The repaired-core probe passed **154 cases, with three multi-GPU skips,
-across 52 CTest targets** on the observed Thor configuration. Its safety and
-integration suite has 90 passes; reused and migrated upstream tests add 49 passes
-and three skips; host-only test-lineage validation adds 15 passes.
-This establishes the tested safety boundaries;
-the full G3 adoption gate remains open. Python GPU Tensor ownership (G4),
+The repaired-core probe registers **58 CTest targets**. Execution results and
+the scope of each complete or targeted run are recorded in [EVIDENCE.md](EVIDENCE.md).
+The full G3 adoption gate remains open. Python GPU Tensor ownership (G4),
 Orin validation and performance/copy profiling (G5) remain unfinished.
 The original rejection diagnostics and upstream baseline are preserved in
 [the parent README](../README.md).
@@ -69,6 +66,8 @@ CPU adapter ABI 3 and the Python CPU API are unchanged.
   Healthy busy final destruction retains one draining pool without poisoning it.
   A later `initialise()` retries its close before allocating a replacement; callers
   retry while old work/readers remain. There is no background publisher reaper.
+  An initialisation failure whose rollback succeeds returns the process epoch,
+  owned names and FDs; the same manager or a replacement may retry.
   Failed mapping/event cleanup retains resources/references; primary-context release failure
   permanently blocks new GPU admission and retains in the process. Context pop
   failure or a mismatched popped context also disables admission. Ambiguous
@@ -155,8 +154,8 @@ The process tests require `/dev/agnocast_rclpy` and the verified ARM64
 bridge/discovery and preload that hook. Before loading a module, check
 `build/g2-device-arm64/artifacts.json`, source identity, ELF architecture,
 vermagic and the running kernel. The old module inside the nested fork is x86_64.
-This run temporarily loaded only the matching `agnocast_rclpy` module and unloaded
-it afterward; the pre-existing `agnocast` module was preserved. Absent opt-in,
+Load only the matching `agnocast_rclpy` module and unload it after peers exit and
+its refcount reaches zero; preserve the pre-existing `agnocast` module. Absent opt-in,
 the 20 transport cases skip; this is not an equivalent safety result.
 The nested Agnocast fork is still uncommitted; an outer checkout alone does not
 reconstruct those device artifacts.
@@ -165,9 +164,12 @@ The isolated cleanup and collision executables require exactly one selected case
 per process and return an error for an empty filter. CTest registers each filter
 explicitly; the runner regression also checks an empty XML cannot mask exit failure.
 
-## Observed results and remaining work
+## Test inventory and remaining work
 
-| Test group | Cases | Evidence |
+The table lists registered cases and their coverage. It is not a run-result
+summary; complete and targeted executions are distinguished in [EVIDENCE.md](EVIDENCE.md).
+
+| Test group | Cases | Coverage |
 |---|---:|---|
 | Metadata reservations | 7 | Exclusive generation, stale reader, overflow, dead reader and 1,000 concurrent admission races |
 | Producer lifetime | 4 | Pending cancel/prepare, active close refusal, single live pool |
@@ -181,30 +183,16 @@ explicitly; the runner regression also checks an empty XML cannot mask exit fail
 | Primary release failure | 1 | Injected driver failure blocks 20 replacements; one unresolved release attempt |
 | Dense descriptor | 6 | dtype, span, allocation, layout and overflow validation |
 | Producer cleanup faults | 11 | Event/query/context/VMM cleanup, partial allocation rollback, context pop failure/mismatch; no cleanup retry or replacement allocation |
-| Producer initialisation faults | 7 | Second-block reserve/create/map/access/FD export/event create/IPC handle failures; successful rollback, names/FDs returned, replacement and same-manager retry |
+| Producer initialisation faults | 13 | Second-block reserve/create/map/access/FD export/event create/IPC handle/socket/bind/listen/event-context push failures; early primary retain/allocation-context push failures; rollback, names/FDs returned, context identity and call balance, replacement/same-manager retry |
 | Subscriber completion faults | 4 | Record, query, destroy, failed wait plus failed event cleanup; charged reference retention |
 | Recoverable subscriber bind faults | 2 | Completion event creation or ready wait fails; publication/ref/permit retained for successful retry and drain |
 | Subscriber context restoration | 4 | Releaser/worker pop gates and faults; no drain before restoration |
 | Isolated runner | 2 | Missing producer/subscriber case filters return failure despite valid zero-test XML |
-| Actual Agnocast processes | 20 | Existing 18 cases plus connected FD receive error/EOF, three failures then successful import/checksum with H=1 |
-| Reused and migrated upstream core | 49 PASS + 3 SKIP | Context, pool, publisher message, caches, manager, BufferRef, mapper, read handle and cross-process VMM |
-| Test lineage (host-only) | 15 PASS | Base revision/hash/inventory, adapted-source ownership, required test classification and CMake registration/failure propagation |
+| Actual Agnocast processes | 20 | Checksum/UID, completion, cleanup, drain, crash/restart and connected FD receive error/EOF recovery with H=1 |
+| Reused and migrated upstream core | 52 | Context, pool, publisher message, caches, manager, BufferRef, mapper, read handle and cross-process VMM; three cases require multiple GPUs |
+| Test lineage (host-only) | 15 | Base revision/hash/inventory, adapted-source ownership, required test classification and CMake registration/failure propagation |
 
-The custom suite is **90 PASS, zero failures/errors/skips**. Together with the
-upstream oracles this is **142 collected = 139 PASS + 3 SKIP** across 51 CTest
-targets. Adding host-only lineage validation gives **157 collected = 154 PASS +
-3 SKIP**, with all 52 targets passing. All three skips require multiple GPUs. The checkpoint
-used 32 fixed blocks: 64 warmup deliveries followed by 1,000 measured deliveries,
-checking every checksum and increasing per-block UIDs. Settled before/after
-FD/metadata-map counts were publisher **123/32**, subscriber **59/0**. These
-measurements do not count CUDA VMM mappings, events or physical memory.
-
-The CPU verifier covers 12 packages and 39 CTest targets:
-**466 PASS + 118 device opt-in SKIP**, with zero failures/errors. This verifier
-execution is separate from finalize and does not rerun the GPU suite.
-
-Historical patch identities, RED/GREEN comparisons and superseded results are
-preserved in [EVIDENCE.md](EVIDENCE.md). Those records are not new executions.
+The device-independent `scripts/verify` gate does not run this GPU probe.
 
 ### Upstream test migration
 
@@ -215,16 +203,16 @@ The canonical core patch and production APIs are unchanged. All ten upstream
 core test groups are now connected to the repaired-core probe; the old Python
 bindings and examples remain outside this build.
 
-| Migrated group | Result | Contract exercised |
+| Migrated group | Cases | Contract exercised |
 |---|---:|---|
-| Manager | 7 PASS | Explicit producer stream, completion and exact grace boundary before reuse, cancel-to-publish, successive single-pool epochs and reader-protected reuse |
-| BufferRef | 5 PASS | Owned metadata size, committed/stale UID, fresh generation per race and the 100 ms grace boundary |
-| Mapper | 4 PASS | Mandatory H/M, missing/stale/unpublished rejection before import, reference and admission return after a real failed FD request |
-| Read handle | 4 PASS + 2 SKIP | Retained primary context for runtime/driver streams, default/legacy acceptance, per-thread rejection; two multi-GPU oracles remain skipped |
-| VMM | 1 PASS | A spawned child imports, checks all 4,096 bytes and releases; parent and child report final context cleanup |
+| Manager | 7 | Explicit producer stream, completion and exact grace boundary before reuse, cancel-to-publish, successive single-pool epochs and reader-protected reuse |
+| BufferRef | 5 | Owned metadata size, committed/stale UID, fresh generation per race and the 100 ms grace boundary |
+| Mapper | 4 | Mandatory H/M, missing/stale/unpublished rejection before import, reference and admission return after a real failed FD request |
+| Read handle | 6 | Retained primary context for runtime/driver streams, default/legacy acceptance, per-thread rejection; two cases require multiple GPUs |
+| VMM | 1 | A spawned child imports, checks all 4,096 bytes and releases; parent and child report final context cleanup |
 
-These five targets contain **23 cases = 21 PASS + 2 SKIP**. The five unchanged
-upstream targets add **28 PASS + 1 SKIP**. Read-handle fixtures use synthetic
+These five targets contain 23 cases. The five unchanged upstream targets add
+29 cases, one requiring multiple GPUs. Read-handle fixtures use synthetic
 pointers without dereferencing them; actual import/data coverage comes from the
 VMM child and Agnocast transport. VMM's CPU readback is a functional oracle, not
 copy-free evidence, and its direct importer does not establish the mapper H bound.
@@ -254,12 +242,14 @@ repaired tree's own `BUILD_TESTING=ON` compatible. Continue to build its core wi
 `BUILD_TESTING=OFF` and use this probe. The host-only `test_upstream_lineage` target
 checks rejection paths and actual CMake registration without loading CUDA.
 
-The latest test run's XML, source snapshots and artifact identities are recorded in
-`log/g3/initialisation-faults/`. Stage-by-stage changes, execution details and
-historical build comparisons are preserved in [EVIDENCE.md](EVIDENCE.md).
-
 Producer allocation/release call counts do not measure physical VRAM or driver
-resource residency. Subscriber bind-failure fixtures use synthetic pointers and
+resource residency. Initialisation context checks establish unchanged top-of-stack
+identity; same-primary-context push leaks are detected by push/pop call balance,
+not by identity alone. Socket/bind/listen errors are injected: the bind case creates
+no competing socket object, and the socket case does not exercise the CLOEXEC
+fallback. Socket selection counts process-wide AF_UNIX stream calls after CUDA
+warm-up; different driver/MPS behaviour in that interval needs separate validation.
+Subscriber bind-failure fixtures use synthetic pointers and
 do not establish payload import coverage. FD receive failures are injected before
 SCM_RIGHTS receipt; malformed ancillary data, already-received FD cleanup and
 producer `sendmsg` failure injection remain outside that coverage.
@@ -268,6 +258,10 @@ G3 remains open. This matrix covers the listed cleanup paths, not every allocati
 event-creation, FD/system-call or asynchronous CUDA failure. Remaining work includes
 the production supervisor and recorded-name recovery procedure, remaining failure combinations, and a complete
 operation-specific diagnostic audit. Current FD/metadata counts do not establish
-physical VRAM/event/VMM accounting or copy profiling. G4 still needs the Python GPU
+physical VRAM/event/VMM accounting or copy profiling. FD receipt followed by
+retain/push/import failure, extra SCM_RIGHTS descriptors, MSG_CTRUNC and producer
+sendmsg recovery still need tests. Source inspection suggests the first-FD-only
+parser could leave an extra received FD open; this is an unverified reproduction
+target. G4 still needs the Python GPU
 provider, Tensor aliases and framework-stream lifetime tests. Orin/CUDA 12,
 native Ubuntu 24.04/Jazzy, performance/copy trace and G5 remain unverified.
