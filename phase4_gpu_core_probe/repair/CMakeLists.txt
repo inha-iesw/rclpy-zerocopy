@@ -146,10 +146,11 @@ target_link_libraries(test_producer_initialisation
   ros2_cuda_ipc_core::ros2_cuda_ipc_core CUDA::cudart ${CMAKE_DL_LIBS})
 foreach(_symbol cuMemAddressReserve cuMemAddressFree cuMemCreate cuMemRelease
     cuMemMap cuMemUnmap cuMemSetAccess cuMemExportToShareableHandle
-    cuEventCreate cuEventDestroy_v2 cuIpcGetEventHandle shm_open bind)
+    cuEventCreate cuEventDestroy_v2 cuIpcGetEventHandle shm_open socket bind listen)
   target_link_options(test_producer_initialisation PRIVATE "-Wl,--export-dynamic-symbol=${_symbol}")
 endforeach()
-foreach(_case MemAddressReserve MemCreate MemMap MemSetAccess MemExport EventCreate IpcGetEventHandle)
+foreach(_case MemAddressReserve MemCreate MemMap MemSetAccess MemExport EventCreate IpcGetEventHandle
+    Socket Bind Listen)
   set(_test "producer_initialisation_${_case}")
   set(_xml "${AMENT_TEST_RESULTS_DIR}/${PROJECT_NAME}/${_test}.gtest.xml")
   ament_add_test(${_test}

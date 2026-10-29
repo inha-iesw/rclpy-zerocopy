@@ -48,6 +48,15 @@ Function original(const char * symbol)
 {
   return reinterpret_cast<Function>(dlsym(RTLD_NEXT, symbol));
 }
+
+bool pool_socket_address(const sockaddr * address, socklen_t size)
+{
+  constexpr char prefix[] = "/tmp/cuda_memory_pool_";
+  if (size < offsetof(sockaddr_un, sun_path) + sizeof(prefix) - 1 ||
+    address->sa_family != AF_UNIX) {return false;}
+  const auto * local = reinterpret_cast<const sockaddr_un *>(address);
+  return std::strncmp(local->sun_path, prefix, sizeof(prefix) - 1) == 0;
+}
 }  // namespace
 
 namespace g3_cleanup
@@ -253,21 +262,46 @@ extern "C" int shm_open(const char * name, int flags, mode_t mode)
   return result;
 }
 
+extern "C" int socket(int domain, int type, int protocol) noexcept
+{
+  if (collect_names && domain == AF_UNIX &&
+    (type & ~SOCK_CLOEXEC) == SOCK_STREAM && fail(Operation::Socket))
+  {
+    errno = EMFILE;
+    return -1;
+  }
+  static const auto real = original<decltype(&socket)>("socket");
+  if (!real) {errno = ENOSYS; return -1;}
+  return real(domain, type, protocol);
+}
+
 extern "C" int bind(int socket, const sockaddr * address, socklen_t size) noexcept
 {
   static const auto real = original<decltype(&bind)>("bind");
   if (!real) {errno = ENOSYS; return -1;}
+  const bool pool_socket = collect_names && pool_socket_address(address, size);
+  if (pool_socket && fail(Operation::Bind)) {errno = EADDRINUSE; return -1;}
   const int result = real(socket, address, size);
-  if (result == 0 && collect_names && address->sa_family == AF_UNIX &&
-    size >= sizeof(sockaddr_un))
-  {
+  if (result == 0 && pool_socket) {
     const auto * local = reinterpret_cast<const sockaddr_un *>(address);
-    constexpr char prefix[] = "/tmp/cuda_memory_pool_";
-    if (std::strncmp(local->sun_path, prefix, sizeof(prefix) - 1) == 0) {
-      socket_names.emplace_back(local->sun_path);
-    }
+    socket_names.emplace_back(local->sun_path);
   }
   return result;
+}
+
+extern "C" int listen(int socket, int backlog) noexcept
+{
+  sockaddr_un address{};
+  socklen_t size = sizeof(address);
+  if (collect_names && getsockname(socket, reinterpret_cast<sockaddr *>(&address), &size) == 0 &&
+    pool_socket_address(reinterpret_cast<const sockaddr *>(&address), size) && fail(Operation::Listen))
+  {
+    errno = EIO;
+    return -1;
+  }
+  static const auto real = original<decltype(&listen)>("listen");
+  if (!real) {errno = ENOSYS; return -1;}
+  return real(socket, backlog);
 }
 
 // Historical cores scan unrelated shared-memory names during initialise.

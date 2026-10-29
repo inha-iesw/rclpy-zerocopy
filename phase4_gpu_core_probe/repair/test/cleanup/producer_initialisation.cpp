@@ -137,7 +137,10 @@ INSTANTIATE_TEST_SUITE_P(
     FailureCase{"MemSetAccess", Operation::MemSetAccess},
     FailureCase{"MemExport", Operation::MemExport},
     FailureCase{"EventCreate", Operation::EventCreate, 2},
-    FailureCase{"IpcGetEventHandle", Operation::IpcGetEventHandle, 2}),
+    FailureCase{"IpcGetEventHandle", Operation::IpcGetEventHandle, 2},
+    FailureCase{"Socket", Operation::Socket},
+    FailureCase{"Bind", Operation::Bind},
+    FailureCase{"Listen", Operation::Listen, 2}),
   [](const ::testing::TestParamInfo<FailureCase> & info) {return info.param.name;});
 
 }  // namespace

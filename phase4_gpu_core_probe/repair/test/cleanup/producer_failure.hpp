@@ -9,7 +9,8 @@ enum class Operation : std::size_t
 {
   EventDestroy, MemUnmap, MemAddressFree, MemRelease, EventQuery,
   ContextPush, ContextPop, MemSetAccess, MemCreate, PrimaryRetain,
-  MemAddressReserve, MemMap, MemExport, EventCreate, IpcGetEventHandle, Count
+  MemAddressReserve, MemMap, MemExport, EventCreate, IpcGetEventHandle,
+  Socket, Bind, Listen, Count
 };
 
 using Counts = std::array<unsigned, static_cast<std::size_t>(Operation::Count)>;
@@ -20,6 +21,10 @@ void arm(Operation operation, unsigned occurrence, bool rollback, bool pop_misma
 Counts counts();
 unsigned injections(Operation operation);
 unsigned count(const Counts & snapshot, Operation operation);
+// Starts owned-name recording and libc fault observation after CUDA warm-up.
+// Socket counts process-wide AF_UNIX stream calls, including other libraries;
+// Bind/Listen select only /tmp/cuda_memory_pool_ paths. A driver/MPS configuration
+// with stream sockets in this interval requires validating that selection again.
 void record_owned_names();
 std::size_t owned_metadata_count();
 std::size_t owned_socket_count();

@@ -70,8 +70,9 @@ TEST_P(RepairedProducerCleanup, FailurePoisonsEpoch)
     EXPECT_FALSE(replacement.initialise()) << attempt;
     EXPECT_TRUE(replacement.poisoned()) << attempt;
   }
-  // Includes allocation and primary retain calls: replacements must not grow
-  // resources even when the injected operation would succeed on another call.
+  // Includes allocation, primary retain and process-wide AF_UNIX stream socket
+  // calls after recording starts: replacements must not grow resources even
+  // when the injected operation would succeed on another call.
   EXPECT_EQ(g3_cleanup::counts(), after);
 }
 
