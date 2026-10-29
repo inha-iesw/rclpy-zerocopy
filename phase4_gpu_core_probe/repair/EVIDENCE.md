@@ -358,6 +358,52 @@ The cumulative LOW/refactoring/design suggestions were not expanded into this
 fix. Full G3, the documented post-receipt CUDA-success retry gap and G4/G5 remain
 open. Finalize and Git mutation were not run.
 
+## Post-receipt CUDA failure recovery (2026-10-29)
+
+Three actual Agnocast peer cases now receive a valid producer VMM FD before
+injecting primary-context retain, first context push, or VMM import failure.
+Each fails the first three maps, then imports the same cached UID through the
+same H=1 mapper, verifies the GPU checksum and drains normally. Startup calls
+cannot consume these failures: the map-thread observation arms only after a
+well-formed, single-FD SCM_RIGHTS receipt from the producer socket.
+
+Every rejection verifies CLOEXEC and immediate EBADF, context restoration,
+zero read references, nonpoison, and settled FD/metadata-map counts on both peers.
+Retain failure makes no push/import/release calls. Push failure releases its one
+successful primary retain. Import failure returns that retain and balances two
+successful push/pop pairs, including the partial-import cleanup guard. The fourth
+map performs a real import with three successful push/pop pairs. After mapper
+drain, all-thread successful retain/release counts and push/pop counts balance;
+worker polling counts are variable and are not asserted as an exact total.
+
+The initial targeted run passed all three new cases. Read-only inspection found
+that a successful import can close its received FD before later driver work
+reuses the same number. The final test therefore requires EBADF on synchronous
+rejection only and uses settled FD counts for successful import. After that
+assertion adjustment and a rebuild, the full probe passed **174 cases with three
+multi-GPU skips across 59 CTest targets**: 110 custom, 49 upstream and 15 host
+lineage passes. Actual transport passed all 26 cases, including the 1,000-delivery
+checkpoint and crash/restart scenarios. The targeted three cases overlap this
+total. CPU `scripts/verify` passed 12 packages/39 targets, **584 collected =
+466 PASS + 118 device opt-in SKIP**, without failures or errors.
+
+The core patch remains `cc8185bed6cda674be7db84623dafe6d87867e4ed3a7e243dc1477bf1df0bf89`.
+No core modification was needed. All 140 reconstructed source hashes and both
+built/installed core archive hashes match the previous verified reconstruction;
+this run rebuilt the probe, not the core or a new empty build tree.
+
+Device runs verified all five recorded artifacts and 24 source/prior-artifact
+hashes, ELF architecture, kernel/vermagic and module srcversion. Each temporary
+module was unloaded after peers exited and its refcount reached zero. The
+pre-existing module, 13 sockets and metadata inventory were preserved.
+Evidence is in `log/g3/post-receipt-recovery/`, including `assessment.json`,
+`targeted/`, the initial `full/`, the final `final/`, and frozen `verification/`.
+
+These results close the three post-receipt CUDA-success retry cases. Remaining
+failure combinations, operation-specific diagnostics and production recovery
+still keep G3 open; G4/G5 and Orin remain unfinished. Finalize and Git mutation
+were not run for this change.
+
 ## Shared checkpoint and device observations
 
 Recorded transport checkpoints used 32 blocks, 64 warmup and 1,000 measured

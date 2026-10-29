@@ -20,7 +20,7 @@ EVENTS = {'READY', 'PUB', 'FULL', 'AVAILABLE', 'CONNECTIONS', 'CLOSED', 'STASHED
           'MAPPED', 'REJECTED', 'DROPPED', 'DONE', 'REMAPPED', 'LIMITS_REJECTED',
           'LIMITS_ACCEPTED', 'FAST_DONE', 'RESOURCES', 'MISSING', 'UNEXPECTED_MAP',
           'PENDING', 'COMPLETE', 'PRODUCED', 'POISONED', 'CLOSING', 'READ_CLOSED', 'FAULT_STATS',
-          'FD_REPLY_STATS'}
+          'FD_REPLY_STATS', 'RECEIPT_STATS'}
 
 
 class Peer:
@@ -290,6 +290,52 @@ def test_connected_fd_request_failure_releases_admission_and_allows_import(peers
     else:
         assert diagnostics.count('recvmsg on ') == 3
         assert 'publisher closed FD request without data' not in diagnostics
+
+
+@pytest.mark.parametrize('fault,rollback', [
+    ('receipt_retain', [1, 0, 0, 0, 0]),
+    ('receipt_push', [1, 0, 0, 1, 0]),
+    ('receipt_import', [1, 2, 2, 1, 1]),
+])
+def test_received_vmm_fd_cuda_failure_returns_resources_and_allows_import(peers, fault, rollback):
+    publisher, subscriber = peers(fault=fault)
+    packet = publish(publisher, 59)
+    assert subscriber.ask('stash') == ['STASHED', packet[1]]
+    before = (settled_resources(publisher), settled_resources(subscriber))
+    for attempt in range(1, 4):
+        assert subscriber.ask('map_only') == ['REJECTED']
+        # Exactly one CLOEXEC FD was received and is already EBADF; the caller's
+        # context is restored, successful pushes/pops balance, and no read ref remains.
+        assert list(map(int, subscriber.ask('receipt_stats')[1:])) == [
+            1, 1, 1, 1, *rollback, 0,
+            attempt * rollback[3], attempt * rollback[1],
+            attempt * rollback[2], attempt * rollback[3]]
+        stats = list(map(int, subscriber.ask('fault_stats')[1:]))
+        assert stats[0:3] == [attempt, 0, attempt if fault == 'receipt_import' else 0]
+        assert stats[4:] == [attempt, attempt, 0]
+        assert (settled_resources(publisher), settled_resources(subscriber)) == before
+    # Same UID and H=1 mapper, with no republish or epoch recreation.
+    assert subscriber.ask('map') == ['MAPPED', packet[1], '1']
+    mapped = list(map(int, subscriber.ask('receipt_stats')[1:11]))
+    # Driver work after successful import may reuse the now-closed FD number.
+    # Check settled FD counts below, rather than requiring that number be EBADF.
+    assert mapped[:2] == [1, 1]
+    assert mapped[3:] == [1, 1, 3, 3, 0, 1, 1]
+    assert subscriber.ask('finish') == ['DONE', str(59 * 64)]
+    stats = list(map(int, subscriber.ask('fault_stats')[1:]))
+    assert stats[0:3] == [3, 0, 4 if fault == 'receipt_import' else 1]
+    assert stats[4:] == [4, 4, 0]
+    deadline = time.monotonic() + 3
+    while subscriber.ask('close_read') != ['READ_CLOSED', '1']:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    drained = list(map(int, subscriber.ask('receipt_stats')[1:]))
+    assert drained[9] == 0
+    retains, pushes, pops, releases = drained[10:]
+    assert retains == releases == 1 + 3 * rollback[3]
+    assert pushes == pops and pushes >= 7 + 3 * rollback[1]
+    assert (settled_resources(publisher), settled_resources(subscriber)) == before
+    close(publisher, subscriber)
 
 
 @pytest.mark.parametrize('fault', [

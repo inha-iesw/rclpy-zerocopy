@@ -2,6 +2,7 @@
 
 #include <cuda.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
@@ -16,7 +17,7 @@ namespace
 enum class Failure
 {
   None, Unmap, AddressFree, Release, EventDestroy, ImportPop, PartialUnmap, PartialPop,
-  ReceiveError, ReceiveEof
+  ReceiveError, ReceiveEof, ReceiptRetain, ReceiptPush, ReceiptImport
 };
 
 Failure selected_failure()
@@ -33,6 +34,9 @@ Failure selected_failure()
       if (std::strcmp(value, "partial_pop") == 0) {return Failure::PartialPop;}
       if (std::strcmp(value, "recv_error") == 0) {return Failure::ReceiveError;}
       if (std::strcmp(value, "recv_eof") == 0) {return Failure::ReceiveEof;}
+      if (std::strcmp(value, "receipt_retain") == 0) {return Failure::ReceiptRetain;}
+      if (std::strcmp(value, "receipt_push") == 0) {return Failure::ReceiptPush;}
+      if (std::strcmp(value, "receipt_import") == 0) {return Failure::ReceiptImport;}
       return Failure::None;
     }();
   return selected;
@@ -48,6 +52,36 @@ std::atomic<unsigned> retain_calls{0};
 std::atomic<unsigned> connection_calls{0};
 std::atomic<unsigned> receive_calls{0};
 std::atomic<int> request_socket{-1};
+
+thread_local bool mapping = false;
+thread_local bool received = false;
+thread_local bool failed_map = false;
+thread_local int received_fd = -1;
+thread_local CUcontext context_before = nullptr;
+thread_local bool context_known = false;
+thread_local g3_import_failure::ReceiptStats receipt;
+std::atomic<bool> observing_lifetime{false};
+std::atomic<unsigned> lifetime_retains{0};
+std::atomic<unsigned> lifetime_pushes{0};
+std::atomic<unsigned> lifetime_pops{0};
+std::atomic<unsigned> lifetime_releases{0};
+
+bool receipt_failure()
+{
+  const auto selected = selected_failure();
+  return selected == Failure::ReceiptRetain || selected == Failure::ReceiptPush ||
+         selected == Failure::ReceiptImport;
+}
+
+bool fail_receipt(Failure operation)
+{
+  if (!received || failed_map || selected_failure() != operation || failure_count.load() >= 3) {
+    return false;
+  }
+  failed_map = true;
+  failure_count.fetch_add(1);
+  return true;
+}
 
 template<typename Function>
 Function original(const char * symbol)
@@ -74,6 +108,41 @@ Stats stats()
   return {failure_count.load(), cleanup_calls.load(), import_calls.load(), retain_calls.load(),
     connection_calls.load(), receive_calls.load()};
 }
+
+void begin_map()
+{
+  if (!receipt_failure()) {return;}
+  receipt = {};
+  received = false;
+  failed_map = false;
+  received_fd = -1;
+  context_known = cuCtxGetCurrent(&context_before) == CUDA_SUCCESS;
+  mapping = true;
+}
+
+void end_map()
+{
+  if (!mapping) {return;}
+  received = false;
+  mapping = false;
+  CUcontext after = nullptr;
+  receipt.context_restored = context_known && cuCtxGetCurrent(&after) == CUDA_SUCCESS &&
+    after == context_before;
+  const int saved_errno = errno;
+  errno = 0;
+  receipt.closed = received_fd >= 0 && fcntl(received_fd, F_GETFD) == -1 && errno == EBADF;
+  errno = saved_errno;
+}
+
+ReceiptStats receipt_stats()
+{
+  auto result = receipt;
+  result.lifetime_retains = lifetime_retains.load();
+  result.lifetime_pushes = lifetime_pushes.load();
+  result.lifetime_pops = lifetime_pops.load();
+  result.lifetime_releases = lifetime_releases.load();
+  return result;
+}
 }  // namespace g3_import_failure
 
 extern "C" int connect(int socket, const sockaddr * address, socklen_t length)
@@ -83,7 +152,8 @@ extern "C" int connect(int socket, const sockaddr * address, socklen_t length)
   const int result = real(socket, address, length);
   const auto selected = selected_failure();
   constexpr char prefix[] = "/tmp/cuda_memory_pool_";
-  if (result == 0 && (selected == Failure::ReceiveError || selected == Failure::ReceiveEof) &&
+  if (result == 0 && (selected == Failure::ReceiveError || selected == Failure::ReceiveEof ||
+    (mapping && receipt_failure())) &&
     address->sa_family == AF_UNIX && length >= sizeof(sockaddr_un) &&
     std::strncmp(reinterpret_cast<const sockaddr_un *>(address)->sun_path,
     prefix, sizeof(prefix) - 1) == 0)
@@ -99,7 +169,9 @@ extern "C" ssize_t recvmsg(int socket, msghdr * message, int flags)
   // Inject before receiving SCM_RIGHTS; closing this connected socket must
   // return all request FDs without charging an imported CUDA resource.
   int expected = socket;
-  if (request_socket.compare_exchange_strong(expected, -1) && receive_calls.fetch_add(1) < 3) {
+  const bool request = request_socket.compare_exchange_strong(expected, -1);
+  const unsigned attempt = request ? receive_calls.fetch_add(1) : 0;
+  if (request && !receipt_failure() && attempt < 3) {
     failure_count.fetch_add(1);
     if (selected_failure() == Failure::ReceiveEof) {return 0;}
     errno = EIO;
@@ -107,7 +179,23 @@ extern "C" ssize_t recvmsg(int socket, msghdr * message, int flags)
   }
   static const auto real = original<decltype(&recvmsg)>("recvmsg");
   if (!real) {errno = ENOSYS; return -1;}
-  return real(socket, message, flags);
+  const auto result = real(socket, message, flags);
+  if (request && mapping && result > 0) {
+    const int saved_errno = errno;
+    auto * header = CMSG_FIRSTHDR(message);
+    if (!(message->msg_flags & MSG_CTRUNC) && header &&
+      header->cmsg_level == SOL_SOCKET && header->cmsg_type == SCM_RIGHTS &&
+      header->cmsg_len == CMSG_LEN(sizeof(int)) && !CMSG_NXTHDR(message, header))
+    {
+      std::memcpy(&received_fd, CMSG_DATA(header), sizeof(received_fd));
+      receipt.fds = 1;
+      receipt.cloexec = fcntl(received_fd, F_GETFD) == FD_CLOEXEC;
+      received = true;
+      observing_lifetime.store(true);
+    }
+    errno = saved_errno;
+  }
+  return result;
 }
 
 // These calls operate on actual peer-imported VMM and IPC-event resources.
@@ -174,13 +262,18 @@ extern "C" CUresult CUDAAPI cuCtxPopCurrent(CUcontext * context)
     return CUDA_ERROR_UNKNOWN;
   }
   static const auto real = original<decltype(&cuCtxPopCurrent)>("cuCtxPopCurrent_v2");
-  return real ? real(context) : CUDA_ERROR_UNKNOWN;
+  const auto result = real ? real(context) : CUDA_ERROR_UNKNOWN;
+  if (received && result == CUDA_SUCCESS) {++receipt.pops;}
+  if (observing_lifetime.load() && result == CUDA_SUCCESS) {lifetime_pops.fetch_add(1);}
+  return result;
 }
 
 extern "C" CUresult CUDAAPI cuMemImportFromShareableHandle(
   CUmemGenericAllocationHandle * handle, void * os_handle, CUmemAllocationHandleType type)
 {
   if (selected_failure() != Failure::None) {import_calls.fetch_add(1);}
+  if (received) {++receipt.imports;}
+  if (fail_receipt(Failure::ReceiptImport)) {return CUDA_ERROR_INVALID_HANDLE;}
   static const auto real = original<decltype(&cuMemImportFromShareableHandle)>(
     "cuMemImportFromShareableHandle");
   return real ? real(handle, os_handle, type) : CUDA_ERROR_UNKNOWN;
@@ -189,6 +282,30 @@ extern "C" CUresult CUDAAPI cuMemImportFromShareableHandle(
 extern "C" CUresult CUDAAPI cuDevicePrimaryCtxRetain(CUcontext * context, CUdevice device)
 {
   if (selected_failure() != Failure::None) {retain_calls.fetch_add(1);}
+  if (received) {++receipt.retains;}
+  if (fail_receipt(Failure::ReceiptRetain)) {return CUDA_ERROR_OUT_OF_MEMORY;}
   static const auto real = original<decltype(&cuDevicePrimaryCtxRetain)>("cuDevicePrimaryCtxRetain");
-  return real ? real(context, device) : CUDA_ERROR_UNKNOWN;
+  const auto result = real ? real(context, device) : CUDA_ERROR_UNKNOWN;
+  if (observing_lifetime.load() && result == CUDA_SUCCESS) {lifetime_retains.fetch_add(1);}
+  return result;
+}
+
+extern "C" CUresult CUDAAPI cuCtxPushCurrent(CUcontext context)
+{
+  if (fail_receipt(Failure::ReceiptPush)) {return CUDA_ERROR_INVALID_CONTEXT;}
+  static const auto real = original<decltype(&cuCtxPushCurrent)>("cuCtxPushCurrent_v2");
+  const auto result = real ? real(context) : CUDA_ERROR_UNKNOWN;
+  if (received && result == CUDA_SUCCESS) {++receipt.pushes;}
+  if (observing_lifetime.load() && result == CUDA_SUCCESS) {lifetime_pushes.fetch_add(1);}
+  return result;
+}
+
+extern "C" CUresult CUDAAPI cuDevicePrimaryCtxRelease(CUdevice device)
+{
+  static const auto real = original<decltype(&cuDevicePrimaryCtxRelease)>(
+    "cuDevicePrimaryCtxRelease_v2");
+  const auto result = real ? real(device) : CUDA_ERROR_UNKNOWN;
+  if (received && result == CUDA_SUCCESS) {++receipt.releases;}
+  if (observing_lifetime.load() && result == CUDA_SUCCESS) {lifetime_releases.fetch_add(1);}
+  return result;
 }

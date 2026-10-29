@@ -21,6 +21,7 @@
 #include "checksum.hpp"
 #include "../test/support.hpp"
 #ifdef G3_CLEANUP_INJECTION
+#include "ros2_cuda_ipc_core/buffer_metadata/buffer_ref.hpp"
 #include "../test/cleanup/import_failure.hpp"
 #include "../test/transport/fd_reply_failure.hpp"
 #endif
@@ -191,7 +192,13 @@ int subscriber(const std::string & topic, std::size_t limit)
       }
       if (command == "take" || command == "map" || command == "map_only") {
         if (!cached_valid) {throw std::runtime_error("no descriptor cached");}
+#ifdef G3_CLEANUP_INJECTION
+        g3_import_failure::begin_map();
+#endif
         auto read = mapper->map(cached.core, stream->driver());
+#ifdef G3_CLEANUP_INJECTION
+        g3_import_failure::end_map();
+#endif
         if (!read) {
           std::cout << (mapper->poisoned() ? "POISONED" :
             mapper->closing() ? "CLOSING" : "REJECTED") << std::endl;
@@ -260,6 +267,19 @@ int subscriber(const std::string & topic, std::size_t limit)
       } else if (command == "resources") {
         resources();
 #ifdef G3_CLEANUP_INJECTION
+      } else if (command == "receipt_stats") {
+        const auto counts = g3_import_failure::receipt_stats();
+        using namespace ros2_cuda_ipc_core::buffer_metadata;
+        const auto metadata = BufferMetadata::attach(shm_name_for_block(
+            cached.core.publisher_pid, cached.core.block_id));
+        const auto refs = BufferRef::current_refcount(metadata);
+        if (!refs) {throw std::runtime_error("missing receipt-test metadata");}
+        std::cout << "RECEIPT_STATS " << counts.fds << " " << counts.cloexec << " " <<
+          counts.closed << " " << counts.context_restored << " " << counts.retains << " " <<
+          counts.pushes << " " << counts.pops << " " << counts.releases << " " <<
+          counts.imports << " " << *refs << " " << counts.lifetime_retains << " " <<
+          counts.lifetime_pushes << " " << counts.lifetime_pops << " " <<
+          counts.lifetime_releases << std::endl;
       } else if (command == "fault_stats") {
         const auto counts = g3_import_failure::stats();
         std::cout << "FAULT_STATS " << counts.failures << " " << counts.cleanup_calls << " " <<

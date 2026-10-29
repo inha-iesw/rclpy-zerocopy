@@ -162,7 +162,7 @@ bridge/discovery and preload that hook. Before loading a module, check
 vermagic and the running kernel. The old module inside the nested fork is x86_64.
 Load only the matching `agnocast_rclpy` module and unload it after peers exit and
 its refcount reaches zero; preserve the pre-existing `agnocast` module. Absent opt-in,
-the 23 transport cases skip; this is not an equivalent safety result.
+the 26 transport cases skip; this is not an equivalent safety result.
 The nested Agnocast fork is still uncommitted; an outer checkout alone does not
 reconstruct those device artifacts.
 
@@ -195,7 +195,7 @@ summary; complete and targeted executions are distinguished in [EVIDENCE.md](EVI
 | Subscriber context restoration | 4 | Releaser/worker pop gates and faults; no drain before restoration |
 | Isolated runner | 2 | Missing producer/subscriber case filters return failure despite valid zero-test XML |
 | FD receipt and rollback | 8 | Real Unix ancillary replies, extra/missing/truncated FD rejection, received-FD close/CLOEXEC, retain/push/import failure rollback, reference/admission return and context restoration |
-| Actual Agnocast processes | 23 | Checksum/UID, completion, cleanup, drain, crash/restart, connected receive error/EOF, malformed FD replies and producer sendmsg recovery with H=1 |
+| Actual Agnocast processes | 26 | Checksum/UID, completion, cleanup, drain, crash/restart, connected receive error/EOF, malformed FD replies, producer sendmsg and post-receipt retain/push/import recovery with H=1 |
 | Reused and migrated upstream core | 52 | Context, pool, publisher message, caches, manager, BufferRef, mapper, read handle and cross-process VMM; three cases require multiple GPUs |
 | Test lineage (host-only) | 15 | Base revision/hash/inventory, adapted-source ownership, required test classification and CMake registration/failure propagation |
 
@@ -262,8 +262,17 @@ do not establish payload import coverage. The native FD-receipt fixture uses
 CUDA import. Its two-header sender may be coalesced into one SCM_RIGHTS array by
 Linux. The actual Agnocast peer cases send duplicated VMM FDs or inject `EPIPE`
 for three requests, then import the same descriptor and verify the GPU checksum.
-These cases cover successful retry after malformed replies and send failure;
-successful GPU retry after each post-receipt CUDA failure is a separate gap.
+These cases cover successful retry after malformed replies and send failure.
+Three additional peer cases receive a valid VMM FD before failing primary retain,
+context push or VMM import for the first three attempts, then import the same UID
+with the same H=1 mapper and verify the GPU checksum. Each rejection checks
+CLOEXEC/EBADF, restored context, zero read references, nonpoison and both peers'
+settled FD/map counts. Per-map retain/import counts are attempts; push/pop/release
+counts include only successful calls. After successful read drain, all-thread
+successful retain/release and push/pop counts balance. Successful import may allow
+the driver to reuse the received FD number, so that path checks settled FD counts
+rather than requiring the old number to remain EBADF. This closes the three
+post-receipt retry cases, not every CUDA failure combination.
 
 G3 remains open. This matrix covers the listed cleanup paths, not every allocation,
 event-creation, FD/system-call or asynchronous CUDA failure. Remaining work includes
