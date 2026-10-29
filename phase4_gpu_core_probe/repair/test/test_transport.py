@@ -19,11 +19,12 @@ pytestmark = pytest.mark.skipif(
 EVENTS = {'READY', 'PUB', 'FULL', 'AVAILABLE', 'CONNECTIONS', 'CLOSED', 'STASHED',
           'MAPPED', 'REJECTED', 'DROPPED', 'DONE', 'REMAPPED', 'LIMITS_REJECTED',
           'LIMITS_ACCEPTED', 'FAST_DONE', 'RESOURCES', 'MISSING', 'UNEXPECTED_MAP',
-          'PENDING', 'COMPLETE', 'PRODUCED', 'POISONED', 'CLOSING', 'READ_CLOSED', 'FAULT_STATS'}
+          'PENDING', 'COMPLETE', 'PRODUCED', 'POISONED', 'CLOSING', 'READ_CLOSED', 'FAULT_STATS',
+          'FD_REPLY_STATS'}
 
 
 class Peer:
-    def __init__(self, binary, role, topic, limit, directory, fault=None):
+    def __init__(self, binary, role, topic, limit, directory, fault=None, reply_fault=None):
         self.role = role
         self.stopped = False
         self.descriptors = set()
@@ -32,6 +33,8 @@ class Peer:
                    AGNOCAST_NO_DISCOVERY_AGENT='1')
         if fault is not None:
             env['G3_IMPORT_FAILURE'] = fault
+        if reply_fault is not None:
+            env['G3_FD_REPLY_FAILURE'] = reply_fault
         hook = Path(__file__).resolve().parents[3] / 'build/g2-device-arm64/lib'
         env['LD_PRELOAD'] = str(hook / 'libagnocast_heaphook.so')
         env['LD_LIBRARY_PATH'] = str(hook) + ':' + env.get('LD_LIBRARY_PATH', '')
@@ -97,11 +100,13 @@ def peers(tmp_path):
     binary = Path(os.environ['G3_TRANSPORT_PEER'])
     active = []
 
-    def start(blocks=1, reads=1, fault=None):
+    def start(blocks=1, reads=1, fault=None, reply_fault=None):
         topic = f'/g3_repair_{os.getpid()}_{time.monotonic_ns()}'
         directory = tmp_path / str(len(active))
         directory.mkdir()
-        publisher = Peer(binary, 'publisher', topic, blocks, directory)
+        publisher_binary = Path(os.environ['G3_CLEANUP_PEER']) if reply_fault else binary
+        publisher = Peer(publisher_binary, 'publisher', topic, blocks, directory,
+                         reply_fault=reply_fault)
         active.append(publisher)
         subscriber_binary = Path(os.environ['G3_CLEANUP_PEER']) if fault else binary
         subscriber = Peer(subscriber_binary, 'subscriber', topic, reads, directory, fault)
@@ -332,6 +337,33 @@ def test_fd_request_disconnect_does_not_terminate_publisher(peers):
     assert subscriber.ask('take')[0] == 'MAPPED'
     assert subscriber.ask('finish') == ['DONE', str(29 * 64)]
     close(publisher, subscriber)
+
+
+@pytest.mark.parametrize('fault', ['two_fds', 'truncated', 'send_error'])
+def test_invalid_fd_reply_releases_resources_and_allows_real_import(peers, fault):
+    publisher, subscriber = peers(reply_fault=fault)
+    publish(publisher, 43)
+    assert subscriber.ask('stash')[0] == 'STASHED'
+    before = (settled_resources(publisher), settled_resources(subscriber))
+    for attempt in range(1, 4):
+        assert subscriber.ask('map_only') == ['REJECTED']
+        # Settled publisher FDs also establish that its send thread closed the
+        # accepted socket after recording the send result.
+        assert (settled_resources(publisher), settled_resources(subscriber)) == before
+        sent = 0 if fault == 'send_error' else attempt
+        assert publisher.ask('fd_reply_stats') == [
+            'FD_REPLY_STATS', str(attempt), str(attempt), str(sent)]
+    # Keep the same published VMM FD, descriptor and H=1 mapper for recovery.
+    assert subscriber.ask('map')[0] == 'MAPPED'
+    assert subscriber.ask('finish') == ['DONE', str(43 * 64)]
+    assert publisher.ask('fd_reply_stats') == [
+        'FD_REPLY_STATS', '4', '3', '0' if fault == 'send_error' else '3']
+    assert (settled_resources(publisher), settled_resources(subscriber)) == before
+    close(publisher, subscriber)
+    if fault == 'send_error':
+        diagnostics = Path(subscriber.stderr.name).read_text()
+        assert diagnostics.count('publisher closed FD request without data') == 3
+        assert 'recvmsg on ' not in diagnostics
 
 
 def test_gpu_consumer_crash_strands_fixed_slot_until_peer_restart(peers):

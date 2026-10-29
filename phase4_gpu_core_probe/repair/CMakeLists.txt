@@ -86,7 +86,7 @@ target_link_libraries(test_gpu_descriptor ${rclpy_agnocast_gpu_msgs_TARGETS})
 enable_language(CUDA)
 add_executable(g3_transport_peer transport/peer.cpp transport/checksum.cu)
 add_executable(g3_cleanup_peer transport/peer.cpp transport/checksum.cu
-  test/cleanup/import_failure.cpp)
+  test/cleanup/import_failure.cpp test/transport/fd_reply_failure.cpp)
 foreach(_peer g3_transport_peer g3_cleanup_peer)
   target_compile_features(${_peer} PRIVATE cxx_std_17)
   set_target_properties(${_peer} PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
@@ -100,7 +100,7 @@ target_compile_definitions(g3_cleanup_peer PRIVATE G3_CLEANUP_INJECTION)
 target_link_libraries(g3_cleanup_peer ${CMAKE_DL_LIBS})
 foreach(_symbol cuIpcOpenEventHandle cuMemUnmap cuMemAddressFree cuMemRelease
     cuEventDestroy_v2 cuCtxPopCurrent_v2 cuMemImportFromShareableHandle cuDevicePrimaryCtxRetain
-    connect recvmsg)
+    connect recvmsg sendmsg)
   target_link_options(g3_cleanup_peer PRIVATE "-Wl,--export-dynamic-symbol=${_symbol}")
 endforeach()
 

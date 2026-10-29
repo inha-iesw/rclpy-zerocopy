@@ -22,6 +22,7 @@
 #include "../test/support.hpp"
 #ifdef G3_CLEANUP_INJECTION
 #include "../test/cleanup/import_failure.hpp"
+#include "../test/transport/fd_reply_failure.hpp"
 #endif
 
 namespace
@@ -119,6 +120,12 @@ int publisher(const std::string & topic, std::size_t blocks)
       std::cout << "CONNECTIONS " << endpoint->get_subscription_count() << std::endl;
     } else if (action == "resources") {
       resources();
+#ifdef G3_CLEANUP_INJECTION
+    } else if (action == "fd_reply_stats") {
+      const auto counts = g3_fd_reply_failure::stats();
+      std::cout << "FD_REPLY_STATS " << counts.attempts << " " << counts.injections << " " <<
+        counts.malformed_sent << std::endl;
+#endif
     } else if (action == "release") {
       stream.release();
       g3_test::check(cudaStreamSynchronize(stream.value));

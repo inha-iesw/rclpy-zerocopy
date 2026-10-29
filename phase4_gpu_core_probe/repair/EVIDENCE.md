@@ -18,6 +18,8 @@ Dates follow the design log's KST stage dates.
 | Initialisation and request failures (§28) | 2026-10-27 | `76400ff8`, unchanged | 52 targets, 154 PASS + 3 SKIP, including 15 host-only lineage cases |
 | Producer socket/context failures (§29) | 2026-10-28 | `76400ff8`, unchanged | Targeted 25 targets, 26 PASS; not a full probe |
 | Producer review corrections (§29 follow-up) | 2026-10-28 | `76400ff8`, unchanged | Targeted 25 targets, 26 PASS; existing 13 initialisation filters preserved |
+| FD receipt and reply recovery (§30) | 2026-10-29 | `24eb33e1` | 59 targets, 171 PASS + 3 multi-GPU SKIP, including 23 actual transport and 15 host lineage cases |
+| FD receipt review corrections (§30 follow-up) | 2026-10-29 | `cc8185be` | 59 targets, 171 PASS + 3 multi-GPU SKIP; existing receive error/EOF and send-error cases now assert diagnostics |
 
 ## Initial bounded repair and primary-release comparison
 
@@ -262,6 +264,99 @@ and Git mutation were not rerun for these review corrections. Earlier CPU result
 remain in `log/g3/initialisation-system-faults/`; current evidence is separately
 preserved in `log/g3/initialisation-review-fixes/`, including `assessment.json`,
 registration comparison, direct/CTest XML and the before/after observer probe.
+
+## FD receipt and reply recovery
+
+The six-case real Unix-socket reproduction against patch `76400ff8` recorded
+two passes and four failures. Two FDs, two sender-side SCM_RIGHTS headers, and
+eight FDs truncated to the receiver buffer each leaked an installed FD. A
+separate capacity-limited receive installed exactly one FD with `MSG_CTRUNC`:
+it did not leak, but incorrectly proceeded to CUDA primary-context retention.
+The reproduction's source, static archive, executable and XML remain in
+`log/g3/fd-receive/red/`; the two-header sender may be coalesced by Linux.
+
+The canonical patch now walks every returned SCM_RIGHTS FD, rejects anything
+other than one FD without control truncation, and closes all installed FDs on
+rejection. Patch SHA256 is
+`24eb33e1c1a41433ddd5a347b21f77cb754675bc05403e6398d056a59265abd1`.
+Only the importer source changed relative to the preceding reconstructed core;
+all 23 patched files reconstruct with zero fuzz and verified bytes. The core
+and every linked probe target were rebuilt. The original six cases passed;
+two added context-push/import failure cases bring the native receipt group to
+eight. These use `/dev/null`, deliberate CUDA failures, FD-number/CLOEXEC/EBADF
+and count oracles, refcount/H=1 retries, primary-release and push/pop counts,
+context identity and non-poison checks. They do not simulate successful import.
+
+Three new actual Agnocast process cases send two/eight copies of the producer's
+VMM FD, or inject `EPIPE` before `sendmsg`, for the first three requests. The
+malformed responses use real `sendmsg`; the test asserts each one-byte send
+succeeded, so an unrelated send failure cannot masquerade as parser rejection.
+Both peers' settled FD/metadata-map counts return to baseline. The fourth request
+uses the same descriptor, original VMM FD and H=1 mapper, imports successfully,
+checks the GPU checksum and drains normally. The injection selects only a
+single-FD SCM_RIGHTS reply from the core's Unix-socket path and preserves the
+sender's FD and `MSG_NOSIGNAL` flags. No producer implementation change was needed.
+
+After tightening successful-pop and malformed-send observations, the final full
+probe passed **171 cases with three multi-GPU skips across 59 CTest targets**:
+107 custom, 49 upstream and 15 host lineage passes. GTest's `result="skipped"`
+attribute is included in this classification. Actual transport passed all 23
+cases, including the 1,000-delivery checkpoint and crash/restart cases. The final
+eight native receipt cases and one VMM child-process test also passed directly;
+these overlap the full run. CPU `scripts/verify` passed 12 packages/39 targets,
+584 collected = 466 PASS + 118 device opt-in SKIP, with no failures/errors.
+
+Before device execution, three ARM64 artifacts, 24 source/prior-artifact hashes,
+ELF machine, kernel/vermagic and module srcversion matched the recorded identity.
+The temporary module was unloaded at refcount zero after each full run; the
+pre-existing module, 13 sockets and metadata inventory were preserved.
+`log/g3/fd-receive/assessment.json`, `device-session.json`, `reconstruction.json`,
+`green/` and `verification/` preserve results and source/binary/evidence hashes.
+
+Full G3 adoption remains open. Successful GPU retry after each post-receipt CUDA
+failure, remaining CUDA/system-call combinations, operation-specific diagnostics
+and production recovery remain separate work. G4/G5 and Orin are unfinished.
+Finalize and Git mutation were not run for this change.
+
+## FD receipt review corrections
+
+Review `code-review-20261029-043150.md` reported three new LOW items. EOF had
+used the errno left by an earlier call, `ScopedFd` implicitly allowed copying,
+and the reply-injection header omitted its three-call limit and counter meanings.
+The importer now diagnoses `recvmsg == 0` without errno, preserves the negative
+return's error diagnostic, deletes both copy operations, and documents ownership
+of the returned FD. The header states the selectors, first-three-reply limit,
+pass-through-inclusive attempts and successful malformed-send count.
+
+The existing receive-error/EOF and producer send-error tests now inspect the
+subscriber log after normal peer exit. Before the core change, receive-error
+passed while both EOF cases failed the new diagnostic assertions. With the
+updated core, the two EOF cases each report three explicit EOF messages without
+the previous errno diagnostic; the receive-error case retains its error messages.
+Compile-only probes include the actual importer: copy construction and assignment
+compiled before the change and are rejected specifically as deleted afterward;
+ordinary construction/reset still compiles. These probes add no registered cases.
+
+The new canonical patch SHA256 is
+`cc8185bed6cda674be7db84623dafe6d87867e4ed3a7e243dc1477bf1df0bf89`.
+Only the importer changed relative to the preceding repaired tree. Reconstruction
+again verified every byte with zero fuzz; the installed core archive and all
+linked probe targets were rebuilt after the final patch edit.
+
+The final full run passed **171 cases with three multi-GPU skips across 59 CTest
+targets**, including all 23 actual transport cases. The eight native FD cases
+also passed directly and overlap that total. CPU `scripts/verify` passed
+12 packages/39 targets, 584 collected = 466 PASS + 118 device opt-in SKIP,
+without failures or errors. RED and GREEN device runs verified the ARM64
+artifacts/source/kernel identity, unloaded the temporary module at refcount zero,
+and preserved the existing module, 13 sockets and metadata inventory.
+
+Evidence is separate from the original §30 run:
+`log/g3/fd-receive-review-fixes/{assessment.json,reconstruction.json,
+core-identity.json,ownership-probe.json,red/,green/,verification/}`.
+The cumulative LOW/refactoring/design suggestions were not expanded into this
+fix. Full G3, the documented post-receipt CUDA-success retry gap and G4/G5 remain
+open. Finalize and Git mutation were not run.
 
 ## Shared checkpoint and device observations
 
