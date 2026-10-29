@@ -146,16 +146,23 @@ target_link_libraries(test_producer_initialisation
   ros2_cuda_ipc_core::ros2_cuda_ipc_core CUDA::cudart ${CMAKE_DL_LIBS})
 foreach(_symbol cuMemAddressReserve cuMemAddressFree cuMemCreate cuMemRelease
     cuMemMap cuMemUnmap cuMemSetAccess cuMemExportToShareableHandle
-    cuEventCreate cuEventDestroy_v2 cuIpcGetEventHandle shm_open socket bind listen)
+    cuEventCreate cuEventDestroy_v2 cuIpcGetEventHandle
+    cuCtxPushCurrent_v2 cuCtxPopCurrent_v2 cuDevicePrimaryCtxRetain cuDevicePrimaryCtxRelease_v2
+    shm_open socket bind listen)
   target_link_options(test_producer_initialisation PRIVATE "-Wl,--export-dynamic-symbol=${_symbol}")
 endforeach()
 foreach(_case MemAddressReserve MemCreate MemMap MemSetAccess MemExport EventCreate IpcGetEventHandle
-    Socket Bind Listen)
+    Socket Bind Listen EventContextPush PrimaryRetain AllocationContextPush)
   set(_test "producer_initialisation_${_case}")
   set(_xml "${AMENT_TEST_RESULTS_DIR}/${PROJECT_NAME}/${_test}.gtest.xml")
+  if(_case MATCHES "^(PrimaryRetain|AllocationContextPush)$")
+    set(_filter "Context/ProducerContextInitialisation.EarlyFailureReturnsEpochAndAllowsRetry/${_case}")
+  else()
+    set(_filter "Allocation/ProducerInitialisation.SecondBlockFailureRollsBackAndAllowsRetry/${_case}")
+  endif()
   ament_add_test(${_test}
     COMMAND $<TARGET_FILE:test_producer_initialisation>
-      "--gtest_filter=Allocation/ProducerInitialisation.SecondBlockFailureRollsBackAndAllowsRetry/${_case}"
+      "--gtest_filter=${_filter}"
       "--gtest_output=xml:${_xml}"
     RESULT_FILE "${_xml}"
     OUTPUT_FILE "${CMAKE_BINARY_DIR}/ament_cmake_gtest/${_test}.txt" TIMEOUT 20)

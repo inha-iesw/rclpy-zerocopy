@@ -10,13 +10,15 @@ enum class Operation : std::size_t
   EventDestroy, MemUnmap, MemAddressFree, MemRelease, EventQuery,
   ContextPush, ContextPop, MemSetAccess, MemCreate, PrimaryRetain,
   MemAddressReserve, MemMap, MemExport, EventCreate, IpcGetEventHandle,
-  Socket, Bind, Listen, Count
+  Socket, Bind, Listen, PrimaryRelease, Count
 };
 
 using Counts = std::array<unsigned, static_cast<std::size_t>(Operation::Count)>;
 
 // Each executable invocation selects one case; failures must never persist
 // across independent cases in a shared CUDA process epoch.
+// CUDA counters are process-wide. PrimaryRelease only observes calls; it never
+// injects a failure. occurrence is relative to the counter when arm() is called.
 void arm(Operation operation, unsigned occurrence, bool rollback, bool pop_mismatch);
 Counts counts();
 unsigned injections(Operation operation);

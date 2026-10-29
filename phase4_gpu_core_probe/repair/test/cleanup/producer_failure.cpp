@@ -30,10 +30,15 @@ bool collect_names = false;
 std::vector<std::string> metadata_names;
 std::vector<std::string> socket_names;
 
+unsigned observe(Operation operation)
+{
+  return observed[static_cast<std::size_t>(operation)].fetch_add(1) + 1;
+}
+
 bool fail(Operation operation)
 {
   const auto index = static_cast<std::size_t>(operation);
-  const auto current = observed[index].fetch_add(1) + 1;
+  const auto current = observe(operation);
   if ((operation == target && current == target_call) ||
     (operation == Operation::MemSetAccess && current == access_call))
   {
@@ -241,9 +246,16 @@ extern "C" CUresult CUDAAPI cuIpcGetEventHandle(CUipcEventHandle * handle, CUeve
 
 extern "C" CUresult CUDAAPI cuDevicePrimaryCtxRetain(CUcontext * context, CUdevice device)
 {
-  (void)fail(Operation::PrimaryRetain);
+  if (fail(Operation::PrimaryRetain)) {return CUDA_ERROR_OUT_OF_MEMORY;}
   static const auto real = original<decltype(&cuDevicePrimaryCtxRetain)>("cuDevicePrimaryCtxRetain");
   return real ? real(context, device) : CUDA_ERROR_UNKNOWN;
+}
+
+extern "C" CUresult CUDAAPI cuDevicePrimaryCtxRelease(CUdevice device)
+{
+  (void)observe(Operation::PrimaryRelease);
+  static const auto real = original<decltype(&cuDevicePrimaryCtxRelease)>("cuDevicePrimaryCtxRelease_v2");
+  return real ? real(device) : CUDA_ERROR_UNKNOWN;
 }
 
 // Record names only after successful creation by this process. The PID comes
