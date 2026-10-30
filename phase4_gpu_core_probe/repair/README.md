@@ -319,6 +319,16 @@ checks event creation/wait before checksum; worker cleanup is observed through
 drain and context/ref balance, not the map-thread event counters. Existing
 `bad_event` coverage already tests IPC event-open rejection and successful retry.
 
+The remaining matrix below identifies concrete gaps; it is not an exhaustive
+failure audit or a production recovery implementation:
+
+| Area | Covered boundary | Remaining work |
+|---|---|---|
+| Producer allocation | 13 initialisation and 11 cleanup cases | Initial granularity query; metadata `ftruncate`/`mmap` failures; event-creation operation diagnostics |
+| FD server / request | Socket/bind/listen, receive/parser/reply failures | CLOEXEC fallback/`fcntl`, `accept`, thread creation and their rollback/diagnostics |
+| Consumer import / bind | Nine receipt retries, bad event, synthetic bind and cleanup faults | Other context, allocation/queue/thread and asynchronous CUDA failure combinations; diagnostic audit |
+| Process recovery | Controlled known-peer crash/restart | Supervisor ownership, confirmed-dead names, peer-group restart and deadlines |
+
 Device-session `metadata_preserved` covers only `rclpy_zc_gpu_v1_*`. Review runs
 observed `/dev/shm/cuda.shm.*` objects remaining after publisher exit; those driver
 objects are outside that preservation check. Later sessions record their file

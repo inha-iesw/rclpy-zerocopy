@@ -554,6 +554,8 @@ These counts are execution observations, not GPU residency or copy measurements.
 Evidence: `log/g3/bind-recovery/{assessment.json,reconstruction.json,red/,full/,
 transport/,host-results.xml,cpu-verify.log,verification/}`. The runner remains
 under `log/g3/post-import-review-fixes/`; tracked promotion D5 is still separate.
+Remaining producer granularity/metadata, FD fallback/thread, asynchronous CUDA,
+operation-diagnostic and production recovery work is listed in the README matrix.
 G3 remains open; G4/G5 and Orin remain unfinished. Finalize and Git mutation were
 not run for this change.
 
