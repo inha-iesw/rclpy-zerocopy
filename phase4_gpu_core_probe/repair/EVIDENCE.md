@@ -456,6 +456,20 @@ Finalize and Git mutation were not run for this change.
 
 ## Post-import review corrections (2026-10-30)
 
+Review `code-review-20261030-063055.md` identified a teardown timing defect in the
+untracked device-session runner: peer exit does not imply all inherited device
+holders have closed. A new runner under `log/g3/post-import-review-fixes/` waits
+up to five seconds for refcount zero, records the initial/final counts and elapsed
+wait, and only then attempts one normal unload. It never force-unloads or kills
+the unlink daemon. Teardown failure has exit 70 and preserves the test exit code,
+JSON and summary, including nonzero/failed-to-launch `rmmod`. Existing stages are
+rejected without overwriting evidence. Previous runners and frozen records remain
+unchanged; promotion of a canonical tracked runner remains a separate task.
+
+Initial host regressions reproduced six failures and one pass with the old runner.
+The corrected runner passed all seven cases with mocked module/subprocess/clock
+state, including delayed close, persistent holders, test failure, unload failure
+and stage reuse. Final checks also assert the JSON summary on unload failure.
 Six host protocol checks passed after an initial six-failure run: named fields,
 exact token count/tag, complete pre-import VMM expectations and the colon-qualified
 context diagnostic. These host regression files are scenario evidence, not new
@@ -475,6 +489,21 @@ cases, in 34.14 seconds. Native sources and all 29 binary hashes still match the
 preceding verified run; neither core nor probe was rebuilt. The full 181-case probe
 and CPU verifier were not rerun. Their latest full results remain the preceding
 stage's 178 PASS/3 multi-GPU SKIP and 466 PASS/118 device opt-in SKIP, respectively.
+
+The new session observed refcount **2 immediately after tests, then 0 after
+0.201 seconds**. `rmmod` and the runner exited zero. All five artifacts and 24
+source/prior-artifact identities were verified, and the existing module, 13 CUDA
+sockets and repaired-core metadata inventory were preserved.
+`cuda.shm.*` was separately observed at **911 → 945 files**, **74,629,120 →
+77,414,400 bytes** (+34 files/+2,785,280 bytes). These driver objects are outside
+`metadata_preserved`; none were removed. Safe deletion and PID/name reuse behavior
+remain unresolved, and the counts do not establish physical GPU resource residency.
+
+Evidence: `log/g3/post-import-review-fixes/{run-device.py,test_runner.py,test_stats.py,
+runner-red.*,runner-green.*,stats-red.*,stats-green.*,transport/,identity.json,
+assessment.json,verification/}`. The transport run retains all peer logs and is
+the formal evidence for these changes; scratchpad review reruns were not promoted.
+G3 remains open. Finalize and Git mutation were not run.
 
 ## Shared checkpoint and device observations
 

@@ -160,8 +160,10 @@ The process tests require `/dev/agnocast_rclpy` and the verified ARM64
 bridge/discovery and preload that hook. Before loading a module, check
 `build/g2-device-arm64/artifacts.json`, source identity, ELF architecture,
 vermagic and the running kernel. The old module inside the nested fork is x86_64.
-Load only the matching `agnocast_rclpy` module and unload it after peers exit and
-its refcount reaches zero; preserve the pre-existing `agnocast` module. Absent opt-in,
+Load only the matching `agnocast_rclpy` module and unload it after all device holders
+close and its refcount reaches zero; preserve the pre-existing `agnocast` module.
+Peer exit alone is insufficient: the forked unlink daemon can retain an inherited
+device FD until its polling loop exits. Absent opt-in,
 the 30 transport cases skip; this is not an equivalent safety result.
 The nested Agnocast fork is still uncommitted; an outer checkout alone does not
 reconstruct those device artifacts.
@@ -292,6 +294,12 @@ Post-import failures, like successful imports, allow later driver calls to reuse
 the FD number and therefore do not require map-return EBADF. These counters cover
 synchronous map/rollback calls, not asynchronous VMM resource residency after drain.
 Together these close seven post-receipt retry cases, not every CUDA failure combination.
+
+Device-session `metadata_preserved` covers only `rclpy_zc_gpu_v1_*`. Review runs
+observed `/dev/shm/cuda.shm.*` objects remaining after publisher exit; those driver
+objects are outside that preservation check. Later sessions record their file
+count and bytes separately and do not delete them. Safe deletion conditions and
+driver behavior on PID/name reuse remain unresolved.
 
 G3 remains open. This matrix covers the listed cleanup paths, not every allocation,
 event-creation, FD/system-call or asynchronous CUDA failure. Remaining work includes
