@@ -20,6 +20,9 @@ Dates follow the design log's KST stage dates.
 | Producer review corrections (§29 follow-up) | 2026-10-28 | `76400ff8`, unchanged | Targeted 25 targets, 26 PASS; existing 13 initialisation filters preserved |
 | FD receipt and reply recovery (§30) | 2026-10-29 | `24eb33e1` | 59 targets, 171 PASS + 3 multi-GPU SKIP, including 23 actual transport and 15 host lineage cases |
 | FD receipt review corrections (§30 follow-up) | 2026-10-29 | `cc8185be` | 59 targets, 171 PASS + 3 multi-GPU SKIP; existing receive error/EOF and send-error cases now assert diagnostics |
+| Post-receipt CUDA failure recovery (§31) | 2026-10-29 | `cc8185be`, unchanged | 59 targets, 174 PASS + 3 multi-GPU SKIP, including 26 actual transport and 15 host lineage cases |
+| Post-import VMM setup failure recovery (§32) | 2026-10-30 | `cc8185be`, unchanged | 59 targets, 178 PASS + 3 multi-GPU SKIP, including 30 actual transport and 15 host lineage cases |
+| Post-import review corrections (§32 follow-up) | 2026-10-30 | `cc8185be`, unchanged | 30 actual transport PASS and 13 host regression PASS; full 181-case probe and CPU verifier not rerun |
 
 ## Initial bounded repair and primary-release comparison
 
@@ -489,6 +492,7 @@ cases, in 34.14 seconds. Native sources and all 29 binary hashes still match the
 preceding verified run; neither core nor probe was rebuilt. The full 181-case probe
 and CPU verifier were not rerun. Their latest full results remain the preceding
 stage's 178 PASS/3 multi-GPU SKIP and 466 PASS/118 device opt-in SKIP, respectively.
+The history table now includes both previously omitted §31 and §32 runs.
 
 The new session observed refcount **2 immediately after tests, then 0 after
 0.201 seconds**. `rmmod` and the runner exited zero. All five artifacts and 24
