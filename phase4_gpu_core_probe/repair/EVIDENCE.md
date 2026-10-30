@@ -23,6 +23,7 @@ Dates follow the design log's KST stage dates.
 | Post-receipt CUDA failure recovery (§31) | 2026-10-29 | `cc8185be`, unchanged | 59 targets, 174 PASS + 3 multi-GPU SKIP, including 26 actual transport and 15 host lineage cases |
 | Post-import VMM setup failure recovery (§32) | 2026-10-30 | `cc8185be`, unchanged | 59 targets, 178 PASS + 3 multi-GPU SKIP, including 30 actual transport and 15 host lineage cases |
 | Post-import review corrections (§32 follow-up) | 2026-10-30 | `cc8185be`, unchanged | 30 actual transport PASS and 13 host regression PASS; full 181-case probe and CPU verifier not rerun |
+| Real imported-resource bind recovery (§33) | 2026-10-30 | `9a6a19d3` | 59 targets, 180 PASS + 3 multi-GPU SKIP, including 32 actual transport and 15 host lineage cases; separate 13 host regression PASS |
 
 ## Initial bounded repair and primary-release comparison
 
@@ -508,6 +509,53 @@ runner-red.*,runner-green.*,stats-red.*,stats-green.*,transport/,identity.json,
 assessment.json,verification/}`. The transport run retains all peer logs and is
 the formal evidence for these changes; scratchpad review reruns were not promoted.
 G3 remains open. Finalize and Git mutation were not run.
+
+## Real imported-resource bind recovery (2026-10-30)
+
+The existing synthetic-publication bind tests did not exercise actual VMM/IPC
+resource rollback. Two new receipt modes fail consumer completion-event creation
+or ready-event wait three times after importing a real producer allocation and
+ready event, then map the same cached UID with the same H=1 mapper, check the GPU
+checksum and drain. IPC event-open failure/retry was already covered by the
+existing `bad_event` transport case and is not counted as new coverage.
+
+The old core passed the new resource-return, successful-retry and drain assertions
+but failed both operation-specific diagnostic assertions (zero instead of three).
+The canonical patch adds only the two missing CUDA-operation diagnostics to
+`read_handle.cpp`, preserving guard restoration and return behavior. The new
+patch SHA256 is
+`9a6a19d3060c6f5d42dc4585a1fdbaa923f3563172b9e9bca4eeb67c6ef2f1df`.
+Zero-fuzz reconstruction verified all 140 sources; only that core file differs
+from the preserved previous reconstruction. Core and probe were rebuilt afterward.
+
+The final full run passed **180 cases with three multi-GPU skips across 59 CTest
+targets**: 116 custom, 49 upstream and 15 host lineage PASS, including **32 actual
+transport PASS**. GTest's `result="skipped"` attributes are included in this count.
+The CPU `scripts/verify` gate passed **466 cases with 118 device opt-in skips**
+across 39 targets and 12 built packages. The unchanged runner/protocol host
+regressions also passed **13/13**.
+
+The full CTest XML and logs were preserved. Its temporary peer logs were removed
+by later CPU pytest cleanup, so the unchanged transport suite was rerun with
+`--basetemp=log/g3/bind-recovery/transport/peers` to retain each peer's stdout and
+stderr. That separate **32/32 PASS** overlaps the full run and is not added to it.
+The nine receipt cases check complete VMM and bind counters, selected diagnostic
+three times, other operation diagnostics absent, ref/context return and nonpoison.
+
+All three device sessions used the corrected existing runner with an absolute
+stage argument, verified five artifacts and 24 source/prior-artifact identities,
+and preserved the pre-existing module, 13 sockets and repaired metadata names.
+The full session observed refcount zero immediately; the final transport session
+observed **2 → 0 after 0.100 seconds**. Each unloaded normally. `cuda.shm.*` counts
+were **945 → 947** (RED), **947 → 1013** (full), and **1013 → 1049** (transport);
+bytes were **77,414,400 → 77,578,240 → 82,984,960 → 85,934,080**. None were deleted.
+These counts are execution observations, not GPU residency or copy measurements.
+
+Evidence: `log/g3/bind-recovery/{assessment.json,reconstruction.json,red/,full/,
+transport/,host-results.xml,cpu-verify.log,verification/}`. The runner remains
+under `log/g3/post-import-review-fixes/`; tracked promotion D5 is still separate.
+G3 remains open; G4/G5 and Orin remain unfinished. Finalize and Git mutation were
+not run for this change.
 
 ## Shared checkpoint and device observations
 

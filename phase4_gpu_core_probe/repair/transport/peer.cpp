@@ -286,6 +286,11 @@ int subscriber(const std::string & topic, std::size_t limit)
           counts.reserves << " " << counts.maps << " " << counts.accesses << " " <<
           counts.unmaps << " " << counts.address_frees << " " << counts.allocation_releases <<
           " " << counts.event_opens << " " << counts.fd_closes << std::endl;
+      } else if (command == "bind_stats") {
+        const auto counts = g3_import_failure::receipt_stats();
+        std::cout << "BIND_STATS " << counts.completion_creates << " " <<
+          counts.completion_created << " " << counts.ready_waits << " " <<
+          counts.ready_destroys << " " << counts.completion_destroys << std::endl;
       } else if (command == "fault_stats") {
         const auto counts = g3_import_failure::stats();
         std::cout << "FAULT_STATS " << counts.failures << " " << counts.cleanup_calls << " " <<

@@ -20,7 +20,7 @@ EVENTS = {'READY', 'PUB', 'FULL', 'AVAILABLE', 'CONNECTIONS', 'CLOSED', 'STASHED
           'MAPPED', 'REJECTED', 'DROPPED', 'DONE', 'REMAPPED', 'LIMITS_REJECTED',
           'LIMITS_ACCEPTED', 'FAST_DONE', 'RESOURCES', 'MISSING', 'UNEXPECTED_MAP',
           'PENDING', 'COMPLETE', 'PRODUCED', 'POISONED', 'CLOSING', 'READ_CLOSED', 'FAULT_STATS',
-          'FD_REPLY_STATS', 'RECEIPT_STATS', 'VMM_STATS'}
+          'FD_REPLY_STATS', 'RECEIPT_STATS', 'VMM_STATS', 'BIND_STATS'}
 
 
 class Peer:
@@ -297,6 +297,8 @@ RECEIPT_FIELDS = ('fds', 'cloexec', 'closed', 'context_restored', 'retains', 'pu
                   'lifetime_pushes', 'lifetime_pops', 'lifetime_releases')
 VMM_FIELDS = ('imported', 'granularities', 'reserves', 'maps', 'accesses', 'unmaps',
              'address_frees', 'allocation_releases', 'event_opens', 'fd_closes')
+BIND_FIELDS = ('completion_creates', 'completion_created', 'ready_waits',
+               'ready_destroys', 'completion_destroys')
 FAULT_FIELDS = ('failures', 'cleanup_calls', 'imports', 'retains', 'connections',
                 'receives', 'poisoned')
 
@@ -311,6 +313,11 @@ def parse_stats(event, tag, fields):
 # unsuccessful import. These dictionaries are never modified by the test.
 NO_VMM = {'fd_closes': 1}
 IMPORT_ROLLBACK = {'retains': 1, 'pushes': 2, 'pops': 2, 'releases': 1, 'imports': 1}
+BIND_VMM_ROLLBACK = dict.fromkeys(VMM_FIELDS, 1)
+BIND_ROLLBACK = {
+    'receipt_bind_create': {'completion_creates': 1, 'ready_destroys': 1},
+    'receipt_bind_wait': dict.fromkeys(BIND_FIELDS, 1),
+}
 RECEIPT_CASES = [
     ('receipt_retain', {'retains': 1}, NO_VMM, 'Failed to retain CUDA primary context:'),
     ('receipt_push', {'retains': 1, 'releases': 1}, NO_VMM,
@@ -329,6 +336,10 @@ RECEIPT_CASES = [
      {'imported': 1, 'granularities': 1, 'reserves': 1, 'maps': 1, 'accesses': 1,
       'unmaps': 1, 'address_frees': 1, 'allocation_releases': 1, 'fd_closes': 1},
      'cuMemSetAccess failed:'),
+    ('receipt_bind_create', IMPORT_ROLLBACK | {'pushes': 3, 'pops': 3},
+     BIND_VMM_ROLLBACK, 'cuEventCreate completion event failed code='),
+    ('receipt_bind_wait', IMPORT_ROLLBACK | {'pushes': 5, 'pops': 5},
+     BIND_VMM_ROLLBACK, 'cuStreamWaitEvent ready event failed code='),
 ]
 RECEIPT_DIAGNOSTICS = tuple(diagnostic for _, _, _, diagnostic in RECEIPT_CASES)
 
@@ -347,6 +358,8 @@ def test_received_vmm_fd_cuda_failure_returns_resources_and_allows_import(
         # independently of map-return EBADF and the settled FD count below.
         vmm = parse_stats(subscriber.ask('vmm_stats'), 'VMM_STATS', VMM_FIELDS)
         assert vmm == dict.fromkeys(VMM_FIELDS, 0) | vmm_rollback
+        assert parse_stats(subscriber.ask('bind_stats'), 'BIND_STATS', BIND_FIELDS) == (
+            dict.fromkeys(BIND_FIELDS, 0) | BIND_ROLLBACK.get(fault, {}))
         # Context restored, successful pushes/pops balanced, no read ref remains.
         expected = dict.fromkeys(RECEIPT_FIELDS, 0) | rollback | {
             'fds': 1, 'cloexec': 1, 'context_restored': 1,
@@ -377,6 +390,9 @@ def test_received_vmm_fd_cuda_failure_returns_resources_and_allows_import(
     assert parse_stats(subscriber.ask('vmm_stats'), 'VMM_STATS', VMM_FIELDS) == {
         'imported': 1, 'granularities': 1, 'reserves': 1, 'maps': 1, 'accesses': 1,
         'unmaps': 0, 'address_frees': 0, 'allocation_releases': 0, 'event_opens': 1, 'fd_closes': 1}
+    assert parse_stats(subscriber.ask('bind_stats'), 'BIND_STATS', BIND_FIELDS) == {
+        'completion_creates': 1, 'completion_created': 1, 'ready_waits': 1,
+        'ready_destroys': 0, 'completion_destroys': 0}
     assert subscriber.ask('finish') == ['DONE', str(59 * 64)]
     stats = parse_stats(subscriber.ask('fault_stats'), 'FAULT_STATS', FAULT_FIELDS)
     assert stats['failures'] == 3 and stats['cleanup_calls'] == 0
@@ -398,6 +414,8 @@ def test_received_vmm_fd_cuda_failure_returns_resources_and_allows_import(
     close(publisher, subscriber)
     diagnostics = Path(subscriber.stderr.name).read_text()
     assert diagnostics.count(diagnostic) == 3
+    assert diagnostics.count('Failed to bind mapped publication for') == (
+        3 if fault in BIND_ROLLBACK else 0)
     for other in RECEIPT_DIAGNOSTICS:
         if other != diagnostic:
             assert other not in diagnostics

@@ -101,7 +101,8 @@ target_link_libraries(g3_cleanup_peer ${CMAKE_DL_LIBS})
 foreach(_symbol cuIpcOpenEventHandle cuMemUnmap cuMemAddressFree cuMemRelease
     cuEventDestroy_v2 cuCtxPopCurrent_v2 cuMemImportFromShareableHandle cuDevicePrimaryCtxRetain
     cuCtxPushCurrent_v2 cuDevicePrimaryCtxRelease_v2 cuMemGetAllocationGranularity
-    cuMemAddressReserve cuMemMap cuMemSetAccess connect recvmsg sendmsg close)
+    cuMemAddressReserve cuMemMap cuMemSetAccess cuEventCreate cuStreamWaitEvent
+    connect recvmsg sendmsg close)
   target_link_options(g3_cleanup_peer PRIVATE "-Wl,--export-dynamic-symbol=${_symbol}")
 endforeach()
 

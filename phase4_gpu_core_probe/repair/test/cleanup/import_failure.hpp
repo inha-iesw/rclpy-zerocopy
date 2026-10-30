@@ -48,9 +48,15 @@ struct ReceiptStats
   // Observe the received FD's first successful close, before any later driver
   // call can reuse its number. Unlike closed, this remains valid after import.
   unsigned fd_closes = 0;
+  // Map-thread bind attempts and successful event ownership transitions.
+  unsigned completion_creates = 0;
+  unsigned completion_created = 0;
+  unsigned ready_waits = 0;
+  unsigned ready_destroys = 0;
+  unsigned completion_destroys = 0;
 };
 
-// receipt_retain/push/import/granularity/reserve/map/access fail the selected
+// receipt_retain/push/import/granularity/reserve/map/access/bind_create/bind_wait fail the selected
 // operation once per map for the first three well-formed FD receipts, then pass through.
 // Observation is local to the map caller, starts after receipt and ends before
 // checksum work. lifetime_* count successful calls on all threads from the

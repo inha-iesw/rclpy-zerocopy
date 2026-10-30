@@ -2499,7 +2499,7 @@
      }
    }
 
-@@ -164,32 +168,35 @@
+@@ -164,32 +168,39 @@
    std::thread worker_;
  };
 
@@ -2553,13 +2553,17 @@
 +  result = std::make_shared<CompletionEvent>();
 +  result->context = context;
 +  const CUresult created = cuEventCreate(&result->event, CU_EVENT_DISABLE_TIMING);
-+  if (created != CUDA_SUCCESS) result->event = nullptr;
++  if (created != CUDA_SUCCESS) {
++    result->event = nullptr;
++    RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.subscriber.read_handle",
++                            "cuEventCreate completion event failed code=%d", created);
++  }
 +  const bool restored = guard.try_close();
 +  return created == CUDA_SUCCESS && restored;
  }
 
  bool validate_stream(
-@@ -199,33 +206,7 @@
+@@ -199,33 +210,7 @@
    if (!context) {
      return true;
    }
@@ -2594,7 +2598,7 @@
  }
 
  bool enqueue_ready_event(
-@@ -239,14 +220,15 @@
+@@ -239,14 +224,19 @@
      return true;
    }
    const auto context = resource->context;
@@ -2610,13 +2614,17 @@
 +    if (!guard_result) return false;
 +    guard.emplace(std::move(guard_result).value());
 +  }
-+  const bool waited = cuStreamWaitEvent(stream, event, 0) == CUDA_SUCCESS;
++  const CUresult waited = cuStreamWaitEvent(stream, event, 0);
++  if (waited != CUDA_SUCCESS) {
++    RCUTILS_LOG_WARN_NAMED("ros2_cuda_ipc_core.subscriber.read_handle",
++                            "cuStreamWaitEvent ready event failed code=%d", waited);
++  }
 +  const bool restored = !guard || guard->try_close();
-+  return waited && restored;
++  return waited == CUDA_SUCCESS && restored;
  }
 
  }  // namespace
-@@ -256,19 +238,36 @@
+@@ -256,19 +246,36 @@
  MappedPublication::MappedPublication(
      std::shared_ptr<const backend::ImportedResources> resource,
      std::unique_ptr<buffer_metadata::BufferRef> buffer_ref,
@@ -2656,7 +2664,7 @@
 
  bool MappedPublication::valid() const noexcept {
    return resource_ && resource_->dev_ptr != nullptr && buffer_ref_ != nullptr;
-@@ -288,6 +287,7 @@
+@@ -288,6 +295,7 @@
    std::shared_ptr<const backend::ImportedResources> resource;
    std::unique_ptr<buffer_metadata::BufferRef> buffer_ref;
    std::unique_ptr<DeferredItem> deferred_item;
@@ -2664,7 +2672,7 @@
    std::size_t byte_size = 0;
    int device_id = -1;
    CUstream consumer_stream = nullptr;
-@@ -303,7 +303,8 @@
+@@ -303,7 +311,8 @@
      if (!completion || completion->event == nullptr || !completion->context) {
        completion.reset();
        resource.reset();
@@ -2674,7 +2682,7 @@
        deferred_item.reset();
        return;
      }
-@@ -313,47 +314,31 @@
+@@ -313,47 +322,31 @@
        item->completion = std::move(completion);
        item->resource = std::move(resource);
        item->buffer_ref = std::move(buffer_ref);
@@ -2746,7 +2754,7 @@
      consumer_stream = nullptr;
    }
  };
-@@ -397,13 +382,21 @@
+@@ -397,13 +390,21 @@
  std::unique_ptr<MappedPublication> ReadHandleFactory::make_publication(
      std::shared_ptr<const backend::ImportedResources> resource,
      std::unique_ptr<buffer_metadata::BufferRef> buffer_ref,
@@ -2772,7 +2780,7 @@
  }
 
  std::optional<ReadHandle> ReadHandleFactory::make_bound(
-@@ -422,12 +415,20 @@
+@@ -422,12 +423,20 @@
    impl->deferred_item = std::make_unique<DeferredItem>();
    impl->byte_size = publication.byte_size_;
    impl->device_id = publication.device_id_;
@@ -2799,7 +2807,7 @@
      return std::nullopt;
    }
 
-@@ -436,6 +437,7 @@
+@@ -436,6 +445,7 @@
    // This is the ownership commit.  No fallible operation follows it.
    impl->resource = std::move(publication.resource_);
    impl->buffer_ref = std::move(publication.buffer_ref_);

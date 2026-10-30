@@ -13,7 +13,7 @@ The original rejection diagnostics and upstream baseline are preserved in
 `0e8933c8e58ffa7f1240a4c9efda3a2b84e5398c` with GNU patch, zero fuzz, and verifies
 every resulting source file. It neither modifies the pristine tree nor invokes
 Git. The MIT core patch is `patches/core-lifecycle.patch`, SHA256
-`cc8185bed6cda674be7db84623dafe6d87867e4ed3a7e243dc1477bf1df0bf89`
+`9a6a19d3060c6f5d42dc4585a1fdbaa923f3563172b9e9bca4eeb67c6ef2f1df`
 (23 core files).
 
 The existing CUDA VMM allocation/import, SCM_RIGHTS FD transfer and IPC event
@@ -164,7 +164,7 @@ Load only the matching `agnocast_rclpy` module and unload it after all device ho
 close and its refcount reaches zero; preserve the pre-existing `agnocast` module.
 Peer exit alone is insufficient: the forked unlink daemon can retain an inherited
 device FD until its polling loop exits. Absent opt-in,
-the 30 transport cases skip; this is not an equivalent safety result.
+the 32 transport cases skip; this is not an equivalent safety result.
 The nested Agnocast fork is still uncommitted; an outer checkout alone does not
 reconstruct those device artifacts.
 
@@ -197,7 +197,7 @@ summary; complete and targeted executions are distinguished in [EVIDENCE.md](EVI
 | Subscriber context restoration | 4 | Releaser/worker pop gates and faults; no drain before restoration |
 | Isolated runner | 2 | Missing producer/subscriber case filters return failure despite valid zero-test XML |
 | FD receipt and rollback | 8 | Real Unix ancillary replies, extra/missing/truncated FD rejection, received-FD close/CLOEXEC, retain/push/import failure rollback, reference/admission return and context restoration |
-| Actual Agnocast processes | 30 | Checksum/UID, completion, cleanup, drain, crash/restart, connected receive error/EOF, malformed FD replies, producer sendmsg and post-receipt retain/push/import/granularity/reserve/map/access recovery with H=1 |
+| Actual Agnocast processes | 32 | Checksum/UID, completion, cleanup, drain, crash/restart, connected receive error/EOF, malformed FD replies, producer sendmsg and post-receipt retain/push/import/granularity/reserve/map/access/bind-create/bind-wait recovery with H=1 |
 | Reused and migrated upstream core | 52 | Context, pool, publisher message, caches, manager, BufferRef, mapper, read handle and cross-process VMM; three cases require multiple GPUs |
 | Test lineage (host-only) | 15 | Base revision/hash/inventory, adapted-source ownership, required test classification and CMake registration/failure propagation |
 
@@ -258,8 +258,9 @@ not by identity alone. Socket/bind/listen errors are injected: the bind case cre
 no competing socket object, and the socket case does not exercise the CLOEXEC
 fallback. Socket selection counts process-wide AF_UNIX stream calls after CUDA
 warm-up; different driver/MPS behaviour in that interval needs separate validation.
-Subscriber bind-failure fixtures use synthetic pointers and
-do not establish payload import coverage. The native FD-receipt fixture uses
+The isolated subscriber bind-failure fixtures use synthetic pointers; actual
+VMM import and bind-failure rollback are covered by the two peer cases below.
+The native FD-receipt fixture uses
 `/dev/null` and deliberately fails retain/push/import; it does not claim successful
 CUDA import. Its two-header sender may be coalesced into one SCM_RIGHTS array by
 Linux. The actual Agnocast peer cases send duplicated VMM FDs or inject `EPIPE`
@@ -274,11 +275,14 @@ counts include only successful calls. After successful read drain, all-thread
 successful retain/release and push/pop counts balance. Successful import may allow
 the driver to reuse the received FD number, so that path checks settled FD counts
 rather than requiring the old number to remain EBADF.
-All seven receipt cases compare the complete VMM field set, requiring zero stage
+All nine receipt cases compare the complete VMM field set, requiring zero stage
 and cleanup calls for retain/push/import failures. They also require the selected
-full diagnostic prefix exactly three times and none of the other six prefixes.
+full diagnostic prefix exactly three times and none of the other eight prefixes.
 The Python consumer checks each STATS tag/field count and uses field names;
-the C++ text protocol is unchanged. Worker polling may add balanced context
+`BIND_STATS` separately reports completion-event creation attempts/successes,
+ready-wait attempts and successful ready/completion event destruction on the map
+thread. Existing `RECEIPT_STATS` and `VMM_STATS` fields are unchanged.
+Worker polling may add balanced context
 push/pop pairs, so drain checks a lower bound rather than an exact pair count.
 
 Four further peer cases fail allocation-granularity lookup, address reservation,
@@ -293,7 +297,27 @@ Every receipt case observes the received FD's first successful `close()` directl
 Post-import failures, like successful imports, allow later driver calls to reuse
 the FD number and therefore do not require map-return EBADF. These counters cover
 synchronous map/rollback calls, not asynchronous VMM resource residency after drain.
-Together these close seven post-receipt retry cases, not every CUDA failure combination.
+Those seven failure paths stop before binding. Two further cases fail completion event
+creation or ready-event wait after real VMM and ready-event import. Each rejects
+three maps before the fourth succeeds on the same UID and H=1 mapper, then checks
+the GPU checksum and drain. Their synchronous rollback expectations are:
+
+| Observation per failed map | Completion create | Ready wait |
+|---|---:|---:|
+| Completion create attempts / successes | 1 / 0 | 1 / 1 |
+| Ready wait attempts | 0 | 1 |
+| Ready event / completion event destroy successes | 1 / 0 | 1 / 1 |
+| VMM unmap / address free / allocation release successes | 1 / 1 / 1 | 1 / 1 / 1 |
+| Successful context pushes / pops | 3 / 3 | 5 / 5 |
+| Primary retain / release successes | 1 / 1 | 1 / 1 |
+
+Both also require one successful VMM import and received-FD close, zero read refs,
+nonpoison and unchanged settled FD/metadata-map counts on both peers. The failed
+wait does not enqueue consumer work. Each bind case checks its operation-specific
+CUDA error diagnostic and the generic bind failure three times. Successful retry
+checks event creation/wait before checksum; worker cleanup is observed through
+drain and context/ref balance, not the map-thread event counters. Existing
+`bad_event` coverage already tests IPC event-open rejection and successful retry.
 
 Device-session `metadata_preserved` covers only `rclpy_zc_gpu_v1_*`. Review runs
 observed `/dev/shm/cuda.shm.*` objects remaining after publisher exit; those driver

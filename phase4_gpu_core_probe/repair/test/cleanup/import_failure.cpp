@@ -19,7 +19,7 @@ enum class Failure
 {
   None, Unmap, AddressFree, Release, EventDestroy, ImportPop, PartialUnmap, PartialPop,
   ReceiveError, ReceiveEof, ReceiptRetain, ReceiptPush, ReceiptImport,
-  ReceiptGranularity, ReceiptReserve, ReceiptMap, ReceiptAccess
+  ReceiptGranularity, ReceiptReserve, ReceiptMap, ReceiptAccess, ReceiptBindCreate, ReceiptBindWait
 };
 
 Failure selected_failure()
@@ -43,6 +43,8 @@ Failure selected_failure()
       if (std::strcmp(value, "receipt_reserve") == 0) {return Failure::ReceiptReserve;}
       if (std::strcmp(value, "receipt_map") == 0) {return Failure::ReceiptMap;}
       if (std::strcmp(value, "receipt_access") == 0) {return Failure::ReceiptAccess;}
+      if (std::strcmp(value, "receipt_bind_create") == 0) {return Failure::ReceiptBindCreate;}
+      if (std::strcmp(value, "receipt_bind_wait") == 0) {return Failure::ReceiptBindWait;}
       return Failure::None;
     }();
   return selected;
@@ -63,6 +65,7 @@ thread_local bool mapping = false;
 thread_local bool received = false;
 thread_local bool failed_map = false;
 thread_local int received_fd = -1;
+thread_local CUevent completion_event = nullptr;
 thread_local CUcontext context_before = nullptr;
 thread_local bool context_known = false;
 thread_local g3_import_failure::ReceiptStats receipt;
@@ -78,7 +81,8 @@ bool receipt_failure()
   return selected == Failure::ReceiptRetain || selected == Failure::ReceiptPush ||
          selected == Failure::ReceiptImport || selected == Failure::ReceiptGranularity ||
          selected == Failure::ReceiptReserve || selected == Failure::ReceiptMap ||
-         selected == Failure::ReceiptAccess;
+         selected == Failure::ReceiptAccess || selected == Failure::ReceiptBindCreate ||
+         selected == Failure::ReceiptBindWait;
 }
 
 bool fail_receipt(Failure operation)
@@ -124,6 +128,7 @@ void begin_map()
   received = false;
   failed_map = false;
   received_fd = -1;
+  completion_event = nullptr;
   context_known = cuCtxGetCurrent(&context_before) == CUDA_SUCCESS;
   mapping = true;
 }
@@ -278,7 +283,33 @@ extern "C" CUresult CUDAAPI cuEventDestroy(CUevent event)
     return CUDA_ERROR_UNKNOWN;
   }
   static const auto real = original<decltype(&cuEventDestroy)>("cuEventDestroy_v2");
-  return real ? real(event) : CUDA_ERROR_UNKNOWN;
+  const auto result = real ? real(event) : CUDA_ERROR_UNKNOWN;
+  if (received && result == CUDA_SUCCESS) {
+    if (event == imported_event.load()) {++receipt.ready_destroys;}
+    if (event == completion_event) {++receipt.completion_destroys;}
+  }
+  return result;
+}
+
+extern "C" CUresult CUDAAPI cuEventCreate(CUevent * event, unsigned flags)
+{
+  if (received) {++receipt.completion_creates;}
+  if (fail_receipt(Failure::ReceiptBindCreate)) {return CUDA_ERROR_OUT_OF_MEMORY;}
+  static const auto real = original<decltype(&cuEventCreate)>("cuEventCreate");
+  const auto result = real ? real(event, flags) : CUDA_ERROR_UNKNOWN;
+  if (received && result == CUDA_SUCCESS) {
+    ++receipt.completion_created;
+    completion_event = *event;
+  }
+  return result;
+}
+
+extern "C" CUresult CUDAAPI cuStreamWaitEvent(CUstream stream, CUevent event, unsigned flags)
+{
+  if (received) {++receipt.ready_waits;}
+  if (fail_receipt(Failure::ReceiptBindWait)) {return CUDA_ERROR_INVALID_HANDLE;}
+  static const auto real = original<decltype(&cuStreamWaitEvent)>("cuStreamWaitEvent");
+  return real ? real(stream, event, flags) : CUDA_ERROR_UNKNOWN;
 }
 
 extern "C" CUresult CUDAAPI cuCtxPopCurrent(CUcontext * context)
