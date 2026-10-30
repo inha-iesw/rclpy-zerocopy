@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cerrno>
@@ -198,12 +199,24 @@ extern "C" ssize_t recvmsg(int socket, msghdr * message, int flags)
   return result;
 }
 
+extern "C" int close(int fd)
+{
+  static const auto real = original<decltype(&close)>("close");
+  if (!real) {errno = ENOSYS; return -1;}
+  const int result = real(fd);
+  if (received && fd == received_fd && receipt.fd_closes == 0 && result == 0) {
+    ++receipt.fd_closes;
+  }
+  return result;
+}
+
 // These calls operate on actual peer-imported VMM and IPC-event resources.
 // Normal driver calls pass through, including every call when the environment
-// selector is absent. Arm only after reaching the importer event-open stage;
-// CUDA runtime and peer startup cleanup must not consume the injected failure.
+// selector is absent. Cleanup injections arm only at the importer event-open
+// stage; receipt injections arm on FD receipt. Startup must not consume either.
 extern "C" CUresult CUDAAPI cuIpcOpenEventHandle(CUevent * event, CUipcEventHandle handle)
 {
+  if (received) {++receipt.event_opens;}
   const auto selected = selected_failure();
   if (selected == Failure::PartialUnmap || selected == Failure::PartialPop) {
     armed.store(true);
@@ -225,21 +238,27 @@ extern "C" CUresult CUDAAPI cuMemUnmap(CUdeviceptr pointer, std::size_t size)
     return CUDA_ERROR_UNKNOWN;
   }
   static const auto real = original<decltype(&cuMemUnmap)>("cuMemUnmap");
-  return real ? real(pointer, size) : CUDA_ERROR_UNKNOWN;
+  const auto result = real ? real(pointer, size) : CUDA_ERROR_UNKNOWN;
+  if (received && result == CUDA_SUCCESS) {++receipt.unmaps;}
+  return result;
 }
 
 extern "C" CUresult CUDAAPI cuMemAddressFree(CUdeviceptr pointer, std::size_t size)
 {
   if (fail_cleanup(selected_failure() == Failure::AddressFree)) {return CUDA_ERROR_UNKNOWN;}
   static const auto real = original<decltype(&cuMemAddressFree)>("cuMemAddressFree");
-  return real ? real(pointer, size) : CUDA_ERROR_UNKNOWN;
+  const auto result = real ? real(pointer, size) : CUDA_ERROR_UNKNOWN;
+  if (received && result == CUDA_SUCCESS) {++receipt.address_frees;}
+  return result;
 }
 
 extern "C" CUresult CUDAAPI cuMemRelease(CUmemGenericAllocationHandle handle)
 {
   if (fail_cleanup(selected_failure() == Failure::Release)) {return CUDA_ERROR_UNKNOWN;}
   static const auto real = original<decltype(&cuMemRelease)>("cuMemRelease");
-  return real ? real(handle) : CUDA_ERROR_UNKNOWN;
+  const auto result = real ? real(handle) : CUDA_ERROR_UNKNOWN;
+  if (received && result == CUDA_SUCCESS) {++receipt.allocation_releases;}
+  return result;
 }
 
 extern "C" CUresult CUDAAPI cuEventDestroy(CUevent event)
@@ -276,7 +295,45 @@ extern "C" CUresult CUDAAPI cuMemImportFromShareableHandle(
   if (fail_receipt(Failure::ReceiptImport)) {return CUDA_ERROR_INVALID_HANDLE;}
   static const auto real = original<decltype(&cuMemImportFromShareableHandle)>(
     "cuMemImportFromShareableHandle");
-  return real ? real(handle, os_handle, type) : CUDA_ERROR_UNKNOWN;
+  const auto result = real ? real(handle, os_handle, type) : CUDA_ERROR_UNKNOWN;
+  if (received && result == CUDA_SUCCESS) {++receipt.imported;}
+  return result;
+}
+
+extern "C" CUresult CUDAAPI cuMemGetAllocationGranularity(
+  std::size_t * granularity, const CUmemAllocationProp * properties,
+  CUmemAllocationGranularity_flags option)
+{
+  if (received) {++receipt.granularities;}
+  static const auto real = original<decltype(&cuMemGetAllocationGranularity)>(
+    "cuMemGetAllocationGranularity");
+  return real ? real(granularity, properties, option) : CUDA_ERROR_UNKNOWN;
+}
+
+extern "C" CUresult CUDAAPI cuMemAddressReserve(
+  CUdeviceptr * pointer, std::size_t size, std::size_t alignment,
+  CUdeviceptr address, unsigned long long flags)
+{
+  if (received) {++receipt.reserves;}
+  static const auto real = original<decltype(&cuMemAddressReserve)>("cuMemAddressReserve");
+  return real ? real(pointer, size, alignment, address, flags) : CUDA_ERROR_UNKNOWN;
+}
+
+extern "C" CUresult CUDAAPI cuMemMap(
+  CUdeviceptr pointer, std::size_t size, std::size_t offset,
+  CUmemGenericAllocationHandle handle, unsigned long long flags)
+{
+  if (received) {++receipt.maps;}
+  static const auto real = original<decltype(&cuMemMap)>("cuMemMap");
+  return real ? real(pointer, size, offset, handle, flags) : CUDA_ERROR_UNKNOWN;
+}
+
+extern "C" CUresult CUDAAPI cuMemSetAccess(
+  CUdeviceptr pointer, std::size_t size, const CUmemAccessDesc * descriptor, std::size_t count)
+{
+  if (received) {++receipt.accesses;}
+  static const auto real = original<decltype(&cuMemSetAccess)>("cuMemSetAccess");
+  return real ? real(pointer, size, descriptor, count) : CUDA_ERROR_UNKNOWN;
 }
 
 extern "C" CUresult CUDAAPI cuDevicePrimaryCtxRetain(CUcontext * context, CUdevice device)

@@ -280,6 +280,12 @@ int subscriber(const std::string & topic, std::size_t limit)
           counts.imports << " " << *refs << " " << counts.lifetime_retains << " " <<
           counts.lifetime_pushes << " " << counts.lifetime_pops << " " <<
           counts.lifetime_releases << std::endl;
+      } else if (command == "vmm_stats") {
+        const auto counts = g3_import_failure::receipt_stats();
+        std::cout << "VMM_STATS " << counts.imported << " " << counts.granularities << " " <<
+          counts.reserves << " " << counts.maps << " " << counts.accesses << " " <<
+          counts.unmaps << " " << counts.address_frees << " " << counts.allocation_releases <<
+          " " << counts.event_opens << " " << counts.fd_closes << std::endl;
       } else if (command == "fault_stats") {
         const auto counts = g3_import_failure::stats();
         std::cout << "FAULT_STATS " << counts.failures << " " << counts.cleanup_calls << " " <<

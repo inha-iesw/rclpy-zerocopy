@@ -20,7 +20,7 @@ EVENTS = {'READY', 'PUB', 'FULL', 'AVAILABLE', 'CONNECTIONS', 'CLOSED', 'STASHED
           'MAPPED', 'REJECTED', 'DROPPED', 'DONE', 'REMAPPED', 'LIMITS_REJECTED',
           'LIMITS_ACCEPTED', 'FAST_DONE', 'RESOURCES', 'MISSING', 'UNEXPECTED_MAP',
           'PENDING', 'COMPLETE', 'PRODUCED', 'POISONED', 'CLOSING', 'READ_CLOSED', 'FAULT_STATS',
-          'FD_REPLY_STATS', 'RECEIPT_STATS'}
+          'FD_REPLY_STATS', 'RECEIPT_STATS', 'VMM_STATS'}
 
 
 class Peer:
@@ -292,50 +292,102 @@ def test_connected_fd_request_failure_releases_admission_and_allows_import(peers
         assert 'publisher closed FD request without data' not in diagnostics
 
 
-@pytest.mark.parametrize('fault,rollback', [
-    ('receipt_retain', [1, 0, 0, 0, 0]),
-    ('receipt_push', [1, 0, 0, 1, 0]),
-    ('receipt_import', [1, 2, 2, 1, 1]),
-])
-def test_received_vmm_fd_cuda_failure_returns_resources_and_allows_import(peers, fault, rollback):
+RECEIPT_FIELDS = ('fds', 'cloexec', 'closed', 'context_restored', 'retains', 'pushes',
+                  'pops', 'releases', 'imports', 'refs', 'lifetime_retains',
+                  'lifetime_pushes', 'lifetime_pops', 'lifetime_releases')
+VMM_FIELDS = ('imported', 'granularities', 'reserves', 'maps', 'accesses', 'unmaps',
+             'address_frees', 'allocation_releases', 'event_opens', 'fd_closes')
+FAULT_FIELDS = ('failures', 'cleanup_calls', 'imports', 'retains', 'connections',
+                'receives', 'poisoned')
+
+
+def parse_stats(event, tag, fields):
+    assert len(event) == len(fields) + 1, (tag, event)
+    assert event[0] == tag, event
+    return dict(zip(fields, map(int, event[1:])))
+
+
+# Unspecified expected fields are zero, including every VMM stage after an
+# unsuccessful import. These dictionaries are never modified by the test.
+NO_VMM = {'fd_closes': 1}
+IMPORT_ROLLBACK = {'retains': 1, 'pushes': 2, 'pops': 2, 'releases': 1, 'imports': 1}
+RECEIPT_CASES = [
+    ('receipt_retain', {'retains': 1}, NO_VMM, 'Failed to retain CUDA primary context:'),
+    ('receipt_push', {'retains': 1, 'releases': 1}, NO_VMM,
+     'Failed to activate CUDA context:'),
+    ('receipt_import', IMPORT_ROLLBACK, NO_VMM, 'cuMemImportFromShareableHandle failed:'),
+]
+RECEIPT_DIAGNOSTICS = tuple(diagnostic for _, _, _, diagnostic in RECEIPT_CASES)
+
+
+@pytest.mark.parametrize('fault,rollback,vmm_rollback,diagnostic', RECEIPT_CASES)
+def test_received_vmm_fd_cuda_failure_returns_resources_and_allows_import(
+        peers, fault, rollback, vmm_rollback, diagnostic):
     publisher, subscriber = peers(fault=fault)
     packet = publish(publisher, 59)
     assert subscriber.ask('stash') == ['STASHED', packet[1]]
     before = (settled_resources(publisher), settled_resources(subscriber))
     for attempt in range(1, 4):
         assert subscriber.ask('map_only') == ['REJECTED']
-        # Exactly one CLOEXEC FD was received and is already EBADF; the caller's
-        # context is restored, successful pushes/pops balance, and no read ref remains.
-        assert list(map(int, subscriber.ask('receipt_stats')[1:])) == [
-            1, 1, 1, 1, *rollback, 0,
-            attempt * rollback[3], attempt * rollback[1],
-            attempt * rollback[2], attempt * rollback[3]]
-        stats = list(map(int, subscriber.ask('fault_stats')[1:]))
-        assert stats[0:3] == [attempt, 0, attempt if fault == 'receipt_import' else 0]
-        assert stats[4:] == [attempt, attempt, 0]
+        receipt = parse_stats(subscriber.ask('receipt_stats'), 'RECEIPT_STATS', RECEIPT_FIELDS)
+        # Later driver work can reuse the FD number. Observe its actual close
+        # independently of map-return EBADF and the settled FD count below.
+        vmm = parse_stats(subscriber.ask('vmm_stats'), 'VMM_STATS', VMM_FIELDS)
+        assert vmm == dict.fromkeys(VMM_FIELDS, 0) | vmm_rollback
+        # Context restored, successful pushes/pops balanced, no read ref remains.
+        expected = dict.fromkeys(RECEIPT_FIELDS, 0) | rollback | {
+            'fds': 1, 'cloexec': 1, 'context_restored': 1,
+            'lifetime_retains': attempt * rollback.get('releases', 0),
+            'lifetime_pushes': attempt * rollback.get('pushes', 0),
+            'lifetime_pops': attempt * rollback.get('pops', 0),
+            'lifetime_releases': attempt * rollback.get('releases', 0)}
+        if vmm_rollback.get('imported', 0) == 0:
+            expected['closed'] = 1  # Rejection before a successful import: EBADF.
+        else:
+            del receipt['closed']
+            del expected['closed']
+        assert receipt == expected
+        stats = parse_stats(subscriber.ask('fault_stats'), 'FAULT_STATS', FAULT_FIELDS)
+        assert stats['failures'] == attempt and stats['cleanup_calls'] == 0
+        assert stats['imports'] == attempt * rollback.get('imports', 0)
+        assert stats['connections'] == stats['receives'] == attempt
+        assert stats['poisoned'] == 0
         assert (settled_resources(publisher), settled_resources(subscriber)) == before
     # Same UID and H=1 mapper, with no republish or epoch recreation.
     assert subscriber.ask('map') == ['MAPPED', packet[1], '1']
-    mapped = list(map(int, subscriber.ask('receipt_stats')[1:11]))
+    mapped = parse_stats(subscriber.ask('receipt_stats'), 'RECEIPT_STATS', RECEIPT_FIELDS)
     # Driver work after successful import may reuse the now-closed FD number.
     # Check settled FD counts below, rather than requiring that number be EBADF.
-    assert mapped[:2] == [1, 1]
-    assert mapped[3:] == [1, 1, 3, 3, 0, 1, 1]
+    for name, value in {'fds': 1, 'cloexec': 1, 'context_restored': 1, 'retains': 1,
+                        'pushes': 3, 'pops': 3, 'releases': 0, 'imports': 1, 'refs': 1}.items():
+        assert mapped[name] == value, (name, mapped)
+    assert parse_stats(subscriber.ask('vmm_stats'), 'VMM_STATS', VMM_FIELDS) == {
+        'imported': 1, 'granularities': 1, 'reserves': 1, 'maps': 1, 'accesses': 1,
+        'unmaps': 0, 'address_frees': 0, 'allocation_releases': 0, 'event_opens': 1, 'fd_closes': 1}
     assert subscriber.ask('finish') == ['DONE', str(59 * 64)]
-    stats = list(map(int, subscriber.ask('fault_stats')[1:]))
-    assert stats[0:3] == [3, 0, 4 if fault == 'receipt_import' else 1]
-    assert stats[4:] == [4, 4, 0]
+    stats = parse_stats(subscriber.ask('fault_stats'), 'FAULT_STATS', FAULT_FIELDS)
+    assert stats['failures'] == 3 and stats['cleanup_calls'] == 0
+    assert stats['imports'] == 1 + 3 * rollback.get('imports', 0)
+    assert stats['connections'] == stats['receives'] == 4
+    assert stats['poisoned'] == 0
     deadline = time.monotonic() + 3
     while subscriber.ask('close_read') != ['READ_CLOSED', '1']:
         assert time.monotonic() < deadline
         time.sleep(0.005)
-    drained = list(map(int, subscriber.ask('receipt_stats')[1:]))
-    assert drained[9] == 0
-    retains, pushes, pops, releases = drained[10:]
-    assert retains == releases == 1 + 3 * rollback[3]
-    assert pushes == pops and pushes >= 7 + 3 * rollback[1]
+    drained = parse_stats(subscriber.ask('receipt_stats'), 'RECEIPT_STATS', RECEIPT_FIELDS)
+    assert drained['refs'] == 0
+    assert drained['lifetime_retains'] == drained['lifetime_releases'] == (
+        1 + 3 * rollback.get('releases', 0))
+    assert drained['lifetime_pushes'] == drained['lifetime_pops']
+    # Worker polling adds balanced push/pop pairs; the minimum is not an exact count.
+    assert drained['lifetime_pushes'] >= 7 + 3 * rollback.get('pushes', 0)
     assert (settled_resources(publisher), settled_resources(subscriber)) == before
     close(publisher, subscriber)
+    diagnostics = Path(subscriber.stderr.name).read_text()
+    assert diagnostics.count(diagnostic) == 3
+    for other in RECEIPT_DIAGNOSTICS:
+        if other != diagnostic:
+            assert other not in diagnostics
 
 
 @pytest.mark.parametrize('fault', [

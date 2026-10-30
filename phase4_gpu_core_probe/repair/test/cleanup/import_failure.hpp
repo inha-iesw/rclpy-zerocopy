@@ -22,7 +22,7 @@ struct ReceiptStats
   unsigned fds = 0;
   bool cloexec = false;
   // EBADF at map return. After a successful import, the driver may have reused
-  // this FD number; require this only for the synchronous rejection paths.
+  // this FD number; require this only for rejection before a successful import.
   bool closed = false;
   bool context_restored = false;
   unsigned retains = 0;
@@ -34,6 +34,20 @@ struct ReceiptStats
   unsigned lifetime_pushes = 0;
   unsigned lifetime_pops = 0;
   unsigned lifetime_releases = 0;
+  // VMM stage/event-open counters are attempts; imported and the resource
+  // return counters count successful calls on this map's thread only.
+  unsigned imported = 0;
+  unsigned granularities = 0;
+  unsigned reserves = 0;
+  unsigned maps = 0;
+  unsigned accesses = 0;
+  unsigned unmaps = 0;
+  unsigned address_frees = 0;
+  unsigned allocation_releases = 0;
+  unsigned event_opens = 0;
+  // Observe the received FD's first successful close, before any later driver
+  // call can reuse its number. Unlike closed, this remains valid after import.
+  unsigned fd_closes = 0;
 };
 
 // receipt_retain/receipt_push/receipt_import fail the selected operation once
