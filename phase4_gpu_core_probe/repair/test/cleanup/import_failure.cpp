@@ -18,7 +18,8 @@ namespace
 enum class Failure
 {
   None, Unmap, AddressFree, Release, EventDestroy, ImportPop, PartialUnmap, PartialPop,
-  ReceiveError, ReceiveEof, ReceiptRetain, ReceiptPush, ReceiptImport
+  ReceiveError, ReceiveEof, ReceiptRetain, ReceiptPush, ReceiptImport,
+  ReceiptGranularity, ReceiptReserve, ReceiptMap, ReceiptAccess
 };
 
 Failure selected_failure()
@@ -38,6 +39,10 @@ Failure selected_failure()
       if (std::strcmp(value, "receipt_retain") == 0) {return Failure::ReceiptRetain;}
       if (std::strcmp(value, "receipt_push") == 0) {return Failure::ReceiptPush;}
       if (std::strcmp(value, "receipt_import") == 0) {return Failure::ReceiptImport;}
+      if (std::strcmp(value, "receipt_granularity") == 0) {return Failure::ReceiptGranularity;}
+      if (std::strcmp(value, "receipt_reserve") == 0) {return Failure::ReceiptReserve;}
+      if (std::strcmp(value, "receipt_map") == 0) {return Failure::ReceiptMap;}
+      if (std::strcmp(value, "receipt_access") == 0) {return Failure::ReceiptAccess;}
       return Failure::None;
     }();
   return selected;
@@ -71,7 +76,9 @@ bool receipt_failure()
 {
   const auto selected = selected_failure();
   return selected == Failure::ReceiptRetain || selected == Failure::ReceiptPush ||
-         selected == Failure::ReceiptImport;
+         selected == Failure::ReceiptImport || selected == Failure::ReceiptGranularity ||
+         selected == Failure::ReceiptReserve || selected == Failure::ReceiptMap ||
+         selected == Failure::ReceiptAccess;
 }
 
 bool fail_receipt(Failure operation)
@@ -305,6 +312,7 @@ extern "C" CUresult CUDAAPI cuMemGetAllocationGranularity(
   CUmemAllocationGranularity_flags option)
 {
   if (received) {++receipt.granularities;}
+  if (fail_receipt(Failure::ReceiptGranularity)) {return CUDA_ERROR_INVALID_VALUE;}
   static const auto real = original<decltype(&cuMemGetAllocationGranularity)>(
     "cuMemGetAllocationGranularity");
   return real ? real(granularity, properties, option) : CUDA_ERROR_UNKNOWN;
@@ -315,6 +323,7 @@ extern "C" CUresult CUDAAPI cuMemAddressReserve(
   CUdeviceptr address, unsigned long long flags)
 {
   if (received) {++receipt.reserves;}
+  if (fail_receipt(Failure::ReceiptReserve)) {return CUDA_ERROR_OUT_OF_MEMORY;}
   static const auto real = original<decltype(&cuMemAddressReserve)>("cuMemAddressReserve");
   return real ? real(pointer, size, alignment, address, flags) : CUDA_ERROR_UNKNOWN;
 }
@@ -324,6 +333,7 @@ extern "C" CUresult CUDAAPI cuMemMap(
   CUmemGenericAllocationHandle handle, unsigned long long flags)
 {
   if (received) {++receipt.maps;}
+  if (fail_receipt(Failure::ReceiptMap)) {return CUDA_ERROR_OUT_OF_MEMORY;}
   static const auto real = original<decltype(&cuMemMap)>("cuMemMap");
   return real ? real(pointer, size, offset, handle, flags) : CUDA_ERROR_UNKNOWN;
 }
@@ -332,6 +342,7 @@ extern "C" CUresult CUDAAPI cuMemSetAccess(
   CUdeviceptr pointer, std::size_t size, const CUmemAccessDesc * descriptor, std::size_t count)
 {
   if (received) {++receipt.accesses;}
+  if (fail_receipt(Failure::ReceiptAccess)) {return CUDA_ERROR_INVALID_VALUE;}
   static const auto real = original<decltype(&cuMemSetAccess)>("cuMemSetAccess");
   return real ? real(pointer, size, descriptor, count) : CUDA_ERROR_UNKNOWN;
 }

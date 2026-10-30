@@ -162,7 +162,7 @@ bridge/discovery and preload that hook. Before loading a module, check
 vermagic and the running kernel. The old module inside the nested fork is x86_64.
 Load only the matching `agnocast_rclpy` module and unload it after peers exit and
 its refcount reaches zero; preserve the pre-existing `agnocast` module. Absent opt-in,
-the 26 transport cases skip; this is not an equivalent safety result.
+the 30 transport cases skip; this is not an equivalent safety result.
 The nested Agnocast fork is still uncommitted; an outer checkout alone does not
 reconstruct those device artifacts.
 
@@ -195,7 +195,7 @@ summary; complete and targeted executions are distinguished in [EVIDENCE.md](EVI
 | Subscriber context restoration | 4 | Releaser/worker pop gates and faults; no drain before restoration |
 | Isolated runner | 2 | Missing producer/subscriber case filters return failure despite valid zero-test XML |
 | FD receipt and rollback | 8 | Real Unix ancillary replies, extra/missing/truncated FD rejection, received-FD close/CLOEXEC, retain/push/import failure rollback, reference/admission return and context restoration |
-| Actual Agnocast processes | 26 | Checksum/UID, completion, cleanup, drain, crash/restart, connected receive error/EOF, malformed FD replies, producer sendmsg and post-receipt retain/push/import recovery with H=1 |
+| Actual Agnocast processes | 30 | Checksum/UID, completion, cleanup, drain, crash/restart, connected receive error/EOF, malformed FD replies, producer sendmsg and post-receipt retain/push/import/granularity/reserve/map/access recovery with H=1 |
 | Reused and migrated upstream core | 52 | Context, pool, publisher message, caches, manager, BufferRef, mapper, read handle and cross-process VMM; three cases require multiple GPUs |
 | Test lineage (host-only) | 15 | Base revision/hash/inventory, adapted-source ownership, required test classification and CMake registration/failure propagation |
 
@@ -271,8 +271,27 @@ settled FD/map counts. Per-map retain/import counts are attempts; push/pop/relea
 counts include only successful calls. After successful read drain, all-thread
 successful retain/release and push/pop counts balance. Successful import may allow
 the driver to reuse the received FD number, so that path checks settled FD counts
-rather than requiring the old number to remain EBADF. This closes the three
-post-receipt retry cases, not every CUDA failure combination.
+rather than requiring the old number to remain EBADF.
+All seven receipt cases compare the complete VMM field set, requiring zero stage
+and cleanup calls for retain/push/import failures. They also require the selected
+full diagnostic prefix exactly three times and none of the other six prefixes.
+The Python consumer checks each STATS tag/field count and uses field names;
+the C++ text protocol is unchanged. Worker polling may add balanced context
+push/pop pairs, so drain checks a lower bound rather than an exact pair count.
+
+Four further peer cases fail allocation-granularity lookup, address reservation,
+mapping or access setup after a successful VMM import. Each fails three times,
+then imports the same UID with the same H=1 mapper and checks checksum/drain.
+The map-thread `VMM_STATS` protocol distinguishes successful imports, stage/event-open
+attempts and successful unmap/address-free/allocation-release calls. Granularity
+and reserve failures release the imported allocation; map failure also frees the
+reserved address; access failure additionally unmaps it. No failed attempt opens
+an IPC event. Each selected operation has three matching diagnostics.
+Every receipt case observes the received FD's first successful `close()` directly.
+Post-import failures, like successful imports, allow later driver calls to reuse
+the FD number and therefore do not require map-return EBADF. These counters cover
+synchronous map/rollback calls, not asynchronous VMM resource residency after drain.
+Together these close seven post-receipt retry cases, not every CUDA failure combination.
 
 G3 remains open. This matrix covers the listed cleanup paths, not every allocation,
 event-creation, FD/system-call or asynchronous CUDA failure. Remaining work includes

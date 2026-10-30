@@ -316,6 +316,19 @@ RECEIPT_CASES = [
     ('receipt_push', {'retains': 1, 'releases': 1}, NO_VMM,
      'Failed to activate CUDA context:'),
     ('receipt_import', IMPORT_ROLLBACK, NO_VMM, 'cuMemImportFromShareableHandle failed:'),
+    ('receipt_granularity', IMPORT_ROLLBACK,
+     {'imported': 1, 'granularities': 1, 'allocation_releases': 1, 'fd_closes': 1},
+     'cuMemGetAllocationGranularity failed:'),
+    ('receipt_reserve', IMPORT_ROLLBACK,
+     {'imported': 1, 'granularities': 1, 'reserves': 1, 'allocation_releases': 1, 'fd_closes': 1},
+     'cuMemAddressReserve failed:'),
+    ('receipt_map', IMPORT_ROLLBACK,
+     {'imported': 1, 'granularities': 1, 'reserves': 1, 'maps': 1,
+      'address_frees': 1, 'allocation_releases': 1, 'fd_closes': 1}, 'cuMemMap failed:'),
+    ('receipt_access', IMPORT_ROLLBACK,
+     {'imported': 1, 'granularities': 1, 'reserves': 1, 'maps': 1, 'accesses': 1,
+      'unmaps': 1, 'address_frees': 1, 'allocation_releases': 1, 'fd_closes': 1},
+     'cuMemSetAccess failed:'),
 ]
 RECEIPT_DIAGNOSTICS = tuple(diagnostic for _, _, _, diagnostic in RECEIPT_CASES)
 

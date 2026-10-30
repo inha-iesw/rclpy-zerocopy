@@ -404,6 +404,78 @@ failure combinations, operation-specific diagnostics and production recovery
 still keep G3 open; G4/G5 and Orin remain unfinished. Finalize and Git mutation
 were not run for this change.
 
+## Post-import VMM setup failure recovery (2026-10-30)
+
+Four actual Agnocast peer cases extend the receipt fixture to allocation-granularity
+lookup, address reservation, mapping and access setup failures after a successful
+VMM import. Each injects the selected failure for three maps, then imports the
+same cached UID through the same H=1 mapper, verifies the GPU checksum and drains.
+No core change was required.
+
+Every failed map proves one successful import and the expected stage-attempt counts.
+Granularity/reserve failures successfully release the imported allocation; map
+failure also frees the reserved address; access failure also unmaps it. No failed
+attempt opens an IPC event. The VMM return counters count successful CUDA calls,
+not merely attempted cleanup. Each rejection restores the caller context, balances
+two successful push/pop pairs and one primary retain/release, returns the read
+reference/admission without poison, and preserves both peers' settled FD/map counts.
+The selected operation produces exactly three matching diagnostics.
+
+The received FD's first successful `close()` is now observed on the map thread in
+all seven receipt cases. The new post-import failures permit the driver to reuse
+that FD number before map returns, so they do not require map-return EBADF. The
+earlier retain/push/import failures retain their EBADF checks. The fourth successful
+map reaches all VMM stages and event open without synchronous VMM cleanup; after
+checksum/drain, all-thread context calls balance. The VMM counters cover synchronous
+rollback, not physical VRAM/event/VMM residency or a payload copy trace.
+
+The targeted four cases passed. The full probe passed **178 cases with three
+multi-GPU skips across 59 CTest targets**: 114 custom, 49 upstream and 15 host
+lineage passes. All **30 actual transport cases** passed, including existing
+receipt/cleanup failures, 1,000 deliveries and crash/restart. The targeted four
+overlap the full result. GTest skips are recorded as `result="skipped"` in XML.
+CPU `scripts/verify` also passed 12 packages/39 targets: **584 collected =
+466 PASS + 118 device opt-in SKIP**, without failures or errors.
+
+The canonical patch remains `cc8185bed6cda674be7db84623dafe6d87867e4ed3a7e243dc1477bf1df0bf89`.
+All 140 reconstructed source hashes and both built/installed core archive hashes
+match the prior verified reconstruction. Only the probe was rebuilt; no fresh
+core reconstruction/build or empty build-directory run is claimed.
+
+Both device sessions verified five artifacts and 24 source/prior-artifact hashes,
+ELF architecture, kernel/vermagic and module srcversion. Each temporary module was
+unloaded at refcount zero; the existing module, 13 sockets and metadata inventory
+were preserved. Evidence is under `log/g3/post-import-recovery/`: build logs,
+`core-identity.json`, `targeted/`, `full/`, `assessment.json` and frozen `verification/`.
+The targeted run retains per-peer logs; full-suite results are frozen XML/CTest logs.
+
+This closes four further recoverable post-import failure paths. Remaining
+allocation/event/syscall/thread/asynchronous-CUDA combinations, diagnostic audit
+and production supervisor/recovery keep G3 open. G4/G5 and Orin remain unfinished.
+Finalize and Git mutation were not run for this change.
+
+## Post-import review corrections (2026-10-30)
+
+Six host protocol checks passed after an initial six-failure run: named fields,
+exact token count/tag, complete pre-import VMM expectations and the colon-qualified
+context diagnostic. These host regression files are scenario evidence, not new
+CTest registrations.
+
+All seven receipt modes now compare every VMM field, filling unspecified expected
+fields with zero. Retain/push/import must show only one received-FD close and zero
+VMM-stage/cleanup counts. EBADF still depends on the expected lack of a successful
+import, independently of table completeness. Each mode requires its full diagnostic
+prefix three times and the other six prefixes zero times. Positive matching is
+independent of the negative-check loop. Named Python field consumption validates
+the existing C++ protocol without changing it. Balanced drain push/pop counts
+retain their lower-bound check because worker polling can add pairs.
+
+The revised real transport suite passed **30/30**, including the seven receipt
+cases, in 34.14 seconds. Native sources and all 29 binary hashes still match the
+preceding verified run; neither core nor probe was rebuilt. The full 181-case probe
+and CPU verifier were not rerun. Their latest full results remain the preceding
+stage's 178 PASS/3 multi-GPU SKIP and 466 PASS/118 device opt-in SKIP, respectively.
+
 ## Shared checkpoint and device observations
 
 Recorded transport checkpoints used 32 blocks, 64 warmup and 1,000 measured

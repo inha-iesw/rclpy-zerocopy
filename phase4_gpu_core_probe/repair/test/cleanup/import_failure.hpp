@@ -50,8 +50,8 @@ struct ReceiptStats
   unsigned fd_closes = 0;
 };
 
-// receipt_retain/receipt_push/receipt_import fail the selected operation once
-// per map for the first three well-formed FD receipts, then pass through.
+// receipt_retain/push/import/granularity/reserve/map/access fail the selected
+// operation once per map for the first three well-formed FD receipts, then pass through.
 // Observation is local to the map caller, starts after receipt and ends before
 // checksum work. lifetime_* count successful calls on all threads from the
 // first receipt onward; read them after mapper drain for a complete balance.
